@@ -15,14 +15,14 @@ async def test_worker_main_wires_detection_and_response_fact_consumers(monkeypat
             events.append("redis_closed")
 
     class Collection:
-        async def create_index(self, keys, unique):
+        async def create_index(self, keys, unique=False, **kwargs):
             events.append(("index", tuple(keys), unique))
 
     collection = Collection()
 
     class Database:
         def __getitem__(self, name):
-            assert name == "wake_interaction_facts"
+            assert name in {"wake_interaction_facts", "voice_interaction_events"}
             return collection
 
     class Mongo:
@@ -40,7 +40,8 @@ async def test_worker_main_wires_detection_and_response_fact_consumers(monkeypat
             pass
 
     class LifecycleConsumer:
-        def __init__(self, redis_client, ledger):
+        def __init__(self, redis_client, ledger, timing_ledger):
+            assert timing_ledger.collection is collection
             events.append("lifecycle_created")
 
         async def run(self):

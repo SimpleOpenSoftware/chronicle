@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import redis.asyncio as redis
@@ -17,6 +18,7 @@ from backend.services.response_coordinator import (
     StaleResponse,
 )
 from backend.services.tts_client import synthesize_speech
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import (
     ClientUpgradeRequired,
     VoiceSessionCoordinator,
@@ -92,12 +94,22 @@ async def deliver_wav_response(
         wake_trace_id=wake_trace_id,
     )
 
+    trace = VoiceTrace(
+        redis_client,
+        TimingIdentity.from_response(response),
+        response_id=response.response_id,
+        generation=response.generation,
+    )
+    if kind != "speech":
+        trace = None
     started = time.perf_counter()
     try:
-        wav = await coordinator.synthesize(response.response_id, operation)
+        async with trace.span("tts") if trace else nullcontext():
+            wav = await coordinator.synthesize(response.response_id, operation)
         if timer is not None:
             timer.tts_ms = (time.perf_counter() - started) * 1000
-        playback = encode_wav_for_playback(wav)
+        async with trace.span("encoding") if trace else nullcontext():
+            playback = encode_wav_for_playback(wav)
         duration_ms = playback.duration_ms
         await coordinator.mark_ready(
             response.response_id,
@@ -105,7 +117,8 @@ async def deliver_wav_response(
             duration_ms=duration_ms,
             sample_rate=24_000,
         )
-        delivered = await coordinator.offer(response.response_id, playback.packets)
+        async with trace.span("downlink") if trace else nullcontext():
+            delivered = await coordinator.offer(response.response_id, playback.packets)
         if timer is not None:
             timer.est_play_secs = duration_ms / 1000
             timer.mark_downlink()

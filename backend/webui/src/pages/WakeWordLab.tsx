@@ -5,6 +5,8 @@ import { wakewordApi, WakeStream, WakeSample, WakeWordConfig, WakeStats } from '
 import { useAuth } from '../contexts/AuthContext'
 import { Alert, Button, Card, IconButton, StatCard, Tabs } from '../components/ui'
 
+import VoiceLatencyReport from '../components/VoiceLatencyReport'
+
 type Bucket = 'pending' | 'positive' | 'negative'
 
 // Native <audio> volume tops out at 1.0; route playback through a Web Audio gain
@@ -158,6 +160,8 @@ export default function WakeWordLab() {
           {error}
         </Alert>
       )}
+
+      <VoiceLatencyReport />
 
       {/* Shared active-streams indicator */}
       <Card className="mb-6">

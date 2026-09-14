@@ -48,6 +48,7 @@ def _frame(sequence: int, pcm: bytes) -> audio_pb2.CanonicalPcmFrame:
         ),
         sequence=sequence,
         monotonic_offset_us=sequence * 40_000,
+        device_monotonic_timestamp_us=900_000_000 + sequence * 40_000,
         delivery_class=audio_pb2.DELIVERY_CLASS_LIVE,
         pcm_s16le=pcm,
         data_purpose=audio_pb2.DATA_PURPOSE_NORMAL_CAPTURE,
@@ -82,6 +83,8 @@ async def test_active_consumer_publishes_only_committed_turns():
     assert committed[0]["audio_session_id"] == "audio-1"
     assert committed[0]["turn_revision"] == "0"
     assert committed[0]["pcm"].startswith(b"speech")
+    assert float(committed[0]["speech_started_device_ms"]) == 900_000
+    assert float(committed[0]["speech_ended_device_ms"]) == 900_080
 
 
 @pytest.mark.asyncio

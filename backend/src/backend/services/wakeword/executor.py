@@ -35,6 +35,7 @@ from backend.services.response_delivery import (
     deliver_text_response,
     deliver_wav_response,
 )
+from backend.services.voice_latency import timing_span
 from backend.services.voice_sessions import VoiceSessionCoordinator
 from backend.services.wakeword.timing import WakeTimer
 
@@ -467,25 +468,26 @@ async def execute_voice_command(
     try:
         _dispatch_start = time.perf_counter()
         try:
-            results = await plugin_router.dispatch_event(
-                event=PluginEvent.WAKE_WORD_DETECTED,
-                user_id=user_id,
-                data=data,
-                metadata={
-                    "client_id": client_id_value,
-                    "session_id": session_id_value,
-                    "conversation_id": conversation_id,
-                    "command": command,
-                    "wakeword": wakeword,
-                    "asr_status": asr_status,
-                    "has_speech": has_speech,
-                    "score": score,
-                    "reason": reason,
-                    "source": source,
-                    "wake_trace_id": wake_trace_id,
-                },
-                on_plugin_done=_on_plugin_done,
-            )
+            async with timing_span("routing"):
+                results = await plugin_router.dispatch_event(
+                    event=PluginEvent.WAKE_WORD_DETECTED,
+                    user_id=user_id,
+                    data=data,
+                    metadata={
+                        "client_id": client_id_value,
+                        "session_id": session_id_value,
+                        "conversation_id": conversation_id,
+                        "command": command,
+                        "wakeword": wakeword,
+                        "asr_status": asr_status,
+                        "has_speech": has_speech,
+                        "score": score,
+                        "reason": reason,
+                        "source": source,
+                        "wake_trace_id": wake_trace_id,
+                    },
+                    on_plugin_done=_on_plugin_done,
+                )
             if response_generation is not None:
                 await responses.assert_generation(
                     user_id, client_id_value, response_generation

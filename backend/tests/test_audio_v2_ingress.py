@@ -30,6 +30,7 @@ def _packet(delivery_class=audio_pb2.DELIVERY_CLASS_LIVE):
         sequence=12,
         captured_at=captured_at,
         monotonic_offset_us=240_000,
+        device_monotonic_timestamp_us=900_240_000,
         delivery_class=delivery_class,
         opus_payload=b"raw-opus",
     )
@@ -119,6 +120,10 @@ async def test_v2_opus_decodes_once_then_crosses_realtime_and_durable_seams(
         canonical_sequence=7,
     )
 
+    assert (
+        streams.publish_frame.await_args.args[0].frame.device_monotonic_timestamp_us
+        == 900_240_000
+    )
     assert next_sequence == 8
     assert streams.publish_frame.await_args.args[0].WhichOneof("event") == "frame"
     assert streams.publish_frame.await_args.args[0].frame.sequence == 7

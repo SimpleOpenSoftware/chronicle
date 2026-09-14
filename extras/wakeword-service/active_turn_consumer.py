@@ -324,6 +324,12 @@ class ActiveTurnConsumer:
                 duration_ms=duration_ms,
                 pcm=pcm,
                 speech=speech,
+                captured_at_ms=frame_event.captured_at.ToMilliseconds(),
+                device_monotonic_ms=(
+                    frame_event.device_monotonic_timestamp_us / 1000
+                    if frame_event.HasField("device_monotonic_timestamp_us")
+                    else None
+                ),
             )
             events = await segmenter.push(frame, semantic_complete=semantic_complete)
             await self._publish_events(events, data_purpose=data_purpose)
@@ -370,6 +376,19 @@ class ActiveTurnConsumer:
                 "ended_at_ms": str(event.ended_at_ms),
                 "reason": event.reason,
             }
+            metadata.update(
+                {
+                    key: str(value)
+                    for key, value in {
+                        "speech_started_device_ms": event.speech_started_device_ms,
+                        "speech_ended_device_ms": event.speech_ended_device_ms,
+                        "speech_started_at_ms": event.speech_started_at_ms,
+                        "speech_ended_at_ms": event.speech_ended_at_ms,
+                    }.items()
+                    if value is not None
+                }
+            )
+            metadata["committed_at_ms"] = str(time.time() * 1000)
             await self.redis_client.xadd(
                 TURN_EVENTS_STREAM,
                 {"event": json.dumps(metadata, separators=(",", ":"))},

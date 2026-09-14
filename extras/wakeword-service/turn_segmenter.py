@@ -37,6 +37,8 @@ class TurnFrame:
     duration_ms: float
     pcm: bytes
     speech: bool
+    captured_at_ms: float | None = None
+    device_monotonic_ms: float | None = None
 
     @property
     def end_ms(self) -> float:
@@ -61,6 +63,10 @@ class TurnEvent:
     pcm: bytes
     reason: str
     deadline_ms: float | None = None
+    speech_started_device_ms: float | None = None
+    speech_ended_device_ms: float | None = None
+    speech_started_at_ms: float | None = None
+    speech_ended_at_ms: float | None = None
 
 
 @dataclass
@@ -105,6 +111,8 @@ class TurnSegmenter:
     ) -> TurnEvent:
         first = turn.frames[0]
         last = turn.frames[-1]
+        voiced = [frame for frame in turn.frames if frame.speech]
+        onset, offset = (voiced[0], voiced[-1]) if voiced else (None, None)
         return TurnEvent(
             kind=kind,
             turn_id=turn.turn_id,
@@ -119,6 +127,18 @@ class TurnSegmenter:
             pcm=b"".join(frame.pcm for frame in turn.frames),
             reason=reason,
             deadline_ms=deadline_ms,
+            speech_started_device_ms=onset.device_monotonic_ms if onset else None,
+            speech_ended_device_ms=(
+                offset.device_monotonic_ms + offset.duration_ms
+                if offset and offset.device_monotonic_ms is not None
+                else None
+            ),
+            speech_started_at_ms=onset.captured_at_ms if onset else None,
+            speech_ended_at_ms=(
+                offset.captured_at_ms + offset.duration_ms
+                if offset and offset.captured_at_ms is not None
+                else None
+            ),
         )
 
     def _cancel(self, reason: str) -> TurnEvent | None:

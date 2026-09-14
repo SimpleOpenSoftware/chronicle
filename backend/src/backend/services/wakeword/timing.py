@@ -22,7 +22,7 @@ What each field measures:
 - ``total``    best-effort end-to-end ≈ capture + asr + (dispatch → downlink).
 - ``est_play`` estimated playback length used by legacy log-only callers. Voice
                protocol v1 emits durable offered/started/done acknowledgements;
-               :mod:`wakeword.latency` is the canonical physical-playback report.
+               :mod:`services.voice_latency` owns the device-clock interaction report.
 
 All durations use a monotonic clock; ``capture``/``asr`` are passed in from the
 dispatcher (which runs before this timer is created).

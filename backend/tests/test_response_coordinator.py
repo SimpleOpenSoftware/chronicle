@@ -92,7 +92,7 @@ async def _queued_response(coordinator, voice):
 
 async def _interaction_events(redis_client):
     rows = await redis_client.xrange("wakeword:interaction-events")
-    return [json.loads(fields[b"event"]) for _, fields in rows]
+    return [json.loads(fields[b"event"]) for _, fields in rows if b"event" in fields]
 
 
 async def test_wake_response_lifecycle_is_durably_emitted_in_the_state_transaction(
@@ -417,8 +417,9 @@ async def test_capture_only_client_must_upgrade_before_interactive_delivery(
     synthesize.assert_not_awaited()
 
 
-async def test_text_delivery_publishes_audio_v2_playback_for_phone(
-    coordinator, voice_coordinator, redis_client, monkeypatch
+@pytest.mark.parametrize("kind", ["speech", "tone"])
+async def test_delivery_publishes_audio_v2_and_only_speech_enters_timing_report(
+    coordinator, voice_coordinator, redis_client, monkeypatch, kind
 ):
     voice = await _ready_voice(voice_coordinator)
     await SessionStore(redis_client).init_session(
@@ -448,14 +449,37 @@ async def test_text_delivery_publishes_audio_v2_playback_for_phone(
     await pubsub.subscribe(channel)
     await pubsub.get_message(timeout=1)
 
-    offered = await deliver_text_response(
-        redis_client,
-        ClientId.from_value("client-1"),
-        SessionId.from_value("audio-1"),
-        "hello",
-        generation=generation,
-        turn_id="turn-1",
-    )
+    if kind == "speech":
+        offered = await deliver_text_response(
+            redis_client,
+            ClientId.from_value("client-1"),
+            SessionId.from_value("audio-1"),
+            "hello",
+            generation=generation,
+            turn_id="turn-1",
+        )
+    else:
+        offered = await response_delivery.deliver_wav_response(
+            redis_client,
+            ClientId.from_value("client-1"),
+            SessionId.from_value("audio-1"),
+            AsyncMock(return_value=_wav()),
+            kind="tone",
+            generation=generation,
+            turn_id="turn-1",
+        )
+    timings = [
+        audio_pb2.InteractionTimingEvent.FromString(fields[b"timing"])
+        for _, fields in await redis_client.xrange("wakeword:interaction-events")
+        if b"timing" in fields
+    ]
+    assert bool(timings) == (kind == "speech")
+    if kind == "speech":
+        assert {e.stage for e in timings if e.HasField("duration_ms")} == {
+            "tts",
+            "encoding",
+            "downlink",
+        }
     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
     downlink = audio_pb2.DeviceDownlinkEvent.FromString(message["data"])
 

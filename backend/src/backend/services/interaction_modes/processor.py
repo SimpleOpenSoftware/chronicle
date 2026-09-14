@@ -15,6 +15,7 @@ from backend.observability.tracing import (
 )
 from backend.plugins.router import PluginRouter
 from backend.services.response_coordinator import ResponseCoordinator, StaleResponse
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import VoiceSessionCoordinator
 
 from .contracts import (
@@ -90,7 +91,22 @@ class InteractionProcessor:
                         "activation_phrase": item.activation_phrase,
                     },
                 )
-                dispatch = await self._process_active(item, session)
+                trace = VoiceTrace(
+                    self.redis,
+                    TimingIdentity(
+                        item.user_id,
+                        item.client_id,
+                        item.audio_session_id,
+                        item.audio_interval.capture_epoch,
+                        item.audio_interval.turn_id or item.input_id,
+                        item.audio_interval.turn_revision,
+                    ),
+                )
+                with trace.bind():
+                    async with trace.span(
+                        "mode_handler", detail=session.owner_plugin_id
+                    ):
+                        dispatch = await self._process_active(item, session)
                 set_span_attributes(
                     span,
                     {

@@ -13,7 +13,8 @@
     "test:wearable-activation": "node scripts/test-wearable-activation.cjs",
     "test:durable-audio-spool": "node scripts/test-durable-audio-spool.cjs",
     "test:push-notifications": "node scripts/test-push-notifications.cjs",
-    "check:theme": "node scripts/check-theme-tokens.mjs"
+    "check:theme": "node scripts/check-theme-tokens.mjs",
+    "test:voice-timing": "node scripts/test-voice-timing.cjs"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.14.0",

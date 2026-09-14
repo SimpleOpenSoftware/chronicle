@@ -41,6 +41,7 @@ export interface CapturePacket {
   sequence: number;
   capturedAtMs: number;
   monotonicOffsetUs: number;
+  deviceMonotonicTimestampUs?: number;
   opus: Uint8Array;
 }
 
@@ -180,6 +181,8 @@ export class AudioV2Socket {
           sequence: BigInt(packet.sequence),
           capturedAt: timestampFromUnixMs(packet.capturedAtMs),
           monotonicOffsetUs: BigInt(packet.monotonicOffsetUs),
+          deviceMonotonicTimestampUs: packet.deviceMonotonicTimestampUs === undefined
+            ? undefined : BigInt(Math.round(packet.deviceMonotonicTimestampUs)),
           deliveryClass: this.currentDeliveryClass,
           opusPayload: packet.opus,
         }),

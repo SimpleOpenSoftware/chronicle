@@ -687,6 +687,7 @@ class ServerControl(_message.Message):
 
 class CaptureMediaPacket(_message.Message):
     __slots__ = (
+        "device_monotonic_timestamp_us",
         "binding",
         "sequence",
         "captured_at",
@@ -694,12 +695,14 @@ class CaptureMediaPacket(_message.Message):
         "delivery_class",
         "opus_payload",
     )
+    DEVICE_MONOTONIC_TIMESTAMP_US_FIELD_NUMBER: _ClassVar[int]
     BINDING_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     CAPTURED_AT_FIELD_NUMBER: _ClassVar[int]
     MONOTONIC_OFFSET_US_FIELD_NUMBER: _ClassVar[int]
     DELIVERY_CLASS_FIELD_NUMBER: _ClassVar[int]
     OPUS_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    device_monotonic_timestamp_us: int
     binding: CaptureBinding
     sequence: int
     captured_at: _timestamp_pb2.Timestamp
@@ -708,6 +711,7 @@ class CaptureMediaPacket(_message.Message):
     opus_payload: bytes
     def __init__(
         self,
+        device_monotonic_timestamp_us: _Optional[int] = ...,
         binding: _Optional[_Union[CaptureBinding, _Mapping]] = ...,
         sequence: _Optional[int] = ...,
         captured_at: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ...,
@@ -807,6 +811,7 @@ class CaptureStreamOpened(_message.Message):
 
 class CanonicalPcmFrame(_message.Message):
     __slots__ = (
+        "device_monotonic_timestamp_us",
         "binding",
         "sequence",
         "captured_at",
@@ -815,6 +820,7 @@ class CanonicalPcmFrame(_message.Message):
         "pcm_s16le",
         "data_purpose",
     )
+    DEVICE_MONOTONIC_TIMESTAMP_US_FIELD_NUMBER: _ClassVar[int]
     BINDING_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     CAPTURED_AT_FIELD_NUMBER: _ClassVar[int]
@@ -822,6 +828,7 @@ class CanonicalPcmFrame(_message.Message):
     DELIVERY_CLASS_FIELD_NUMBER: _ClassVar[int]
     PCM_S16LE_FIELD_NUMBER: _ClassVar[int]
     DATA_PURPOSE_FIELD_NUMBER: _ClassVar[int]
+    device_monotonic_timestamp_us: int
     binding: CaptureBinding
     sequence: int
     captured_at: _timestamp_pb2.Timestamp
@@ -831,6 +838,7 @@ class CanonicalPcmFrame(_message.Message):
     data_purpose: DataPurpose
     def __init__(
         self,
+        device_monotonic_timestamp_us: _Optional[int] = ...,
         binding: _Optional[_Union[CaptureBinding, _Mapping]] = ...,
         sequence: _Optional[int] = ...,
         captured_at: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ...,
@@ -868,4 +876,75 @@ class CaptureStreamEvent(_message.Message):
         frame: _Optional[_Union[CanonicalPcmFrame, _Mapping]] = ...,
         ended: _Optional[_Union[CaptureStreamEnded, _Mapping]] = ...,
         failed: _Optional[_Union[ProtocolError, _Mapping]] = ...,
+    ) -> None: ...
+
+class InteractionTimingEvent(_message.Message):
+    __slots__ = (
+        "event_id",
+        "user_id",
+        "client_id",
+        "audio_session_id",
+        "capture_epoch",
+        "turn_id",
+        "turn_revision",
+        "response_id",
+        "generation",
+        "stage",
+        "clock_domain",
+        "timestamp_ms",
+        "observed_at_ms",
+        "duration_ms",
+        "outcome",
+        "detail",
+    )
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    USER_ID_FIELD_NUMBER: _ClassVar[int]
+    CLIENT_ID_FIELD_NUMBER: _ClassVar[int]
+    AUDIO_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    CAPTURE_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    TURN_ID_FIELD_NUMBER: _ClassVar[int]
+    TURN_REVISION_FIELD_NUMBER: _ClassVar[int]
+    RESPONSE_ID_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_FIELD_NUMBER: _ClassVar[int]
+    STAGE_FIELD_NUMBER: _ClassVar[int]
+    CLOCK_DOMAIN_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMP_MS_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    DURATION_MS_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    event_id: str
+    user_id: str
+    client_id: str
+    audio_session_id: str
+    capture_epoch: int
+    turn_id: str
+    turn_revision: int
+    response_id: str
+    generation: int
+    stage: str
+    clock_domain: str
+    timestamp_ms: float
+    observed_at_ms: float
+    duration_ms: float
+    outcome: str
+    detail: str
+    def __init__(
+        self,
+        event_id: _Optional[str] = ...,
+        user_id: _Optional[str] = ...,
+        client_id: _Optional[str] = ...,
+        audio_session_id: _Optional[str] = ...,
+        capture_epoch: _Optional[int] = ...,
+        turn_id: _Optional[str] = ...,
+        turn_revision: _Optional[int] = ...,
+        response_id: _Optional[str] = ...,
+        generation: _Optional[int] = ...,
+        stage: _Optional[str] = ...,
+        clock_domain: _Optional[str] = ...,
+        timestamp_ms: _Optional[float] = ...,
+        observed_at_ms: _Optional[float] = ...,
+        duration_ms: _Optional[float] = ...,
+        outcome: _Optional[str] = ...,
+        detail: _Optional[str] = ...,
     ) -> None: ...

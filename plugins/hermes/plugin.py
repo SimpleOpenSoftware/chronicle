@@ -27,6 +27,7 @@ from backend.plugins.base import (
     PluginContext,
     PluginResult,
 )
+from backend.services.voice_latency import timing_span
 
 logger = logging.getLogger(__name__)
 
@@ -256,11 +257,12 @@ class HermesPlugin(BasePlugin):
 
         try:
             logger.info(f"Forwarding command to Hermes: '{command}'")
-            resp = await self._client.post(
-                f"{self.api_url}/v1/chat/completions",
-                json=payload,
-                headers=self._headers(session_id=conversation_id),
-            )
+            async with timing_span("agent", detail="hermes_full_reply"):
+                resp = await self._client.post(
+                    f"{self.api_url}/v1/chat/completions",
+                    json=payload,
+                    headers=self._headers(session_id=conversation_id),
+                )
             resp.raise_for_status()
             data = resp.json()
 
@@ -272,7 +274,8 @@ class HermesPlugin(BasePlugin):
             # the channel has context. Each line is prefixed for multi-line input.
             quoted = "\n".join(f"> {line}" for line in command.splitlines())
             discord_text = f"{quoted}\n\n{reply}" if quoted else reply
-            await self._push_to_discord(discord_text)
+            async with timing_span("notification", detail="discord"):
+                await self._push_to_discord(discord_text)
 
             return PluginResult(
                 success=True,

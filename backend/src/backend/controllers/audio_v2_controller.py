@@ -350,6 +350,11 @@ async def ingest_capture_packet(
                     sequence=canonical_sequence + index,
                     captured_at=captured_at,
                     monotonic_offset_us=packet.monotonic_offset_us + index * 20_000,
+                    device_monotonic_timestamp_us=(
+                        packet.device_monotonic_timestamp_us + index * 20_000
+                        if packet.HasField("device_monotonic_timestamp_us")
+                        else None
+                    ),
                     delivery_class=packet.delivery_class,
                     pcm_s16le=pcm,
                     data_purpose={

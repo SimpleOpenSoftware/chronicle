@@ -135,6 +135,7 @@ export const useAudioStreamer = (options?: UseAudioStreamerOptions): UseAudioStr
   const reconnectAttemptRef = useRef(0);
   const liveSequenceRef = useRef(0);
   const liveStartedAtRef = useRef(0);
+  const nativeClockOriginRef = useRef<number | null>(null);
   const acceptedRef = useRef(new Map<number, SpoolPacket>());
   const acceptedWaitersRef = useRef(new Map<number, () => void>());
   const connectingRef = useRef<Promise<void> | null>(null);
@@ -168,17 +169,23 @@ export const useAudioStreamer = (options?: UseAudioStreamerOptions): UseAudioStr
     acceptedWaitersRef.current.delete(sequence);
   }, []);
 
-  const sendSpoolPacket = useCallback((packet: SpoolPacket, sequence: number) => {
+  const sendSpoolPacket = useCallback((packet: SpoolPacket, sequence: number, nativeMs?: number) => {
     const socket = socketRef.current;
     if (!socket?.activeBinding) return false;
     acceptedRef.current.set(sequence, packet);
+    if (nativeMs !== undefined && nativeClockOriginRef.current === null) {
+      nativeClockOriginRef.current = nativeMs;
+    }
     socket.sendPacket({
       sequence,
       capturedAtMs: packet.capturedAtMs,
       monotonicOffsetUs: Math.max(
         0,
-        Math.round((packet.capturedAtMs - liveStartedAtRef.current) * 1000)
+        Math.round((nativeMs === undefined
+          ? packet.capturedAtMs - liveStartedAtRef.current
+          : nativeMs - nativeClockOriginRef.current!) * 1000)
       ),
+      deviceMonotonicTimestampUs: nativeMs === undefined ? undefined : nativeMs * 1000,
       opus: packet.payload,
     });
     return true;
@@ -339,6 +346,7 @@ export const useAudioStreamer = (options?: UseAudioStreamerOptions): UseAudioStr
       deliveryModeRef.current = 'recovering';
       await drainRecovery(socket, phoneVoice?.captureEpoch ?? 0);
       liveStartedAtRef.current = Date.now();
+      nativeClockOriginRef.current = null;
       liveSequenceRef.current = 0;
       const capabilities = phoneVoice
         ? typedCapabilities(phoneVoice.capabilities)
@@ -419,11 +427,11 @@ export const useAudioStreamer = (options?: UseAudioStreamerOptions): UseAudioStr
     }
   }, [drainRecovery, encodeBase64, options, packetAccepted]);
 
-  const enqueueLive = useCallback((opus: Uint8Array, capturedAtMs: number) => {
+  const enqueueLive = useCallback((opus: Uint8Array, capturedAtMs: number, nativeMs?: number) => {
     if (!opus.length) return;
     const packet = durableAudioSpool.append(opus, capturedAtMs);
     if (deliveryModeRef.current === 'live') {
-      sendSpoolPacket(packet, liveSequenceRef.current++);
+      sendSpoolPacket(packet, liveSequenceRef.current++, nativeMs);
     }
   }, [sendSpoolPacket]);
 
@@ -432,7 +440,7 @@ export const useAudioStreamer = (options?: UseAudioStreamerOptions): UseAudioStr
   }, [enqueueLive]);
 
   const sendInteractiveFrame = useCallback((frame: CapturedOpusFrame) => {
-    enqueueLive(frame.opus, frame.capturedAtMs);
+    enqueueLive(frame.opus, frame.capturedAtMs, frame.monotonicTimestampMs);
   }, [enqueueLive]);
 
   useEffect(() => {

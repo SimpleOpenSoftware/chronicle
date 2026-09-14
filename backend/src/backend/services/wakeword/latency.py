@@ -1,4 +1,8 @@
-"""One canonical latency report over immutable wake interaction facts."""
+"""Wake activation stage timings over immutable facts.
+
+These wall-clock/ACK intervals are diagnostic, not acoustic end-to-end latency.
+The device-clock speaking/waiting/playback report lives in services.voice_latency.
+"""
 
 from __future__ import annotations
 

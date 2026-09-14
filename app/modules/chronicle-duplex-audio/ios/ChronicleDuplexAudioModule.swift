@@ -173,8 +173,8 @@ public final class ChronicleDuplexAudioModule: Module {
     self.converter = converter
     self.opusConverter = opusConverter
     let inputFrameCount = AVAudioFrameCount(round(inputFormat.sampleRate * 0.02))
-    input.installTap(onBus: 0, bufferSize: inputFrameCount, format: inputFormat) { [weak self] buffer, _ in
-      self?.emitOpus(buffer)
+    input.installTap(onBus: 0, bufferSize: inputFrameCount, format: inputFormat) { [weak self] buffer, audioTime in
+      self?.emitOpus(buffer, audioTime: audioTime)
     }
     tapInstalled = true
     engine.prepare()
@@ -182,7 +182,10 @@ public final class ChronicleDuplexAudioModule: Module {
     sessionRunning = true
   }
 
-  private func emitOpus(_ input: AVAudioPCMBuffer) {
+  private func emitOpus(_ input: AVAudioPCMBuffer, audioTime: AVAudioTime) {
+    let capturedMonotonicMs = AVAudioTime.seconds(forHostTime: audioTime.hostTime) * 1_000
+    let capturedWallMs = Date().timeIntervalSince1970 * 1_000
+      - (ProcessInfo.processInfo.systemUptime * 1_000 - capturedMonotonicMs)
     guard !captureSuppressed,
           engine.isRunning,
           let converter,
@@ -232,8 +235,8 @@ public final class ChronicleDuplexAudioModule: Module {
     let durationMs = Double(output.frameLength) / 16_000 * 1_000
     sendEvent("onOpusFrame", [
       "captureEpoch": captureEpoch,
-      "capturedAtMs": Date().timeIntervalSince1970 * 1_000 - durationMs,
-      "monotonicTimestampMs": ProcessInfo.processInfo.systemUptime * 1_000 - durationMs,
+      "capturedAtMs": capturedWallMs,
+      "monotonicTimestampMs": capturedMonotonicMs,
       "sampleRate": 16_000,
       "channels": 1,
       "frameDurationMs": durationMs,
@@ -277,22 +280,35 @@ public final class ChronicleDuplexAudioModule: Module {
     currentResponse = (responseId, generation)
     captureSuppressed = capabilities()["mode"] as? String == "duplex_half"
     for (index, buffer) in decoded.enumerated() {
+      let isFirst = index == 0
       let isLast = index == decoded.count - 1
+      let bufferDurationMs = Double(buffer.frameLength) / buffer.format.sampleRate * 1_000
       player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
-        guard isLast else { return }
+        // Capture the observation before dispatching across the control queue.
+        // Apple includes downstream/device latency in dataPlayedBack. Subtracting
+        // the first buffer estimates its onset; callback jitter remains explicit
+        // in the report's estimated quality.
+        let completedMs = ProcessInfo.processInfo.systemUptime * 1_000
+        guard isFirst || isLast else { return }
         self?.controlQueue.async {
           guard let self,
                 let current = self.currentResponse,
                 current.id == responseId,
                 current.generation == generation else { return }
-          self.currentResponse = nil
-          self.captureSuppressed = false
-          self.emitPlayback(responseId, generation, state: "done", errorCode: nil)
+          if isFirst {
+            self.emitPlayback(responseId, generation, state: "started", errorCode: nil,
+                              timestampMs: completedMs - bufferDurationMs)
+          }
+          if isLast {
+            self.currentResponse = nil
+            self.captureSuppressed = false
+            self.emitPlayback(responseId, generation, state: "done", errorCode: nil,
+                              timestampMs: completedMs)
+          }
         }
       }
     }
     player.play()
-    emitPlayback(responseId, generation, state: "started", errorCode: nil)
   }
 
   private func decodePlaybackPacket(
@@ -349,14 +365,15 @@ public final class ChronicleDuplexAudioModule: Module {
     _ responseId: String,
     _ generation: Int,
     state: String,
-    errorCode: String?
+    errorCode: String?,
+    timestampMs: Double? = nil
   ) {
     sendEvent("onPlaybackState", [
       "responseId": responseId,
       "generation": generation,
       "captureEpoch": captureEpoch,
       "state": state,
-      "monotonicTimestampMs": ProcessInfo.processInfo.systemUptime * 1_000,
+      "monotonicTimestampMs": timestampMs ?? ProcessInfo.processInfo.systemUptime * 1_000,
       "errorCode": errorCode as Any,
     ])
   }

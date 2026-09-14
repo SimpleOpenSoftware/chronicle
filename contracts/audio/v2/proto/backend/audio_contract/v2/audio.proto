@@ -266,6 +266,8 @@ message ServerControl {
 }
 
 message CaptureMediaPacket {
+  // Native device uptime of the first sample; absent for sources without this clock.
+  optional uint64 device_monotonic_timestamp_us = 7;
   CaptureBinding binding = 1;
   uint64 sequence = 2;
   google.protobuf.Timestamp captured_at = 3;
@@ -311,6 +313,7 @@ message CaptureStreamOpened {
 }
 
 message CanonicalPcmFrame {
+  optional uint64 device_monotonic_timestamp_us = 9;
   CaptureBinding binding = 1;
   uint64 sequence = 2;
   google.protobuf.Timestamp captured_at = 3;
@@ -332,4 +335,24 @@ message CaptureStreamEvent {
     CaptureStreamEnded ended = 3;
     ProtocolError failed = 4;
   }
+}
+
+// Durable diagnostic observations. No transcript, response text, or audio payload.
+message InteractionTimingEvent {
+  string event_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+  string audio_session_id = 4;
+  uint64 capture_epoch = 5;
+  string turn_id = 6;
+  uint32 turn_revision = 7;
+  string response_id = 8;
+  uint64 generation = 9;
+  string stage = 10;
+  string clock_domain = 11;
+  double timestamp_ms = 12;
+  double observed_at_ms = 13;
+  optional double duration_ms = 14;
+  string outcome = 15;
+  string detail = 16;
 }

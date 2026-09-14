@@ -193,11 +193,12 @@ class ChronicleDuplexAudioModule : Module() {
       val count = activeRecorder.read(frame, 0, frame.size, AudioRecord.READ_BLOCKING)
       if (count <= 0 || captureSuppressed) continue
       val durationMs = count.toDouble() / (16_000 * 2) * 1_000
+      val capturedUs = SystemClock.elapsedRealtimeNanos() / 1_000 - (durationMs * 1_000).toLong()
       val inputIndex = encoder.dequeueInputBuffer(10_000)
       if (inputIndex >= 0) {
         encoder.getInputBuffer(inputIndex)?.apply { clear(); put(frame, 0, count) }
         encoder.queueInputBuffer(
-          inputIndex, 0, count, SystemClock.elapsedRealtimeNanos() / 1_000, 0
+          inputIndex, 0, count, capturedUs, 0
         )
       }
       while (true) {
@@ -214,8 +215,9 @@ class ChronicleDuplexAudioModule : Module() {
             "onOpusFrame",
             bundleOf(
               "captureEpoch" to epoch,
-              "capturedAtMs" to System.currentTimeMillis().toDouble() - durationMs,
-              "monotonicTimestampMs" to SystemClock.elapsedRealtime().toDouble() - durationMs,
+              "capturedAtMs" to System.currentTimeMillis().toDouble()
+                - (SystemClock.elapsedRealtime().toDouble() - outputInfo.presentationTimeUs / 1_000.0),
+              "monotonicTimestampMs" to outputInfo.presentationTimeUs / 1_000.0,
               "sampleRate" to 16_000,
               "channels" to 1,
               "frameDurationMs" to durationMs,
@@ -253,8 +255,9 @@ class ChronicleDuplexAudioModule : Module() {
     val binding = EpochResponse(responseId, generation, epoch)
     currentResponse = binding
     captureSuppressed = capabilities()["mode"] == "duplex_half"
+    activePlayer.pause()
+    activePlayer.flush()
     activePlayer.play()
-    emitPlayback(responseId, generation, "started", null)
     playbackExecutor.execute {
       playOpusPackets(packets, activePlayer, binding)
     }
@@ -273,6 +276,18 @@ class ChronicleDuplexAudioModule : Module() {
       val info = MediaCodec.BufferInfo()
       var inputSequence = 0
       var outputEnded = false
+      var writtenFrames = 0L
+      var started = false
+      val initialHead = activePlayer.playbackHeadPosition.toLong() and 0xffffffffL
+      fun playedFrames(): Long = ((activePlayer.playbackHeadPosition.toLong() and 0xffffffffL) - initialHead) and 0xffffffffL
+      fun observeStart() {
+        val played = playedFrames()
+        if (!started && played > 0) {
+          started = true
+          emitPlayback(binding.id, binding.generation, "started", null,
+            SystemClock.elapsedRealtime().toDouble() - played * 1_000.0 / 24_000)
+        }
+      }
       while (!outputEnded && currentResponse == binding) {
         if (inputSequence <= packets.size) {
           val inputIndex = decoder.dequeueInputBuffer(10_000)
@@ -299,15 +314,30 @@ class ChronicleDuplexAudioModule : Module() {
               limit(info.offset + info.size)
               get(pcm)
             }
-            if (activePlayer.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING) <= 0) {
-              throw IllegalStateException("AudioTrack write failed")
+            var offset = 0
+            while (offset < pcm.size && currentResponse == binding) {
+              val written = activePlayer.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+              if (written <= 0) throw IllegalStateException("AudioTrack write failed")
+              offset += written
+              writtenFrames += written / 2
+              observeStart()
             }
           }
           outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
           decoder.releaseOutputBuffer(outputIndex, false)
         }
       }
+      val drainDeadline = SystemClock.elapsedRealtime() + 5_000
+      while (currentResponse == binding && playedFrames() < writtenFrames) {
+        observeStart()
+        if (SystemClock.elapsedRealtime() >= drainDeadline) {
+          throw IllegalStateException("AudioTrack drain timeout")
+        }
+        Thread.sleep(5)
+      }
+      observeStart()
       if (currentResponse == binding) {
+        if (!started) throw IllegalStateException("AudioTrack rendered no frames")
         currentResponse = null
         captureSuppressed = false
         emitPlayback(binding.id, binding.generation, "done", null)
@@ -333,7 +363,8 @@ class ChronicleDuplexAudioModule : Module() {
     emitPlayback(current.id, current.generation, "cancelled", errorCode)
   }
 
-  private fun emitPlayback(responseId: String, generation: Int, state: String, errorCode: String?) {
+  private fun emitPlayback(responseId: String, generation: Int, state: String, errorCode: String?,
+                           timestampMs: Double = SystemClock.elapsedRealtime().toDouble()) {
     sendEvent(
       "onPlaybackState",
       bundleOf(
@@ -341,7 +372,7 @@ class ChronicleDuplexAudioModule : Module() {
         "generation" to generation,
         "captureEpoch" to captureEpoch,
         "state" to state,
-        "monotonicTimestampMs" to SystemClock.elapsedRealtime().toDouble(),
+        "monotonicTimestampMs" to timestampMs,
         "errorCode" to errorCode,
       ),
     )

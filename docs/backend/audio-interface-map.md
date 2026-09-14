@@ -291,3 +291,14 @@ test and a deployed trace both exist.
   draining serially on the local GPU (three completed at the last checkpoint, one
   running, 21 queued); they remain deliberately serialized to avoid competing VRAM
   peaks.
+
+### Voice timing observations
+
+- Live phone packets and canonical PCM frames can carry native device monotonic
+  timestamps independently of session-relative offsets and wall time.
+- Turn segmentation retains first/last voiced-frame timestamps separately from the
+  committed interval's pre-roll and endpoint silence.
+- Generated `InteractionTimingEvent` observations join STT, response delivery and
+  device playback through the existing durable interaction-event consumer.
+- See [voice-latency.md](voice-latency.md) for measurement semantics, missing-event
+  handling and the required physical-device validation gate.

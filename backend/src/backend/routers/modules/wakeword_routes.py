@@ -24,7 +24,9 @@ from pydantic import BaseModel
 
 from backend.auth import current_active_user, current_superuser
 from backend.client_manager import owns_client_id, user_id_prefix
+from backend.database import get_database
 from backend.redis_factory import create_async_redis
+from backend.services import voice_latency
 from backend.services.plugin_service import get_plugin_router
 from backend.services.wakeword.executor import open_followup_window
 from backend.services.wakeword.followup import handle_dial_followup
@@ -828,3 +830,15 @@ async def delete_sample(
                 status_code=503, detail=f"Wake-word service unreachable: {e}"
             )
     return resp.json()
+
+
+@router.get("/latency")
+async def voice_interaction_latency(
+    limit: int = Query(20, ge=1, le=100),
+    client_id: str | None = Query(None),
+    current_user: User = Depends(current_active_user),
+):
+    """Recent voice turns, including incomplete/failed traces, owned by this user."""
+    return await voice_latency.recent_voice_reports(
+        get_database(), user_id=str(current_user.id), client_id=client_id, limit=limit
+    )

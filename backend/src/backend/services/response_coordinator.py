@@ -26,6 +26,7 @@ from backend.services.playback_audio import (
     DOWNLINK_FRAME_MS,
     DOWNLINK_SAMPLE_RATE_HZ,
 )
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import VoiceSessionCoordinator
 
 RESPONSE_RETENTION_SECONDS = 24 * 60 * 60
@@ -293,6 +294,13 @@ class ResponseCoordinator:
                     continue
 
         if cancelled is not None and cancelled.state == "cancelled":
+            if cancelled.kind == "speech":
+                await VoiceTrace(
+                    self.redis,
+                    TimingIdentity.from_response(cancelled),
+                    response_id=cancelled.response_id,
+                    generation=cancelled.generation,
+                ).emit("response_cancelled", detail=reason)
             event = audio_pb2.DeviceDownlinkEvent(
                 cancel_playback=audio_pb2.CancelPlayback(
                     binding=_capture_binding(cancelled),
@@ -380,6 +388,17 @@ class ResponseCoordinator:
                         record.response_id,
                         ex=RESPONSE_RETENTION_SECONDS,
                     )
+                    if record.kind == "speech":
+                        event = VoiceTrace(
+                            self.redis,
+                            TimingIdentity.from_response(record),
+                            response_id=record.response_id,
+                            generation=record.generation,
+                        ).event("response_queued")
+                        pipe.xadd(
+                            WAKE_INTERACTION_EVENTS_STREAM,
+                            {"timing": event.SerializeToString()},
+                        )
                     if record.wake_trace_id:
                         pipe.xadd(
                             WAKE_INTERACTION_EVENTS_STREAM,
@@ -448,6 +467,35 @@ class ResponseCoordinator:
                     pipe.expire(record_key, RESPONSE_RETENTION_SECONDS)
                     if state in {"done", "cancelled", "failed"}:
                         pipe.delete(current_key)
+                    if record.kind == "speech" and state != "synthesizing":
+                        trace = VoiceTrace(
+                            self.redis,
+                            TimingIdentity.from_response(record),
+                            response_id=record.response_id,
+                            generation=record.generation,
+                        )
+                        ack_ms = (updates or {}).get("playback_monotonic_ms")
+                        timing_stage = (
+                            "response_started"
+                            if state == "playing"
+                            else "response_" + state
+                        )
+                        event = trace.event(
+                            timing_stage,
+                            **(
+                                {
+                                    "timestamp_ms": float(ack_ms),
+                                    "clock_domain": trace.identity.device_clock,
+                                }
+                                if ack_ms is not None
+                                else {}
+                            ),
+                            detail=(updates or {}).get("terminal_reason", ""),
+                        )
+                        pipe.xadd(
+                            WAKE_INTERACTION_EVENTS_STREAM,
+                            {"timing": event.SerializeToString()},
+                        )
                     stage = {
                         "ready": "response_ready",
                         "offered": "response_offered",
@@ -658,10 +706,33 @@ class ResponseCoordinator:
         # player can report that it actually stopped. Accept that later observation
         # without reviving the response or replacing the coordinator's reason.
         if state == "cancelled" and record.state == "cancelled":
+            prior = await self.redis.hget(
+                voice_response(response_id), "ack_cancelled_ms"
+            )
+            if prior is not None:
+                if float(_decode(prior)) != monotonic_timestamp_ms:
+                    raise InvalidResponseTransition(
+                        "conflicting cancellation acknowledgement"
+                    )
+                return record
+            if record.kind == "speech":
+                trace = VoiceTrace(
+                    self.redis,
+                    TimingIdentity.from_response(record),
+                    response_id=record.response_id,
+                    generation=record.generation,
+                )
+                await trace.emit(
+                    "response_cancelled",
+                    timestamp_ms=monotonic_timestamp_ms,
+                    clock_domain=trace.identity.device_clock,
+                    detail=record.terminal_reason or "cancelled",
+                )
             await self.redis.hset(
                 voice_response(response_id),
                 mapping={
                     "playback_monotonic_ms": str(monotonic_timestamp_ms),
+                    "ack_cancelled_ms": str(monotonic_timestamp_ms),
                     "updated_at": str(time.time()),
                 },
             )
@@ -669,6 +740,14 @@ class ResponseCoordinator:
             if acknowledged is None:
                 raise StaleResponse("response disappeared during cancellation ACK")
             return acknowledged
+
+        prior_ack = await self.redis.hget(
+            voice_response(response_id), f"ack_{state}_ms"
+        )
+        if prior_ack is not None:
+            if float(_decode(prior_ack)) != monotonic_timestamp_ms:
+                raise InvalidResponseTransition("conflicting playback acknowledgement")
+            return record
 
         transitions: dict[str, tuple[set[ResponseState], ResponseState]] = {
             "started": ({"offered"}, "playing"),
@@ -684,6 +763,7 @@ class ResponseCoordinator:
             state=next_state,
             updates={
                 "playback_monotonic_ms": str(monotonic_timestamp_ms),
+                f"ack_{state}_ms": str(monotonic_timestamp_ms),
                 "terminal_reason": terminal_reason,
             },
         )

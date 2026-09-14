@@ -16,6 +16,12 @@ from backend.redis_keys import SessionId, transcription_results_stream
 from backend.services.audio_stream.session_store import SessionStore
 from backend.services.response_coordinator import ResponseCoordinator
 from backend.services.transcription import get_transcription_provider
+from backend.services.voice_latency import (
+    TimingIdentity,
+    VoiceTrace,
+    mark_timing,
+    timing_span,
+)
 from backend.services.voice_sessions import VoiceSessionCoordinator
 from backend.services.wakeword.activations import WakeActivation, WakeActivationStore
 from backend.utils.audio_utils import pcm_to_wav_bytes
@@ -50,6 +56,11 @@ class CommittedAudioTurn:
     sample_rate: int
     channels: int
     sample_width: int
+    speech_started_device_ms: float | None = None
+    speech_ended_device_ms: float | None = None
+    speech_started_at_ms: float | None = None
+    speech_ended_at_ms: float | None = None
+    committed_at_ms: float | None = None
 
     @classmethod
     def from_fields(cls, fields: dict) -> "CommittedAudioTurn":
@@ -94,6 +105,17 @@ class CommittedAudioTurn:
             sample_rate=int(required["sample_rate"]),
             channels=int(required["channels"]),
             sample_width=int(required["sample_width"]),
+            **{
+                key: float(_value(fields, key))
+                for key in (
+                    "speech_started_device_ms",
+                    "speech_ended_device_ms",
+                    "speech_started_at_ms",
+                    "speech_ended_at_ms",
+                    "committed_at_ms",
+                )
+                if _value(fields, key) is not None
+            },
         )
 
 
@@ -125,6 +147,21 @@ class CommittedTranscriptAssembler:
         self.watermark_wait_seconds = watermark_wait_seconds
 
     async def resolve(self, turn: CommittedAudioTurn) -> TranscriptResolution:
+        async with timing_span("stt"):
+            async with timing_span("stt_wait", detail="streaming_final_watermark"):
+                text, watermark_ms = await self._wait_for_final(turn)
+            if text:
+                return TranscriptResolution(text, "streaming_final", watermark_ms)
+            async with timing_span("stt_batch", detail="exact_range_batch"):
+                text = await self.exact_transcriber(
+                    turn.pcm,
+                    turn.sample_rate,
+                    turn.channels,
+                    turn.sample_width,
+                )
+            return TranscriptResolution(text.strip(), "exact_range_batch", watermark_ms)
+
+    async def _wait_for_final(self, turn: CommittedAudioTurn) -> tuple[str, float]:
         deadline = time.monotonic() + self.watermark_wait_seconds
         watermark_ms = 0.0
         while True:
@@ -143,19 +180,13 @@ class CommittedTranscriptAssembler:
                     for word in selected
                 ).strip()
                 if text:
-                    return TranscriptResolution(text, "streaming_final", watermark_ms)
+                    return text, watermark_ms
                 break
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(STT_POLL_SECONDS)
 
-        text = await self.exact_transcriber(
-            turn.pcm,
-            turn.sample_rate,
-            turn.channels,
-            turn.sample_width,
-        )
-        return TranscriptResolution(text.strip(), "exact_range_batch", watermark_ms)
+        return "", watermark_ms
 
     async def _final_words(self, audio_session_id: str) -> tuple[list[dict], float]:
         stream = str(
@@ -245,6 +276,43 @@ class CommittedTurnRouter:
                 "committed turn does not match authenticated capture binding"
             )
 
+        trace = VoiceTrace(
+            self.redis, TimingIdentity.from_turn(turn, voice.user_id, voice.client_id)
+        )
+        await trace.emit("turn_received")
+        if turn.committed_at_ms is not None:
+            await trace.emit(
+                "turn_committed",
+                timestamp_ms=turn.committed_at_ms,
+                observed_at_ms=turn.committed_at_ms,
+                clock_domain="wall:wake-service",
+            )
+        for stage, value, wall in (
+            (
+                "speech_started",
+                turn.speech_started_device_ms,
+                turn.speech_started_at_ms,
+            ),
+            ("speech_ended", turn.speech_ended_device_ms, turn.speech_ended_at_ms),
+        ):
+            if value is not None:
+                await trace.emit(
+                    stage,
+                    timestamp_ms=value,
+                    observed_at_ms=wall,
+                    clock_domain=trace.identity.device_clock,
+                    detail="vad_frame_estimate",
+                )
+        with trace.bind():
+            try:
+                return await self._route_turn(turn, voice)
+            except Exception as error:
+                await trace.emit(
+                    "turn_failed", outcome="failed", detail=type(error).__name__
+                )
+                raise
+
+    async def _route_turn(self, turn, voice):
         claimed = await AudioEpisodeArbiter(self.redis).claim(
             user_id=voice.user_id,
             client_id=voice.client_id,
@@ -259,6 +327,7 @@ class CommittedTurnRouter:
             )
         transcript = await self.transcripts.resolve(turn)
         if not transcript.text:
+            await mark_timing("turn_ignored", detail="empty_transcript")
             return InteractionIngressResult(
                 consumed=False, reason="empty_exact_transcript"
             )
@@ -289,6 +358,7 @@ class CommittedTurnRouter:
                     accepted=True,
                     reason="wake_command",
                 )
+            await mark_timing("turn_ignored", detail="not_addressed")
             return InteractionIngressResult(
                 consumed=True,
                 accepted=False,
