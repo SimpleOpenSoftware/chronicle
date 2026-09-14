@@ -38,7 +38,7 @@ export default function App() {
   // Bluetooth
   const { bleManager, bluetoothState, permissionGranted, requestBluetoothPermission, isPermissionsLoading } = useBluetoothManager();
 
-  // Settings (must be before audioStreamer so the token refresh callback can reference it)
+  // Settings
   const settings = useSharedAppSettings();
 
   // Live backend reachability (Connection Doctor), re-probed on pull-to-refresh.
@@ -46,26 +46,16 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
 
   // Audio
-  const audioStreamer = useAudioStreamer({
-    autoReconnectEnabled: settings.autoReconnectEnabled,
-    onTokenRefreshed: (newToken) => {
-      // Update app-level auth state when auto-re-login refreshes the token
-      if (settings.currentUserEmail) {
-        settings.handleAuthStatusChange(true, settings.currentUserEmail, newToken);
-      }
-    },
-  });
+  const audioStreamer = useAudioStreamer();
   const phoneAudioRecorder = usePhoneAudioRecorder();
 
   const { isListeningAudio: isOmiAudioListenerActive, audioPacketsReceived, startAudioListener: originalStartAudioListener, stopAudioListener: originalStopAudioListener, isRetrying: isAudioListenerRetrying, retryAttempts: audioListenerRetryAttempts } = useAudioListener(omiConnection, () => !!deviceConnection.connectedDeviceId);
 
   // Refs for disconnect cleanup
   const isOmiAudioListenerActiveRef = useRef(isOmiAudioListenerActive);
-  const isAudioStreamingRef = useRef(audioStreamer.isStreaming);
   // Track if audio pipeline was active before BLE disconnect (for auto-restart on reconnect)
   const wasStreamingBeforeDisconnectRef = useRef(false);
   useEffect(() => { isOmiAudioListenerActiveRef.current = isOmiAudioListenerActive; }, [isOmiAudioListenerActive]);
-  useEffect(() => { isAudioStreamingRef.current = audioStreamer.isStreaming; }, [audioStreamer.isStreaming]);
 
   // Refs to break the declaration-order cycle:
   // onDeviceConnect/onDeviceDisconnect need orchestrator + autoReconnect,
@@ -99,22 +89,13 @@ export default function App() {
   }, [omiConnection]);
 
   const onDeviceDisconnect = useCallback(async () => {
-    // Remember if audio was active so we can auto-restart on reconnect
-    if (isOmiAudioListenerActiveRef.current || isAudioStreamingRef.current) {
+    // BLE disconnect only owns the wearable pipeline. Phone capture is independent.
+    if (isOmiAudioListenerActiveRef.current) {
       wasStreamingBeforeDisconnectRef.current = true;
+      await originalStopAudioListener();
+      await audioStreamer.stopStreaming();
     }
-
-    // Stop audio listener (BLE is gone, can't read audio)
-    if (isOmiAudioListenerActiveRef.current) await originalStopAudioListener();
-
-    // Keep WebSocket alive — it will reconnect or idle until BLE comes back.
-    // Only stop WebSocket for phone audio mode (no BLE needed there).
-    if (phoneAudioRecorder.isRecording) {
-      audioStreamer.stopStreaming();
-      await phoneAudioRecorder.stopRecording();
-      orchestratorRef.current?.setIsPhoneAudioMode(false);
-    }
-  }, [originalStopAudioListener, audioStreamer.stopStreaming, phoneAudioRecorder.stopRecording, phoneAudioRecorder.isRecording]);
+  }, [originalStopAudioListener, audioStreamer.stopStreaming]);
 
   const deviceConnection = useDeviceConnection(omiConnection, bleManager, onDeviceDisconnect, onDeviceConnect);
 

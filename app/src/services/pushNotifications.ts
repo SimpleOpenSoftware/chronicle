@@ -45,9 +45,12 @@ export const configureNotificationPresentation = async (): Promise<void> => {
   }
 };
 
-const registerToken = async (backendUrl: string): Promise<void> => {
+const registerToken = async (
+  backendUrl: string,
+  devicePushToken?: Notifications.DevicePushToken,
+): Promise<void> => {
   if (!projectId) throw new Error('This build has no EAS project ID.');
-  const token = await Notifications.getExpoPushTokenAsync({ projectId });
+  const token = await Notifications.getExpoPushTokenAsync({ projectId, devicePushToken });
   const installationId = await getOrCreateInstallationId();
   const response = await fetchAuthed(
     `${deriveBaseUrl(backendUrl)}/api/notifications/devices/${encodeURIComponent(installationId)}`,
@@ -123,8 +126,8 @@ export const startNotificationTapHandling = async (): Promise<() => void> => {
 /** Native-token rotation means the Expo token must be fetched and registered again. */
 export const listenForPushTokenChanges = (backendUrl: string): (() => void) => {
   if (Platform.OS === 'web') return () => {};
-  const subscription = Notifications.addPushTokenListener(() => {
-    void refreshPushRegistration(backendUrl).catch(error => {
+  const subscription = Notifications.addPushTokenListener(devicePushToken => {
+    void registerToken(backendUrl, devicePushToken).catch(error => {
       console.warn('[Notifications] token refresh failed:', error);
     });
   });

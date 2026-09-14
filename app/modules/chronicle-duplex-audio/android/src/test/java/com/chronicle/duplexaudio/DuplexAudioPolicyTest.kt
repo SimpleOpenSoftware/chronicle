@@ -51,4 +51,14 @@ class DuplexAudioPolicyTest {
       gate.schedule(EpochResponse("two", 1, 4))
     }
   }
+
+  @Test fun audioMeterReportsSilenceAndNormalizedPeak() {
+    assertEquals(0.0, DuplexAudioPolicy.audioLevel(ByteArray(640), 640), 0.001)
+    val halfScale = ByteArray(640)
+    for (index in halfScale.indices step 2) {
+      halfScale[index] = 0
+      halfScale[index + 1] = 64
+    }
+    assertEquals(0.5, DuplexAudioPolicy.audioLevel(halfScale, 640), 0.001)
+  }
 }

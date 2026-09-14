@@ -11,7 +11,7 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "test:wearable-activation": "node scripts/test-wearable-activation.cjs",
-    "test:durable-audio-spool": "node scripts/test-durable-audio-spool.cjs",
+    "test:phone-audio-diagnostics": "node scripts/test-phone-audio-diagnostics.cjs && node scripts/test-phone-audio-streaming.cjs && node scripts/test-phone-audio-self-test.cjs && node scripts/test-client-diagnostic-metadata.cjs",
     "test:push-notifications": "node scripts/test-push-notifications.cjs",
     "check:theme": "node scripts/check-theme-tokens.mjs",
     "test:voice-timing": "node scripts/test-voice-timing.cjs"
@@ -26,6 +26,7 @@
     "@react-native/virtualized-lists": "^0.80.2",
     "deprecated-react-native-prop-types": "^5.0.0",
     "expo": "~55.0.15",
+    "expo-application": "~55.0.19",
     "expo-asset": "~55.0.17",
     "expo-build-properties": "~55.0.13",
     "expo-camera": "~55.0.15",

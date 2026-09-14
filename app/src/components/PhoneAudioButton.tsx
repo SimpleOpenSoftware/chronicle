@@ -89,7 +89,7 @@ const PhoneAudioButton: React.FC<PhoneAudioButtonProps> = ({
         </View>
       )}
 
-      {error && !isRecording && (
+      {error && (
         <Caption style={s.errorText}>{error}</Caption>
       )}
 

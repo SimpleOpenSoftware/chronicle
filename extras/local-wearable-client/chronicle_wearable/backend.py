@@ -87,6 +87,7 @@ async def stream_to_backend(
                 if "neo" in device_name.lower()
                 else audio_pb2.DEVICE_KIND_OMI
             ),
+            uplink_frame_duration_ms=60,
             ssl_context=_ssl_context(),
         )
         connected_at = None

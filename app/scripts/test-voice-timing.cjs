@@ -11,7 +11,7 @@ const sockets = [];
 class Socket {
   constructor(options) { this.options = options; this.packets = []; this.acks = []; sockets.push(this); }
   async connect() {}
-  async beginCapture() { this.activeBinding = { captureSessionId: { value: 'capture' } }; }
+  async beginCapture() { this.activeBinding = { captureSessionId: { value: 'capture' } }; return this.activeBinding; }
   voiceReady() {}
   sendPacket(packet) { this.packets.push(packet); }
   acknowledgePlayback(...args) { this.acks.push(args); }
@@ -32,11 +32,9 @@ const mocks = {
   },
   '../protocol/audioV2': protocol,
   '../protocol/audioV2Socket': { AudioV2Socket: Socket },
-  '../services/auth': { refreshToken: async () => 'fixture-token' },
-  '../services/durableAudioSpool': { durableAudioSpool: {
-    pendingPackets: async () => [], append: (payload, capturedAtMs) => ({ payload, capturedAtMs, fileName: 'fixture', sequence: 0 }),
-    acknowledge: async () => {}, close() {},
-  } },
+  '../services/auth': { getValidToken: async () => 'fixture-token' },
+  '../services/phoneAudioDiagnostics': { phoneAudioDiagnostics: new Proxy({}, { get: () => () => {} }) },
+
 };
 const sourcePath = path.join(__dirname, '../src/hooks/useAudioStreamer.ts');
 const loaded = new Module(sourcePath, module);
@@ -49,15 +47,15 @@ loaded._compile(ts.transpileModule(fs.readFileSync(sourcePath, 'utf8'), { compil
 } }).outputText, sourcePath);
 
 (async () => {
-  const hook = loaded.exports.useAudioStreamer({ autoReconnectEnabled: false });
+  const hook = loaded.exports.useAudioStreamer();
   const effect = { requested: true, available: true, enabled: true };
-  const config = { phoneVoice: { captureEpoch: 3, capabilities: { mode: 'duplex_full', input_route: 'built_in_mic', output_route: 'speakerphone', native_sample_rate: 48000, aec: effect, noise_suppression: effect }, stopCapture: async () => {} } };
+  const config = { kind: 'phone', captureEpoch: 3, capabilities: { mode: 'duplex_full', input_route: 'built_in_mic', output_route: 'speakerphone', native_sample_rate: 48000, aec: effect, noise_suppression: effect }, stopCapture: async () => {} };
   await hook.startStreaming('ws://localhost/ws/audio?token=fixture', config);
   try {
     const frame = (mono, wall) => ({ captureEpoch: 3, capturedAtMs: wall, monotonicTimestampMs: mono, frameDurationMs: 20, opus: new Uint8Array([1, 2, 3]) });
-    hook.sendInteractiveFrame(frame(900000, 1700000000000));
-    hook.sendInteractiveFrame(frame(900020, 1699996400020)); // wall clock jumps back an hour
-    hook.sendInteractiveFrame(frame(900040, 1700003600040)); // wall clock jumps forward
+    hook.sendFrame('phone', frame(900000, 1700000000000));
+    hook.sendFrame('phone', frame(900020, 1699996400020)); // wall clock jumps back an hour
+    hook.sendFrame('phone', frame(900040, 1700003600040)); // wall clock jumps forward
     assert.deepEqual(sockets[0].packets.map(p => p.monotonicOffsetUs), [0, 20000, 40000]);
     assert.deepEqual(sockets[0].packets.map(p => p.deviceMonotonicTimestampUs), [900000000, 900020000, 900040000]);
     playbackListener({ captureEpoch: 3, responseId: 'reply', generation: 1, state: 'started', monotonicTimestampMs: 905000.5 });
@@ -67,7 +65,7 @@ loaded._compile(ts.transpileModule(fs.readFileSync(sourcePath, 'utf8'), { compil
   } finally { await hook.stopStreaming(); }
   await hook.startStreaming('ws://localhost/ws/audio?token=fixture', config);
   try {
-    hook.sendInteractiveFrame({ captureEpoch: 3, capturedAtMs: 1700004000000, monotonicTimestampMs: 1000000, frameDurationMs: 20, opus: new Uint8Array([1]) });
+    hook.sendFrame('phone', { captureEpoch: 3, capturedAtMs: 1700004000000, monotonicTimestampMs: 1000000, frameDurationMs: 20, opus: new Uint8Array([1]) });
     assert.equal(sockets[1].packets[0].monotonicOffsetUs, 0, 'new capture resets only the relative origin');
     assert.equal(sockets[1].packets[0].deviceMonotonicTimestampUs, 1000000000);
   } finally { await hook.stopStreaming(); }

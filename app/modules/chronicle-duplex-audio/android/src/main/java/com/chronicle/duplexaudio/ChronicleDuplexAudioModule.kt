@@ -221,6 +221,7 @@ class ChronicleDuplexAudioModule : Module() {
               "sampleRate" to 16_000,
               "channels" to 1,
               "frameDurationMs" to durationMs,
+              "audioLevel" to DuplexAudioPolicy.audioLevel(frame, count),
               "opusBase64" to Base64.encodeToString(packet, Base64.NO_WRAP),
             ),
           )

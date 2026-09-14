@@ -1,10 +1,11 @@
-import { useState, useCallback } from 'react';
+import { useCallback } from 'react';
 import { Alert } from 'react-native';
-import { OmiConnection } from 'friend-lite-react-native';
-import { AppSettings } from './useAppSettings';
-import type { StreamStartConfig } from './useAudioStreamer';
+import { BleAudioCodec, OmiConnection } from 'friend-lite-react-native';
+import type { AppSettings } from './useAppSettings';
+import type { AudioStreamSource } from './useAudioStreamer';
 import type { PhoneCaptureSession } from './usePhoneAudioRecorder';
 import type { CapturedOpusFrame } from '../protocol/capturedOpusFrame';
+import { phoneAudioDiagnostics } from '../services/phoneAudioDiagnostics';
 
 interface OrchestratorParams {
   omiConnection: OmiConnection;
@@ -12,28 +13,23 @@ interface OrchestratorParams {
     connectedDeviceId: string | null;
   };
   audioStreamer: {
-    isStreaming: boolean;
-    startStreaming: (url: string, config?: StreamStartConfig) => Promise<void>;
+    startStreaming: (url: string, source: AudioStreamSource) => Promise<void>;
     stopStreaming: () => Promise<void>;
-    sendDurableAudio: (audioBytes: Uint8Array) => void;
-    sendInteractiveFrame: (frame: CapturedOpusFrame) => void;
-    getWebSocketReadyState: () => number | undefined;
+    sendFrame: (source: 'phone' | 'wearable', frame: CapturedOpusFrame) => void;
   };
   phoneAudioRecorder: {
     isRecording: boolean;
     startRecording: (
       onData: (frame: CapturedOpusFrame) => Promise<void>
     ) => Promise<PhoneCaptureSession>;
-    stopRecording: () => Promise<void>;
   };
   originalStartAudioListener: (onAudioData: (bytes: Uint8Array) => void) => Promise<void>;
   originalStopAudioListener: () => Promise<void>;
-  settings: AppSettings;
+  settings: Pick<AppSettings, 'webSocketUrl'>;
 }
 
 export interface AudioOrchestrator {
   isPhoneAudioMode: boolean;
-  setIsPhoneAudioMode: (mode: boolean) => void;
   handleStartAudioListeningAndStreaming: () => Promise<void>;
   handleStopAudioListeningAndStreaming: () => Promise<void>;
   handleTogglePhoneAudio: () => Promise<void>;
@@ -48,47 +44,14 @@ export const useAudioStreamingOrchestrator = ({
   originalStopAudioListener,
   settings,
 }: OrchestratorParams): AudioOrchestrator => {
-  const [isPhoneAudioMode, setIsPhoneAudioMode] = useState<boolean>(false);
-
-  const buildWebSocketUrl = useCallback((baseUrl: string): string => {
+  const buildAudioWebSocketUrl = useCallback((baseUrl: string): string => {
     let url = baseUrl.trim();
     url = url.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
     const parsed = new URL(url);
     parsed.pathname = '/ws/audio';
     parsed.search = '';
-    url = parsed.toString();
-
-    const isAdvanced = settings.jwtToken && settings.isAuthenticated;
-    if (isAdvanced) {
-      const params = new URLSearchParams();
-      params.append('token', settings.jwtToken!);
-      const deviceName = settings.userId?.trim() || 'phone';
-      params.append('device_name', deviceName);
-      const separator = url.includes('?') ? '&' : '?';
-      url = `${url}${separator}${params.toString()}`;
-    }
-    return url;
-  }, [settings.jwtToken, settings.isAuthenticated, settings.userId]);
-
-  const buildPhoneWebSocketUrl = useCallback((baseUrl: string): string => {
-    let url = baseUrl.trim();
-    url = url.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
-    const parsed = new URL(url);
-    parsed.pathname = '/ws/audio';
-    parsed.search = '';
-    url = parsed.toString();
-
-    const isAdvanced = settings.jwtToken && settings.isAuthenticated;
-    if (isAdvanced) {
-      const params = new URLSearchParams();
-      params.append('token', settings.jwtToken!);
-      const deviceName = settings.userId?.trim() || 'phone-mic';
-      params.append('device_name', deviceName);
-      const separator = url.includes('?') ? '&' : '?';
-      url = `${url}${separator}${params.toString()}`;
-    }
-    return url;
-  }, [settings.jwtToken, settings.isAuthenticated, settings.userId]);
+    return parsed.toString();
+  }, []);
 
   const handleStartAudioListeningAndStreaming = useCallback(async () => {
     if (!settings.webSocketUrl?.trim()) {
@@ -101,22 +64,30 @@ export const useAudioStreamingOrchestrator = ({
     }
 
     try {
-      const finalUrl = buildWebSocketUrl(settings.webSocketUrl);
+      const codec = await omiConnection.getAudioCodec();
+      if (codec !== BleAudioCodec.OPUS) {
+        throw new Error(`Wearable must stream Opus; device reported ${codec}`);
+      }
+      const sourceId = deviceConnection.connectedDeviceId;
+      const finalUrl = buildAudioWebSocketUrl(settings.webSocketUrl);
       await originalStartAudioListener(async (audioBytes) => {
         if (audioBytes.length > 0) {
-          audioStreamer.sendDurableAudio(audioBytes);
+          audioStreamer.sendFrame('wearable', {
+            captureEpoch: 0,
+            capturedAtMs: Date.now(),
+            monotonicTimestampMs: performance.now(),
+            frameDurationMs: 60,
+            opus: audioBytes,
+          });
         }
       });
-      // BLE capture is independent of network availability. The durable spool above
-      // keeps receiving while this connection attempt fails or reconnects.
-      audioStreamer.startStreaming(finalUrl).catch((error) => {
-        console.warn('[AudioOrchestrator] Initial WebSocket connection failed; buffering locally:', error);
-      });
+      await audioStreamer.startStreaming(finalUrl, { kind: 'wearable', sourceId });
     } catch (error) {
       Alert.alert('Error', 'Could not start audio listening or streaming.');
-      if (audioStreamer.isStreaming) audioStreamer.stopStreaming();
+      await originalStopAudioListener();
+      await audioStreamer.stopStreaming();
     }
-  }, [originalStartAudioListener, audioStreamer, settings.webSocketUrl, omiConnection, deviceConnection.connectedDeviceId, buildWebSocketUrl]);
+  }, [originalStartAudioListener, audioStreamer, settings.webSocketUrl, omiConnection, deviceConnection.connectedDeviceId, buildAudioWebSocketUrl]);
 
   const handleStopAudioListeningAndStreaming = useCallback(async () => {
     await originalStopAudioListener();
@@ -130,40 +101,35 @@ export const useAudioStreamingOrchestrator = ({
     }
 
     try {
-      const finalUrl = buildPhoneWebSocketUrl(settings.webSocketUrl);
+      const finalUrl = buildAudioWebSocketUrl(settings.webSocketUrl);
       const capture = await phoneAudioRecorder.startRecording(async (frame) => {
-        const wsReady = audioStreamer.getWebSocketReadyState();
-        if (wsReady === WebSocket.OPEN && frame.opus.length > 0) {
-          audioStreamer.sendInteractiveFrame(frame);
-        }
+        if (frame.opus.length === 0) return;
+        audioStreamer.sendFrame('phone', frame);
       });
-      await audioStreamer.startStreaming(finalUrl, { phoneVoice: capture });
-      setIsPhoneAudioMode(true);
+      await audioStreamer.startStreaming(finalUrl, { kind: 'phone', ...capture });
     } catch (error) {
+      phoneAudioDiagnostics.failure('orchestrator_start', error);
       Alert.alert('Error', 'Could not start phone audio streaming.');
-      if (audioStreamer.isStreaming) audioStreamer.stopStreaming();
-      if (phoneAudioRecorder.isRecording) await phoneAudioRecorder.stopRecording();
-      setIsPhoneAudioMode(false);
+      await audioStreamer.stopStreaming();
     }
-  }, [audioStreamer, phoneAudioRecorder, settings.webSocketUrl, buildPhoneWebSocketUrl]);
+  }, [audioStreamer, phoneAudioRecorder, settings.webSocketUrl, buildAudioWebSocketUrl]);
 
   const handleStopPhoneAudioStreaming = useCallback(async () => {
     await audioStreamer.stopStreaming();
-    await phoneAudioRecorder.stopRecording();
-    setIsPhoneAudioMode(false);
-  }, [phoneAudioRecorder, audioStreamer]);
+    phoneAudioDiagnostics.stopped();
+  }, [audioStreamer]);
 
   const handleTogglePhoneAudio = useCallback(async () => {
-    if (isPhoneAudioMode || phoneAudioRecorder.isRecording) {
+    if (phoneAudioRecorder.isRecording) {
       await handleStopPhoneAudioStreaming();
     } else {
+      phoneAudioDiagnostics.beginAttempt();
       await handleStartPhoneAudioStreaming();
     }
-  }, [isPhoneAudioMode, phoneAudioRecorder.isRecording, handleStartPhoneAudioStreaming, handleStopPhoneAudioStreaming]);
+  }, [phoneAudioRecorder.isRecording, handleStartPhoneAudioStreaming, handleStopPhoneAudioStreaming]);
 
   return {
-    isPhoneAudioMode,
-    setIsPhoneAudioMode,
+    isPhoneAudioMode: phoneAudioRecorder.isRecording,
     handleStartAudioListeningAndStreaming,
     handleStopAudioListeningAndStreaming,
     handleTogglePhoneAudio,

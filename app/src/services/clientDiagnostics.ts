@@ -1,3 +1,4 @@
+import * as Application from 'expo-application';
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
@@ -22,8 +23,8 @@ export async function uploadClientDiagnostic(contents: string): Promise<ClientDi
   if (!configuredUrl) throw new Error('Configure and log in to a Chronicle backend first.');
 
   const deviceId = await getLastConnectedDeviceId();
-  const appVersion = Constants.expoConfig?.version ?? 'unknown';
-  const buildVersion = String((Constants as any).nativeBuildVersion ?? 'unknown');
+  const appVersion = Application.nativeApplicationVersion ?? Constants.expoConfig?.version ?? 'unknown';
+  const buildVersion = Application.nativeBuildVersion ?? 'unknown';
   const response = await fetchAuthed(`${deriveBaseUrl(configuredUrl)}/api/client-diagnostics`, {
     method: 'POST',
     headers: {

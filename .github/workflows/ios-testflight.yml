@@ -15,7 +15,53 @@ on:
         type: string
 
 jobs:
+  audio-v2-release-gate:
+    if: github.event_name == 'push' || inputs.build_id == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - name: Setup repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: latest
+
+      - name: Install Opus runtime
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0
+
+      - name: Install backend test dependencies
+        run: uv sync --locked --group test
+
+      - name: Verify Audio V2 phone path
+        run: >-
+          uv run --group test pytest
+          tests/test_audio_v2_websocket_entrypoint.py
+          tests/test_audio_protocol_v2.py
+          tests/test_audio_v2_ingress.py
+          tests/test_audio_v2_streams.py
+          tests/test_audio_persistence_lifecycle.py
+          tests/test_audio_durability.py
+          -q
+
   build-and-submit:
+    needs: audio-v2-release-gate
+    if: >-
+      ${{
+        always() &&
+        (needs.audio-v2-release-gate.result == 'success' ||
+         needs.audio-v2-release-gate.result == 'skipped')
+      }}
     runs-on: macos-26
     timeout-minutes: 120
     defaults:
@@ -51,10 +97,12 @@ jobs:
         run: |
           npm run test:wearable-activation
           npm run typecheck
-          npm run test:durable-audio-spool
+          npm run test:voice-timing
+          npm run test:phone-audio-diagnostics
           npm run test:push-notifications
           npm run check:theme
           npx --no-install expo-modules-autolinking verify --platform ios --verbose
+          swift test --package-path modules/chronicle-duplex-audio/ios
 
       - name: Write and validate ASC API key
         env:

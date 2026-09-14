@@ -106,6 +106,7 @@ async def run_device_session(
                 source_id=config.device_name,
                 display_name=config.device_name,
                 device_kind=audio_pb2.DEVICE_KIND_HAVPE,
+                uplink_frame_duration_ms=20,
             )
             playback = HavpePlayback(client, device)
             client.on_control = playback.control

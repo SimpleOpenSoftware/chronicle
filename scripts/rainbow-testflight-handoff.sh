@@ -52,7 +52,7 @@ fi
 
 npm ci
 npm run typecheck
-npm run test:durable-audio-spool
+npm run test:phone-audio-diagnostics
 npm run check:theme
 npx --no-install expo config --type public --json >/dev/null
 npx --no-install expo-modules-autolinking verify --platform ios --verbose

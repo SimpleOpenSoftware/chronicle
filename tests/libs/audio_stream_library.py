@@ -69,6 +69,7 @@ class StreamManager:
             source_id=device_name,
             display_name=device_name,
             device_kind=audio_pb2.DEVICE_KIND_PROBE,
+            uplink_frame_duration_ms=20,
         )
         session = _Session(loop=loop, thread=thread, client=client)
         stream_id = str(uuid.uuid4())
@@ -251,4 +252,5 @@ def get_audio_stream_client(
         source_id=device_name,
         display_name=device_name,
         device_kind=audio_pb2.DEVICE_KIND_PROBE,
+        uplink_frame_duration_ms=20,
     )

@@ -21,6 +21,16 @@ def _timestamp(epoch_seconds: float) -> timestamp_pb2.Timestamp:
     return value
 
 
+def _opus_spec(sample_rate_hz: int, frame_duration_ms: int) -> audio_pb2.AudioSpec:
+    return audio_pb2.AudioSpec(
+        codec=audio_pb2.AUDIO_CODEC_OPUS,
+        sample_rate_hz=sample_rate_hz,
+        channel_count=1,
+        frame_duration=duration_pb2.Duration(nanos=frame_duration_ms * 1_000_000),
+        bitrate_bps=24_000,
+    )
+
+
 class AudioV2Client:
     """Own connection, capture binding, sequencing, and generated wire encoding."""
 
@@ -32,15 +42,19 @@ class AudioV2Client:
         source_id: str,
         display_name: str,
         device_kind: int,
+        uplink_frame_duration_ms: int,
         ssl_context=None,
         on_control: ControlHandler | None = None,
         on_playback: PlaybackHandler | None = None,
     ) -> None:
+        if uplink_frame_duration_ms not in {20, 60}:
+            raise ValueError("uplink_frame_duration_ms must be 20 or 60")
         self.websocket_url = websocket_url
         self.bearer_token = bearer_token
         self.source_id = source_id
         self.display_name = display_name
         self.device_kind = device_kind
+        self.uplink_frame_duration_ms = uplink_frame_duration_ms
         self.ssl_context = ssl_context
         self.on_control = on_control
         self.on_playback = on_playback
@@ -52,16 +66,6 @@ class AudioV2Client:
         self._delivery_class = audio_pb2.DELIVERY_CLASS_UNSPECIFIED
         self._started_monotonic = 0.0
         self._send_lock = asyncio.Lock()
-
-    @staticmethod
-    def opus_spec(sample_rate_hz: int) -> audio_pb2.AudioSpec:
-        return audio_pb2.AudioSpec(
-            codec=audio_pb2.AUDIO_CODEC_OPUS,
-            sample_rate_hz=sample_rate_hz,
-            channel_count=1,
-            frame_duration=duration_pb2.Duration(nanos=20_000_000),
-            bitrate_bps=24_000,
-        )
 
     async def connect(self) -> None:
         connect_options = dict(
@@ -81,8 +85,8 @@ class AudioV2Client:
                 source_id=audio_pb2.CaptureSourceId(value=self.source_id),
                 device_kind=self.device_kind,
                 display_name=self.display_name,
-                supported_uplink=[self.opus_spec(16_000)],
-                supported_downlink=[self.opus_spec(24_000)],
+                supported_uplink=[_opus_spec(16_000, self.uplink_frame_duration_ms)],
+                supported_downlink=[_opus_spec(24_000, 20)],
             )
         )
         await hello
@@ -104,7 +108,7 @@ class AudioV2Client:
                 processing_profile=processing_profile,
                 data_purpose=data_purpose,
                 delivery_class=delivery_class,
-                audio_spec=self.opus_spec(16_000),
+                audio_spec=_opus_spec(16_000, self.uplink_frame_duration_ms),
                 capabilities=capabilities,
                 recovery_batch_id=recovery_batch_id,
             )
