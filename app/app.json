@@ -91,6 +91,7 @@
         {
           "android": {
             "usesCleartextTraffic": true,
+            "minSdkVersion": 31,
             "compileSdkVersion": 36,
             "targetSdkVersion": 35,
             "extraMavenRepos": [
