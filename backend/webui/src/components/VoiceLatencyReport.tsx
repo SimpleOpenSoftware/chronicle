@@ -67,7 +67,7 @@ export function VoiceTimingCard({ report }: { report: VoiceReport }) {
       <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">{report.alignment}</p>
       <ol className="space-y-2" aria-label="Interaction waterfall">
         {report.events.map(event => <li key={event.event_id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3 text-xs items-center">
-          <span className="break-words">{labels[event.stage] ?? event.stage}{event.outcome !== 'ok' ? ` · ${event.outcome}` : ''}
+          <span className="break-words">{labels[event.stage] ?? event.stage}{event.outcome !== 'ok' ? ` · ${event.outcome === 'running' ? 'started' : event.outcome}` : ''}
             {event.duration_ms != null ? ` · ${duration(event.duration_ms)}` : ''}</span>
           <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded" title={event.detail}>
             <div className="h-2 bg-blue-500 rounded" style={{ marginLeft: `${Math.min(99.5, 100 * (event.observed_at_ms - eventStart) / range)}%`,
