@@ -3,7 +3,7 @@ package com.chronicle.duplexaudio
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AcousticEchoCanceler
+import android.media.audiofx.AcousticEchoCanceler
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -15,7 +15,7 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaRecorder
-import android.media.NoiseSuppressor
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.SystemClock
 import android.util.Base64
