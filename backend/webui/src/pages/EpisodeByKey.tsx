@@ -61,7 +61,7 @@ export default function EpisodeByKey() {
                   to={`/timeline/key/${key}`}
                   className="text-sm text-blue-600 hover:underline dark:text-blue-400"
                 >
-                  {key}
+                  Episode {successors.indexOf(key) + 1}
                 </Link>
               </li>
             ))}
@@ -70,8 +70,11 @@ export default function EpisodeByKey() {
       ) : (
         <div className="rounded-lg border border-dashed border-gray-300 p-6 text-sm text-gray-500 dark:border-gray-600 dark:text-gray-400">
           {query.isError
-            ? 'No episode has ever used this key.'
+            ? (query.error as { response?: { status?: number } }).response?.status === 404
+              ? 'No episode was found for this link.'
+              : 'Could not resolve this episode link.'
             : 'This episode was removed and was not replaced.'}
+          {query.isError && (query.error as { response?: { status?: number } }).response?.status !== 404 && <Button className="mt-3" variant="secondary" onClick={() => query.refetch()}>Retry</Button>}
         </div>
       )}
     </div>

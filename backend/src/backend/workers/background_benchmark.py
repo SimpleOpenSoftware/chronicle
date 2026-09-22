@@ -6,6 +6,7 @@ from collections import Counter
 import numpy as np
 
 from backend.models.conversation import Conversation
+from backend.services import privacy
 from backend.workers.background_suppression import (
     CONFIDENT_MARGIN,
     CONFIDENT_SIMILARITY,
@@ -171,6 +172,7 @@ def evaluate_reviews(reviews: list[dict]) -> dict:
 
 
 async def build_background_benchmark(requested_by: str) -> dict:
+    visibility = privacy.ConversationPrivacyFilter()
     database = Conversation.get_pymongo_collection().database
     corpus_rows = [
         row
@@ -178,6 +180,8 @@ async def build_background_benchmark(requested_by: str) -> dict:
             {"requested_by": requested_by}, {"_id": 0}
         )
     ]
+    corpus_rows = await visibility.filter_embeddings(corpus_rows)
+    await visibility.assert_current()
     by_key = {row["clip_key"]: row for row in corpus_rows}
     review_docs = [
         row
@@ -187,7 +191,12 @@ async def build_background_benchmark(requested_by: str) -> dict:
     ]
     reviews = []
     reconstructed_review_samples = False
+    await visibility.assert_current()
     for review in review_docs:
+        if not review.get("member_keys") or not set(review["member_keys"]) <= set(
+            by_key
+        ):
+            continue
         decision = review.get("decision")
         if decision not in {"background_speech", "mixed"} | FOREGROUND_DECISIONS:
             continue

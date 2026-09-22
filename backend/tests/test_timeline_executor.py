@@ -216,10 +216,14 @@ def test_context_scaffolding_repair_does_not_touch_quoted_evidence_text():
     assert repaired == raw
 
 
-def test_build_executor_selects_pi_without_codex(monkeypatch):
+@pytest.mark.parametrize("configured", [True, False])
+def test_build_executor_selects_pi_without_codex(monkeypatch, configured):
     monkeypatch.setattr(
         "backend.services.timeline.executor.settings_dict",
-        lambda: {"executor": "pi", "pi": {"operation": "timeline_segmentation"}},
+        lambda: {
+            **({"executor": "pi"} if configured else {}),
+            "pi": {"operation": "timeline_segmentation"},
+        },
     )
 
     executor = build_executor()
@@ -417,6 +421,7 @@ async def test_context_condenser_passes_bounded_block_directly_without_tool_loop
         context_window=131072,
         timeout_seconds=900,
         reasoning=True,
+        reasoning_allowed=True,
         temperature=1.0,
         system_prompt_prefix="Reasoning strength: high",
     )
@@ -506,6 +511,7 @@ async def test_context_condenser_retries_invalid_json_and_archives_bad_output(
         context_window=131072,
         timeout_seconds=900,
         reasoning=True,
+        reasoning_allowed=True,
         temperature=1.0,
         system_prompt_prefix="Reasoning strength: high",
     )
@@ -1354,117 +1360,38 @@ async def test_range_executor_enforces_separation_barrier_before_interpretation(
 async def test_invalid_pi_stage_artifact_cannot_poison_the_next_range_retry(
     tmp_path, monkeypatch
 ):
+    from pi_task_helpers import install_pi
+
+    from backend.services.memory.agent.vault_tools import VaultToolError
+    from backend.services.timeline import accepted_context, pi_executor, pi_tasks
+
     bundle = _staged_bundle()
     invalid = SeparationResult(
         hypotheses=[
             _separated().model_copy(update={"start_anchor_ids": ["anchor:missing"]})
         ]
     )
-    valid_separation = SeparationResult(hypotheses=[_separated()])
-    valid_interpretation = InterpretationResult(accepted=[_interpreted()])
-    responses = [
-        invalid.model_dump_json(),
-        valid_separation.model_dump_json(),
-        valid_interpretation.model_dump_json(),
-    ]
-    calls = []
-    artifacts = []
-    reusable = {}
-    promotions = []
+    valid = SeparationResult(hypotheses=[_separated()])
+    interpreted = InterpretationResult(accepted=[_interpreted()])
 
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor._resolve_pi_config",
-        lambda operation: _PiRuntimeConfig(
-            binary="pi",
-            model="muse-glimmer",
-            provider="chronicle-llamacpp",
-            base_url="http://llama.cpp/v1",
-            api_key="no-key",
-            thinking="high",
-            max_tokens=12000,
-            context_window=131072,
-            timeout_seconds=900,
-            reasoning=True,
-            temperature=1.0,
-            system_prompt_prefix="Reasoning strength: high",
-        ),
+    def repair(tools):
+        with pytest.raises(VaultToolError, match="unknown anchor"):
+            tools.dispatch("finish_task", {"result": invalid.model_dump(mode="json")})
+        tools.dispatch("finish_task", {"result": valid.model_dump(mode="json")})
+
+    calls = install_pi(
+        monkeypatch, tmp_path, [repair, interpreted.model_dump(mode="json")]
     )
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor.load_reusable_run",
-        lambda operation, request: None,
-    )
-
-    def persist(**kwargs):
-        artifacts.append(kwargs)
-        if kwargs["reusable"]:
-            reusable[kwargs["operation"]] = kwargs["result"]
-        return "request", f"artifact-{len(artifacts)}"
-
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor.persist_inference_run",
-        persist,
-    )
-
-    def promote(operation, request_hash, artifact_hash):
-        promotions.append((operation, request_hash, artifact_hash))
-        artifact_number = int(artifact_hash.rsplit("-", 1)[1])
-        reusable[operation] = artifacts[artifact_number - 1]["result"]
-
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor.promote_inference_run",
-        promote,
-    )
-
-    async def invoke(*_args, **kwargs):
-        _, _, aliases = _compact_stage_context({"blocks": []}, bundle.manifest)
-        response = _encode_stage_text(responses[len(calls)], aliases)
-        calls.append(kwargs)
-        return (
-            SimpleNamespace(
-                truncated=False,
-                fatal_errors=[],
-                errors=[],
-                summary=response,
-                usage={},
-                rounds=1,
-                tool_calls=0,
-            ),
-            SimpleNamespace(call_count=0),
-        )
-
-    monkeypatch.setattr("backend.services.timeline.pi_executor._invoke_pi", invoke)
+    monkeypatch.setattr(pi_executor, "_resolve_pi_config", pi_tasks._resolve_pi_config)
+    monkeypatch.setattr(accepted_context, "snapshot", lambda *a: {})
     executor = RangeReconcileExecutor(PiTimelineExecutor({}))
-
     action = await executor.reconcile(bundle)
-
-    assert len(calls) == 3
-    prompt_text = calls[0]["prompt"]
-    supplied = json.JSONDecoder().raw_decode(prompt_text[prompt_text.index("{") :])[0]
-    assert all("events" not in block for block in supplied["blocks"])
-    assert all(
-        "started_at" not in note and "ended_at" not in note
-        for block in supplied["blocks"]
-        for note in block["evidence_notes"]
-    )
-    assert "unknown anchor" in artifacts[0]["metadata"]["validation_error"]
-    assert artifacts[0]["metadata"]["validation_status"] == "rejected"
-    assert "Deterministic validation feedback" in calls[1]["prompt"]
-    anchor_json = (
-        calls[0]["prompt"]
-        .split("Authoritative boundary anchors:\n", 1)[1]
-        .split("\n\n", 1)[0]
-    )
-    table = json.loads(anchor_json)
-    assert "Keys are authoritative anchor IDs" in table["encoding"]
-    assert len(table["anchors"]) == len(bundle.manifest.anchors)
-    assert "Authoritative boundary anchors:" not in calls[2]["prompt"]
-    assert action.separation.model_dump() == valid_separation.model_dump()
-    assert action.interpretation.model_dump() == valid_interpretation.model_dump()
-    assert [artifact["reusable"] for artifact in artifacts] == [False, False, False]
-    assert [operation for operation, *_ in promotions] == [
-        "pi_timeline_separation",
-        "pi_timeline_interpretation",
-    ]
+    assert len(calls) == 2
+    assert calls[0]["tool_handler"].trace[0]["error"]
+    assert action.separation.model_dump() == valid.model_dump()
+    assert action.interpretation.model_dump() == interpreted.model_dump()
+    await executor.reconcile(bundle)
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1761,13 +1688,8 @@ async def test_codex_range_stages_use_distinct_cache_namespaces(tmp_path, monkey
         "codex_timeline_separation",
         "codex_timeline_interpretation",
     ]
-    assert (
-        lookups[0][1]["prompt_version"] == "timeline-separation-v11-recording-coverage"
-    )
-    assert (
-        lookups[1][1]["prompt_version"]
-        == "timeline-interpretation-v6-device-local-coverage"
-    )
+    assert lookups[0][1]["prompt_version"] == "timeline-separation-pi-v1"
+    assert lookups[1][1]["prompt_version"] == "timeline-interpretation-pi-v1"
     assert separated.inference_provenance == StageInferenceProvenance(
         operation="codex_timeline_separation",
         request_hash="request:codex_timeline_separation",
@@ -1781,67 +1703,30 @@ async def test_codex_range_stages_use_distinct_cache_namespaces(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_pi_range_stages_use_distinct_cache_namespaces(tmp_path, monkeypatch):
+    from pi_task_helpers import install_pi
+
+    from backend.services.timeline import accepted_context, pi_executor, pi_tasks
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     bundle = _staged_bundle()
     separation = SeparationResult(hypotheses=[_separated()])
     interpretation = InterpretationResult(accepted=[_interpreted()])
-    lookups = []
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor._resolve_pi_config",
-        lambda operation: _PiRuntimeConfig(
-            binary="pi",
-            model="muse-glimmer",
-            provider="chronicle-llamacpp",
-            base_url="http://llama.cpp/v1",
-            api_key="no-key",
-            thinking="high",
-            max_tokens=12000,
-            context_window=131072,
-            timeout_seconds=900,
-            reasoning=True,
-            temperature=1.0,
-            system_prompt_prefix="Reasoning strength: high",
-        ),
+    calls = install_pi(
+        monkeypatch,
+        tmp_path,
+        [separation.model_dump(mode="json"), interpretation.model_dump(mode="json")],
     )
-
-    def cached(operation, request):
-        lookups.append((operation, request))
-        result = (
-            separation.model_dump(mode="json")
-            if operation.endswith("separation")
-            else interpretation.model_dump(mode="json")
-        )
-        return ReusableInferenceRun(
-            result=result,
-            request_hash=f"request:{operation}",
-            artifact_hash=f"artifact:{operation}",
-        )
-
-    monkeypatch.setattr(
-        "backend.services.timeline.pi_executor.load_reusable_run",
-        cached,
-    )
+    monkeypatch.setattr(pi_executor, "_resolve_pi_config", pi_tasks._resolve_pi_config)
+    monkeypatch.setattr(accepted_context, "snapshot", lambda *a: {})
     executor = PiTimelineExecutor({})
-
-    separated = await executor.separate(tmp_path, bundle)
-    await executor.interpret(tmp_path, bundle, separated)
-
-    assert [item[0] for item in lookups] == [
-        "pi_timeline_separation",
-        "pi_timeline_interpretation",
-    ]
-    assert (
-        lookups[0][1]["prompt_version"] == "timeline-separation-v11-recording-coverage"
-    )
-    assert (
-        lookups[1][1]["prompt_version"]
-        == "timeline-interpretation-v6-device-local-coverage"
-    )
-    assert separated.inference_provenance == StageInferenceProvenance(
-        operation="pi_timeline_separation",
-        request_hash="request:pi_timeline_separation",
-        artifact_hash="artifact:pi_timeline_separation",
-        cache_hit=True,
-    )
+    separated = await executor.separate(workspace, bundle)
+    interpreted = await executor.interpret(workspace, bundle, separated)
+    assert separated.inference_provenance.operation == "pi_timeline_separation"
+    assert interpreted.inference_provenance.operation == "pi_timeline_interpretation"
+    cached = await executor.separate(workspace, bundle)
+    assert cached.inference_provenance.cache_hit
+    assert len(calls) == 2
 
 
 def test_compact_context_preserves_all_anchor_windows_and_source_identity():

@@ -296,8 +296,8 @@ export default function BackgroundReviewPanel() {
       {open && <div className="border-t border-gray-100 px-4 pb-4 pt-3 dark:border-gray-700">
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="text-sm text-gray-700 dark:text-gray-200">Sample the full corpus once, then classify similar audio in a few cluster decisions.</p>
-            <p className="mt-1 text-xs text-gray-400">Noise includes transcript gaps. Content means produced/played media — TV, videos, podcasts — whether or not it was the point of the recording. Real people are humans speaking live.</p>
+            <p className="text-sm text-gray-700 dark:text-gray-200">Review similar audio together.</p>
+            <p className="mt-1 text-xs text-gray-400">Content is played media; real people are speaking live.</p>
           </div>
           <div className="flex items-center gap-2">
             {decisionHistory.length > 0 && <button onClick={() => setShowDecisionHistory((value) => !value)} className="rounded border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700">Annotation history ({decisionHistory.length})</button>}

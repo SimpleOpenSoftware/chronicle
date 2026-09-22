@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from google.protobuf import timestamp_pb2
 from redis import exceptions as redis_exceptions
 
@@ -183,6 +183,90 @@ def test_device_downlink_channel_requires_client_identity():
 
     with pytest.raises(TypeError, match="ClientId"):
         device_downlink_channel(SessionId.from_value("session-uuid"))
+
+
+def test_wake_consumer_health_flags_alive_but_lagging_stream():
+    consumer = WakeWordConsumer(FakeDetector(), "redis://unused", SimpleNamespace())
+    consumer.running = True
+    session_id = SessionId.from_value("session-uuid")
+    consumer._stream_tasks[session_id] = SimpleNamespace(done=lambda: False)
+
+    consumer._record_stream_progress(
+        session_id,
+        AudioStreamName.from_value("audio:v2:realtime:session-uuid"),
+        "95000-0",
+        processed_at_ms=100_000.0,
+    )
+
+    health = consumer.health()
+
+    assert health["healthy"] is False
+    assert health["lagging_streams"] == 1
+    assert health["delivery_lag_max_ms"] == 5_000.0
+    assert health["streams"][0]["last_consumed_id"] == "95000-0"
+
+
+def test_wake_consumer_health_accepts_fresh_stream_progress():
+    consumer = WakeWordConsumer(FakeDetector(), "redis://unused", SimpleNamespace())
+    consumer.running = True
+    session_id = SessionId.from_value("session-uuid")
+    consumer._stream_tasks[session_id] = SimpleNamespace(done=lambda: False)
+
+    consumer._record_stream_progress(
+        session_id,
+        AudioStreamName.from_value("audio:v2:realtime:session-uuid"),
+        "99500-0",
+        processed_at_ms=100_000.0,
+    )
+
+    health = consumer.health()
+
+    assert health["healthy"] is True
+    assert health["lagging_streams"] == 0
+    assert health["delivery_lag_max_ms"] == 500.0
+
+
+@pytest.mark.asyncio
+async def test_http_health_is_unhealthy_when_wake_consumer_is_falling_behind(
+    monkeypatch,
+):
+    wake_consumer = SimpleNamespace(
+        running=True,
+        health=lambda: {
+            "healthy": False,
+            "active_streams": 1,
+            "lagging_streams": 1,
+            "delivery_lag_max_ms": 5_000.0,
+        },
+    )
+    active_consumer = SimpleNamespace(
+        running=True,
+        health=lambda: {"healthy": True, "running": True, "active_streams": 1},
+    )
+    loop_monitor = SimpleNamespace(stats=lambda: {"lag_p95_ms": 1.0})
+    live_task = SimpleNamespace(done=lambda: False)
+    monkeypatch.setattr(wake_app.app.state, "consumer", wake_consumer, raising=False)
+    monkeypatch.setattr(wake_app.app.state, "consumer_task", live_task, raising=False)
+    monkeypatch.setattr(
+        wake_app.app.state,
+        "active_turn_consumer",
+        active_consumer,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        wake_app.app.state, "active_turn_task", live_task, raising=False
+    )
+    monkeypatch.setattr(wake_app.app.state, "loop_monitor", loop_monitor, raising=False)
+    monkeypatch.setattr(
+        wake_app.app.state, "loop_monitor_task", live_task, raising=False
+    )
+
+    response = Response()
+    payload = await wake_app.health(response)
+
+    assert response.status_code == 503
+    assert payload["status"] == "unhealthy"
+    assert payload["wake_consumer"]["lagging_streams"] == 1
 
 
 @pytest.mark.asyncio

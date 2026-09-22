@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+import backend.controllers.conversation_controller as conversation_controller
 from backend.auth import (
     current_active_user,
     current_active_user_optional,
@@ -1055,4 +1056,15 @@ async def merge(
     """
     return await data_audit_controller.merge_conversations(
         current_user, body.conversation_ids
+    )
+
+
+@router.get("/recordings/{conversation_id}")
+async def dataset_recording_detail(
+    conversation_id: str, user: User = Depends(current_active_user)
+):
+    """Explicit corpus inspection; personal activity and memory actions live elsewhere."""
+
+    return await conversation_controller.get_conversation(
+        conversation_id, user, dataset=True
     )

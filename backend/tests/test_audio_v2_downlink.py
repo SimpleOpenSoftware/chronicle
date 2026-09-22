@@ -87,3 +87,77 @@ async def test_typed_downlink_forwards_offer_then_atomic_opus_media():
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def test_processing_downlink_validates_binding_and_generation_without_response_record():
+    from google.protobuf import json_format
+
+    from backend.audio_contract.v2 import audio_pb2 as pb
+    from backend.redis_keys import (
+        ClientId,
+        device_downlink_channel,
+        response_generation,
+    )
+
+    redis = fake_aioredis.FakeRedis(decode_responses=False)
+    await redis.set(response_generation("user", "client"), 7)
+    voices = SimpleNamespace(
+        binding_matches=AsyncMock(
+            side_effect=lambda **kwargs: kwargs["voice_session_id"] == "voice"
+        )
+    )
+    responses = ResponseCoordinator(redis, voices)
+    websocket = SimpleNamespace(send_text=AsyncMock(), send_bytes=AsyncMock())
+    channel = str(device_downlink_channel(ClientId.from_value("client")))
+    task = asyncio.create_task(
+        _subscribe_v2_downlink(
+            websocket=websocket,
+            redis_client=redis,
+            voice_sessions=voices,
+            responses=responses,
+            client_state=SimpleNamespace(socket_id="socket"),
+            user_id="user",
+            client_id="client",
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not (await redis.pubsub_numsub(channel))[0][1]:
+                await asyncio.sleep(0)
+        for generation, voice_id in [(6, "voice"), (7, "stale-binding"), (7, "voice")]:
+            update = pb.VoiceProcessingUpdate(
+                binding=pb.CaptureBinding(
+                    capture_session_id=pb.CaptureSessionId(value="audio"),
+                    voice_session_id=pb.VoiceSessionId(value=voice_id),
+                    capture_epoch=1,
+                ),
+                interaction_id="interaction",
+                generation=generation,
+                sequence=1,
+                effect_id="effect",
+                state_revision=3,
+                generating_text=True,
+                synthesizing_speech=True,
+            )
+            await redis.publish(
+                channel,
+                pb.DeviceDownlinkEvent(
+                    voice_processing_update=update
+                ).SerializeToString(),
+            )
+        async with asyncio.timeout(1):
+            while not websocket.send_text.await_count:
+                await asyncio.sleep(0)
+        assert websocket.send_text.await_count == 1
+        message = json_format.Parse(
+            websocket.send_text.await_args.args[0], pb.ServerControl()
+        )
+        assert message.WhichOneof("event") == "voice_processing_update"
+        assert message.voice_processing_update.effect_id == "effect"
+        assert message.voice_processing_update.generating_text
+        assert message.voice_processing_update.synthesizing_speech
+        websocket.send_bytes.assert_not_awaited()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await redis.aclose()

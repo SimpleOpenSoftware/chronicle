@@ -4,8 +4,11 @@ import { AlertTriangle, Archive, AudioLines, BookOpen, Check, CircleDot, Eye, Fi
 import { Link, Navigate, useNavigate, useParams } from 'react-router-dom'
 
 import LiveRecord from './LiveRecord'
+import { spaceStateLabel, spaceSyncLabel } from '../utils/memorySpaceStatus'
+import { TITLE_NOT_GENERATED } from '../lib/constants'
+import { sourceDate } from '../utils/sourceTime'
 import { Button, Input, Textarea, computeWordDiff, WordDiff } from '../components/ui'
-import { memorySpacesApi, type SpaceMergeProposal, type SpaceNoteReviewFrame } from '../services/api'
+import { memorySpacesApi, type MemorySpace, type SpaceMergeProposal, type SpaceNoteReviewFrame } from '../services/api'
 
 const TABS = [
   { id: 'record', label: 'Record', icon: Mic },
@@ -21,15 +24,15 @@ function errorDetail(error: unknown) {
   return candidate?.response?.data?.detail || candidate?.message || 'Something went wrong'
 }
 
-function ScopeStrip({ name, state, syncState }: { name: string; state: string; syncState: string }) {
+function ScopeStrip({ name, state, syncState }: { name: string; state: MemorySpace['state']; syncState: MemorySpace['sync_state'] }) {
   return (
     <div className="sticky top-0 z-20 -mx-4 mb-6 border-y border-[#cfc3aa] bg-[#f4efdf]/95 px-4 py-2.5 backdrop-blur dark:border-stone-700 dark:bg-[#211f1a]/95 sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8">
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-stone-700 dark:text-stone-300">
         <span className="flex items-center gap-2 font-semibold"><BookOpen className="h-4 w-4 text-emerald-800 dark:text-emerald-300" />{name}</span>
         <span className="flex items-center gap-1.5"><LockKeyhole className="h-3.5 w-3.5" />Main sealed</span>
-        <span className="flex items-center gap-1.5"><Wifi className="h-3.5 w-3.5" />{syncState}</span>
-        <span className="flex items-center gap-1.5"><CircleDot className="h-3.5 w-3.5 text-red-700 dark:text-red-400" />Recordings land here</span>
-        <span className="ml-auto uppercase tracking-[0.15em] text-stone-500">{state}</span>
+        <span className="flex items-center gap-1.5"><Wifi className="h-3.5 w-3.5" />{spaceSyncLabel[syncState]}</span>
+        <span className="flex items-center gap-1.5"><CircleDot className="h-3.5 w-3.5 text-red-700 dark:text-red-400" />{state === 'active' ? 'Recordings land here' : state === 'archived' ? 'Read-only' : 'Edits paused'}</span>
+        <span className="ml-auto uppercase tracking-[0.15em] text-stone-500">{spaceStateLabel[state]}</span>
       </div>
     </div>
   )
@@ -111,6 +114,9 @@ function NotesTab({ spaceId, archived }: { spaceId: string; archived: boolean })
           </div>
           {!archived && <Button size="sm" variant="secondary" onClick={newNote} aria-label="New note"><Plus className="h-4 w-4" /></Button>}
         </div>
+        {notes.isLoading && <p className="py-3 text-xs text-stone-500">Loading notes…</p>}
+        {notes.isError && <p role="alert" className="py-3 text-xs text-red-700 dark:text-red-300">Could not load notes. <button className="underline" onClick={() => notes.refetch()}>Retry</button></p>}
+        {notes.isSuccess && !filtered.length && <p className="py-3 text-xs text-stone-500">{search ? 'No notes match this filter.' : 'No notes yet.'}</p>}
         <div className="mt-3 divide-y divide-stone-200 dark:divide-stone-800">
           {filtered.map(note => (
             <button
@@ -161,7 +167,7 @@ function ChatTab({ spaceId, archived }: { spaceId: string; archived: boolean }) 
   return (
     <div className="mx-auto flex min-h-[34rem] max-w-3xl flex-col">
       <div className="flex-1 space-y-5 py-4">
-        {!turns.length && <p className="border-l-2 border-[#9b8b69] pl-4 text-sm leading-6 text-stone-600 dark:text-stone-400">This chat can read only this notebook. Main remains sealed unless you copied notes in when the space was created.</p>}
+        {!turns.length && <p className="border-l-2 border-[#9b8b69] pl-4 text-sm leading-6 text-stone-600 dark:text-stone-400">Uses only this notebook, including notes copied from Main.</p>}
         {turns.map((turn, index) => (
           <div key={index} className={turn.role === 'user' ? 'ml-auto max-w-[85%] border-r-2 border-stone-400 pr-4 text-right' : 'max-w-[90%] border-l-2 border-emerald-700 pl-4'}>
             <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-400">{turn.role}</p>
@@ -197,6 +203,7 @@ function ReviewFrameImage({ spaceId, conversationId, frame }: { spaceId: string;
     setUrl(next)
     return () => URL.revokeObjectURL(next)
   }, [image.data])
+  if (image.isError) return <p className="py-4 text-xs text-red-700 dark:text-red-300">Could not load this screen frame.</p>
   if (!url) return <div className="flex aspect-video items-center justify-center bg-stone-200 text-stone-500 dark:bg-stone-900"><Loader2 className="h-4 w-4 animate-spin" /></div>
   return <img src={url} alt={`Screen context frame ${frame.frame_id}`} className="aspect-video w-full object-cover" />
 }
@@ -226,7 +233,9 @@ function NoteExtractionReview({ spaceId, conversationId, archived }: { spaceId: 
       ])
     },
   })
-  if (review.isLoading || !review.data) return <div className="py-4 text-xs text-stone-500">Loading transcript checkpoint…</div>
+  if (review.isLoading) return <div className="py-4 text-xs text-stone-500">Loading transcript checkpoint…</div>
+  if (review.isError) return <p role="alert" className="py-4 text-xs text-red-700 dark:text-red-300">Could not load this transcript checkpoint. <button className="underline" onClick={() => review.refetch()}>Retry</button></p>
+  if (!review.data) return null
   const data = review.data
   const sourceName = new Map(data.sources.map(source => [source.source_id, source.name]))
   const extracted = data.review_state === 'extracted'
@@ -377,6 +386,9 @@ function MergeTab({ spaceId, spaceState }: { spaceId: string; spaceState: string
       queryClient.removeQueries({ queryKey: ['memory-space-latest-merge', spaceId] })
     },
   })
+  if (latestProposal.isError && !proposal) {
+    return <p role="alert" className="py-12 text-sm text-red-700 dark:text-red-300">Could not load the publication ledger. <button className="underline" onClick={() => latestProposal.refetch()}>Retry</button></p>
+  }
   if (latestProposal.isLoading && !proposal) {
     return <p className="flex items-center justify-center gap-2 py-12 text-sm text-stone-500"><Loader2 className="h-4 w-4 animate-spin" />Loading publication ledger…</p>
   }
@@ -389,7 +401,7 @@ function MergeTab({ spaceId, spaceState }: { spaceId: string; spaceState: string
     return (
       <div className="mx-auto max-w-2xl py-10">
         <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-100">Publication ledger</h2>
-        <p className="mt-3 text-sm leading-6 text-stone-600 dark:text-stone-400">Freeze this notebook, compare its edits with current Main, validate the staged vault, then choose exactly what crosses the seal.</p>
+        <p className="mt-3 text-sm leading-6 text-stone-600 dark:text-stone-400">Preparation pauses notebook edits. Review the proposed changes before publishing to Main.</p>
         <Button className="mt-6" icon={recoveringProposal ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDiff className="h-4 w-4" />} disabled={prepare.isPending || recoveringProposal} onClick={() => prepare.mutate(false)}>Prepare merge</Button>
         {recoveringProposal && <p className="mt-3 text-xs text-stone-500">Reviewing the staged vault… This can take a few minutes; the ledger will appear automatically.</p>}
         {prepare.isError && !recoveringProposal && (
@@ -501,7 +513,8 @@ export default function MemorySpaceWorkspace() {
 
   if (!spaceId) return <Navigate to="/spaces" replace />
   if (space.isLoading) return <p className="py-16 text-center text-sm text-stone-500">Opening sealed notebook…</p>
-  if (!space.data) return <p className="py-16 text-center text-sm text-red-700">Memory space not found.</p>
+  if (space.isError) return <div role="alert" className="space-y-3 py-12 text-center text-sm text-red-700 dark:text-red-300"><p>{(space.error as { response?: { status?: number } }).response?.status === 404 ? 'Memory space not found.' : 'Could not load this memory space.'}</p><Button variant="secondary" onClick={() => space.refetch()}>Retry</Button></div>
+  if (!space.data) return null
   const archived = space.data.state === 'archived'
   const recordingRows = (recordings.data as { conversations?: Array<{ conversation_id: string; title?: string; created_at?: string; processing_status?: string; memory_review_state?: string }> } | undefined)?.conversations ?? []
 
@@ -522,17 +535,19 @@ export default function MemorySpaceWorkspace() {
       </header>
 
       <div className="mx-auto mt-6 max-w-6xl">
-        {archived && activeTab !== 'merge' && <div className="mb-5 border-l-2 border-slate-500 pl-4 text-sm text-stone-600 dark:text-stone-400">Archived spaces are read-only. Their local Obsidian vault remains available, while Chronicle sync and writes stay frozen.</div>}
+        {archived && activeTab !== 'merge' && <div className="mb-5 border-l-2 border-slate-500 pl-4 text-sm text-stone-600 dark:text-stone-400">Archived spaces are read-only. Reopen a new cycle to resume editing and sync.</div>}
         {activeTab === 'record' && (
           <div className="space-y-8">
             {!archived && <LiveRecord memorySpaceId={spaceId} destinationLabel={space.data.name} embedded />}
             <section className="border-t border-stone-300 pt-5 dark:border-stone-700">
               <h2 className="text-sm font-semibold uppercase tracking-[0.14em] text-stone-500">Recordings in this space</h2>
               <div className="mt-3 divide-y divide-stone-200 dark:divide-stone-800">
-                {!recordingRows.length && <p className="py-5 text-sm text-stone-500">No recordings yet.</p>}
+                {recordings.isLoading && <p className="py-5 text-sm text-stone-500">Loading recordings…</p>}
+                {recordings.isError && <p role="alert" className="py-5 text-sm text-red-700 dark:text-red-300">Could not load recordings. <button className="underline" onClick={() => recordings.refetch()}>Retry</button></p>}
+                {recordings.isSuccess && !recordingRows.length && <p className="py-5 text-sm text-stone-500">No recordings yet.</p>}
                 {recordingRows.map(recording => (
                   <div key={recording.conversation_id} className="space-y-4 py-4">
-                    <div className="flex items-center justify-between gap-3"><span><span className="block text-sm font-medium">{recording.title || 'Processing recording'}</span><span className="text-xs text-stone-500">{recording.created_at ? new Date(recording.created_at).toLocaleString() : ''}</span></span><span className="text-xs text-stone-500">{recording.processing_status}</span></div>
+                    <div className="flex items-center justify-between gap-3"><span><span className="block text-sm font-medium">{recording.title && recording.title !== TITLE_NOT_GENERATED ? recording.title : 'Untitled recording'}</span><span className="text-xs text-stone-500">{recording.created_at ? sourceDate(recording.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' }) : ''}</span></span><span className="text-xs text-stone-500">{recording.processing_status ? `Processing: ${recording.processing_status.replace(/_/g, ' ')}` : 'Processing status unavailable'}</span></div>
                     <SpaceRecordingAudio conversationId={recording.conversation_id} title={recording.title || 'recording'} />
                     {recording.memory_review_state && recording.memory_review_state !== 'automatic' && <NoteExtractionReview spaceId={spaceId} conversationId={recording.conversation_id} archived={archived} />}
                   </div>

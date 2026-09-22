@@ -21,11 +21,13 @@ import math
 import os
 import struct
 import time
+import uuid
 import wave
 from typing import Any, Awaitable, Callable, List, Optional
 
 import redis.asyncio as redis
 
+import backend.plugins.base as base
 from backend.plugins.events import PluginEvent
 from backend.plugins.router import PluginRouter
 from backend.redis_keys import ClientId, SessionId, device_downlink_channel
@@ -35,6 +37,7 @@ from backend.services.response_delivery import (
     deliver_text_response,
     deliver_wav_response,
 )
+from backend.services.voice_latency import timing_span
 from backend.services.voice_sessions import VoiceSessionCoordinator
 from backend.services.wakeword.timing import WakeTimer
 
@@ -434,6 +437,8 @@ async def execute_voice_command(
             )
 
     data: dict[str, Any] = {
+        "dialogue_input_id": response_turn_id or wake_trace_id or str(uuid.uuid4()),
+        "response_generation": response_generation,
         "command": command,
         "client_id": client_id_value,
         "session_id": session_id_value,
@@ -467,25 +472,57 @@ async def execute_voice_command(
     try:
         _dispatch_start = time.perf_counter()
         try:
-            results = await plugin_router.dispatch_event(
-                event=PluginEvent.WAKE_WORD_DETECTED,
-                user_id=user_id,
-                data=data,
-                metadata={
-                    "client_id": client_id_value,
-                    "session_id": session_id_value,
-                    "conversation_id": conversation_id,
-                    "command": command,
-                    "wakeword": wakeword,
-                    "asr_status": asr_status,
-                    "has_speech": has_speech,
-                    "score": score,
-                    "reason": reason,
-                    "source": source,
-                    "wake_trace_id": wake_trace_id,
-                },
-                on_plugin_done=_on_plugin_done,
-            )
+            async with timing_span("routing"):
+                # Defer this dependency to break the import cycle through
+                # backend.services.dialogue.capture -> backend.services.wakeword.executor.
+                from backend.services.dialogue.capture import accept
+
+                routed = None
+                if (
+                    has_speech
+                    and command.strip()
+                    and capture_view
+                    and capture_view.voice_session_id
+                ):
+                    routed = await accept(
+                        redis_client,
+                        user_id=user_id,
+                        client_id=client_id_value,
+                        capture_id=session_id_value,
+                        input_id=data["dialogue_input_id"],
+                        text=command,
+                        generation=response_generation,
+                    )
+                results = (
+                    [
+                        base.PluginResult(
+                            success=True,
+                            message="",
+                            should_continue=False,
+                            data={"thread_id": routed.id},
+                        )
+                    ]
+                    if routed
+                    else await plugin_router.dispatch_event(
+                        event=PluginEvent.WAKE_WORD_DETECTED,
+                        user_id=user_id,
+                        data=data,
+                        metadata={
+                            "client_id": client_id_value,
+                            "session_id": session_id_value,
+                            "conversation_id": conversation_id,
+                            "command": command,
+                            "wakeword": wakeword,
+                            "asr_status": asr_status,
+                            "has_speech": has_speech,
+                            "score": score,
+                            "reason": reason,
+                            "source": source,
+                            "wake_trace_id": wake_trace_id,
+                        },
+                        on_plugin_done=_on_plugin_done,
+                    )
+                )
             if response_generation is not None:
                 await responses.assert_generation(
                     user_id, client_id_value, response_generation

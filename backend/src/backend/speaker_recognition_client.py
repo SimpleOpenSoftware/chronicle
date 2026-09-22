@@ -26,15 +26,23 @@ from typing import Dict, List, Optional
 import aiohttp
 from aiohttp import ClientConnectorError
 
+import backend.service_deployment as service_deployment
 from backend.config import get_diarization_settings
 from backend.model_registry import get_models_registry
 from backend.models.conversation import Conversation
+from backend.services.speaker_gallery_privacy import (
+    GalleryLogFilter,
+    checked_response,
+    guard_gallery,
+    request_headers,
+)
 from backend.utils.audio_chunk_utils import reconstruct_audio_ranges
 from backend.utils.audio_extraction import extract_audio_for_results
 from backend.utils.audio_utils import pcm_to_wav_bytes
 from backend.utils.segment_utils import is_non_speech
 
 logger = logging.getLogger(__name__)
+logger.addFilter(GalleryLogFilter())
 
 SPEAKER_IDENTIFY_CONCURRENCY = int(os.getenv("SPEAKER_IDENTIFY_CONCURRENCY", "8"))
 SPEAKER_IDENTIFY_BATCH_SIZE = int(os.getenv("SPEAKER_IDENTIFY_BATCH_SIZE", "32"))
@@ -190,6 +198,25 @@ class SpeakerRecognitionClient:
             )
             return
 
+        self._gateway_headers = {}
+        deployment = speaker_config.get("deployment")
+        if deployment:
+            if (
+                service_url
+                or speaker_config.get("service_url")
+                or os.getenv("SPEAKER_SERVICE_URL")
+            ):
+                raise ValueError(
+                    "Managed speaker recognition cannot also configure SPEAKER_SERVICE_URL or service_url"
+                )
+
+            self.service_url = service_deployment.gateway_url(deployment, "speaker")
+            self._gateway_headers = {
+                "X-Chronicle-Service-Token": service_deployment.gateway_token()
+            }
+            self.enabled = True
+            return
+
         # Enabled - determine URL (priority: param > config > env var > minidisc)
         self.service_url = (
             service_url
@@ -255,6 +282,7 @@ class SpeakerRecognitionClient:
         )
         return timeout
 
+    @guard_gallery
     async def diarize_identify_match(
         self,
         conversation_id: str,
@@ -312,7 +340,9 @@ class SpeakerRecognitionClient:
             # by the speaker job instead.
             config = get_diarization_settings()
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 # Prepare form data with conversation_id + backend_token
                 form_data = aiohttp.FormData()
                 form_data.add_field("conversation_id", conversation_id)
@@ -369,6 +399,7 @@ class SpeakerRecognitionClient:
 
                 async with session.post(
                     request_url,
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     data=form_data,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
@@ -377,7 +408,7 @@ class SpeakerRecognitionClient:
                     )
 
                     if response.status != 200:
-                        response_text = await response.text()
+                        response_text = await checked_response(response, "text")
                         logger.error(
                             f"🎤 ❌ Speaker service returned status {response.status}: {response_text}"
                         )
@@ -390,7 +421,7 @@ class SpeakerRecognitionClient:
                             "segments": [],
                         }
 
-                    result = await response.json()
+                    result = await checked_response(response, "json")
 
                     # Log basic result info
                     num_segments = len(result.get("segments", []))
@@ -413,6 +444,7 @@ class SpeakerRecognitionClient:
             logger.error(f"🎤 Error during speaker recognition: {e}")
             return {"error": "unknown_error", "message": str(e), "segments": []}
 
+    @guard_gallery
     async def identify_segment(
         self,
         audio_wav_bytes: bytes,
@@ -444,7 +476,9 @@ class SpeakerRecognitionClient:
             }
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 form_data = aiohttp.FormData()
                 form_data.add_field(
                     "file",
@@ -461,11 +495,12 @@ class SpeakerRecognitionClient:
 
                 async with session.post(
                     f"{self.service_url}/identify",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     data=form_data,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as response:
                     if response.status != 200:
-                        response_text = await response.text()
+                        response_text = await checked_response(response, "text")
                         logger.warning(
                             f"🎤 /identify returned status {response.status}: {response_text}"
                         )
@@ -476,7 +511,7 @@ class SpeakerRecognitionClient:
                             "status": "error",
                         }
 
-                    return await response.json()
+                    return await checked_response(response, "json")
 
         except ClientConnectorError as e:
             logger.error(f"🎤 Failed to connect to speaker service /identify: {e}")
@@ -512,6 +547,7 @@ class SpeakerRecognitionClient:
                 "status": "error",
             }
 
+    @guard_gallery
     async def identify_batch(
         self,
         clips: List[tuple[str, bytes]],
@@ -529,7 +565,9 @@ class SpeakerRecognitionClient:
             }
         owns_session = session is None
         if session is None:
-            session = aiohttp.ClientSession()
+            session = aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            )
         try:
             form_data = aiohttp.FormData()
             for segment_id, audio_wav_bytes in clips:
@@ -548,17 +586,18 @@ class SpeakerRecognitionClient:
             form_data.add_field("include_embeddings", str(include_embeddings).lower())
             async with session.post(
                 f"{self.service_url}/identify/batch",
+                headers=request_headers(getattr(self, "_gateway_headers", {})),
                 data=form_data,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as response:
                 if response.status != 200:
-                    response_text = await response.text()
+                    response_text = await checked_response(response, "text")
                     return {
                         "error": "server_error",
                         "message": f"HTTP {response.status}: {response_text[:500]}",
                         "results": [],
                     }
-                return await response.json()
+                return await checked_response(response, "json")
         except ClientConnectorError as error:
             return {
                 "error": "connection_failed",
@@ -577,6 +616,7 @@ class SpeakerRecognitionClient:
             if owns_session:
                 await session.close()
 
+    @guard_gallery
     async def identify_provider_segments(
         self,
         conversation_id: str,
@@ -679,7 +719,9 @@ class SpeakerRecognitionClient:
                 sample_refs.append((label, seg))
 
         sample_results: List[Optional[Dict]] = [None] * len(sample_refs)
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            headers=getattr(self, "_gateway_headers", {})
+        ) as session:
             for offset in range(0, len(sample_refs), SPEAKER_IDENTIFY_BATCH_SIZE):
                 batch_refs = sample_refs[offset : offset + SPEAKER_IDENTIFY_BATCH_SIZE]
                 ranges = [(seg["start"], seg["end"]) for _, seg in batch_refs]
@@ -850,7 +892,9 @@ class SpeakerRecognitionClient:
                 eligible_indices.append(i)
 
         segment_results: List[Optional[Dict]] = [None] * len(segments)
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            headers=getattr(self, "_gateway_headers", {})
+        ) as session:
             batches = _pack_identification_batches(
                 segments,
                 eligible_indices,
@@ -1076,6 +1120,7 @@ class SpeakerRecognitionClient:
 
         return result
 
+    @guard_gallery
     async def diarize_and_identify(
         self,
         audio_data: bytes,
@@ -1114,7 +1159,9 @@ class SpeakerRecognitionClient:
             timeout = self.calculate_timeout(estimated_duration)
 
             # Call the speaker recognition service
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 # Prepare the audio data for upload (no disk I/O!)
                 form_data = aiohttp.FormData()
                 form_data.add_field(
@@ -1165,13 +1212,14 @@ class SpeakerRecognitionClient:
                 # Make the request
                 async with session.post(
                     endpoint_url,
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     data=form_data,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     logger.info(f"🎤 [DIARIZE] Response status: {response.status}")
 
                     if response.status != 200:
-                        response_text = await response.text()
+                        response_text = await checked_response(response, "text")
                         logger.warning(
                             f"🎤 [DIARIZE] ❌ Speaker recognition service returned status {response.status}: {response_text}"
                         )
@@ -1181,7 +1229,7 @@ class SpeakerRecognitionClient:
                             "segments": [],
                         }
 
-                    result = await response.json()
+                    result = await checked_response(response, "json")
                     segments_count = len(result.get("segments", []))
                     logger.info(
                         f"🎤 [DIARIZE] ✅ Speaker service returned {segments_count} segments"
@@ -1228,6 +1276,7 @@ class SpeakerRecognitionClient:
             logger.debug(traceback.format_exc())
             return {"error": "unknown_error", "message": str(e), "segments": []}
 
+    @guard_gallery
     async def identify_speakers(
         self, audio_path: str, segments: List[Dict]
     ) -> Dict[str, str]:
@@ -1270,7 +1319,9 @@ class SpeakerRecognitionClient:
             timeout = self.calculate_timeout(audio_duration)
 
             # Call the speaker recognition service
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 # Prepare the audio file for upload
                 with open(audio_path, "rb") as audio_file:
                     form_data = aiohttp.FormData()
@@ -1312,16 +1363,17 @@ class SpeakerRecognitionClient:
                     # Make the request
                     async with session.post(
                         f"{self.service_url}/diarize-and-identify",
+                        headers=request_headers(getattr(self, "_gateway_headers", {})),
                         data=form_data,
                         timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as response:
                         if response.status != 200:
                             logger.warning(
-                                f"Speaker recognition service returned status {response.status}: {await response.text()}"
+                                f"Speaker recognition service returned status {response.status}: {await checked_response(response, "text")}"
                             )
                             return {}
 
-                        result = await response.json()
+                        result = await checked_response(response, "json")
 
                         # Process the response to create speaker mapping
                         speaker_mapping = self._process_diarization_result(
@@ -1402,12 +1454,13 @@ class SpeakerRecognitionClient:
             logger.error(f"🎤 Error processing diarization result: {e}")
             return {}
 
+    @guard_gallery
     async def get_enrolled_speakers(self, user_id: Optional[str] = None) -> Dict:
         """
         Get enrolled speakers from the speaker recognition service.
 
         Args:
-            user_id: Optional user ID to filter speakers (for future user isolation)
+            user_id: Optional user ID to filter speakers
 
         Returns:
             Dictionary containing speakers list and metadata
@@ -1416,9 +1469,13 @@ class SpeakerRecognitionClient:
             return {"speakers": []}
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.get(
                     f"{self.service_url}/speakers",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
+                    params={"user_id": user_id} if user_id is not None else {},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:
                     if response.status != 200:
@@ -1427,7 +1484,7 @@ class SpeakerRecognitionClient:
                         )
                         return {"speakers": []}
 
-                    result = await response.json()
+                    result = await checked_response(response, "json")
                     speakers = result.get("speakers", [])
                     logger.info(f"🎤 Retrieved {len(speakers)} enrolled speakers")
                     return result
@@ -1439,6 +1496,7 @@ class SpeakerRecognitionClient:
             logger.error(f"🎤 Error getting enrolled speakers: {e}")
             return {"speakers": []}
 
+    @guard_gallery
     async def get_speaker_by_name(
         self, speaker_name: str, user_id: str
     ) -> Optional[Dict]:
@@ -1457,9 +1515,12 @@ class SpeakerRecognitionClient:
             return None
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.get(
                     f"{self.service_url}/speakers",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     params={"user_id": user_id},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:
@@ -1469,7 +1530,7 @@ class SpeakerRecognitionClient:
                         )
                         return None
 
-                    result = await response.json()
+                    result = await checked_response(response, "json")
                     speakers = result.get("speakers", [])
 
                     # Case-insensitive name match
@@ -1492,137 +1553,134 @@ class SpeakerRecognitionClient:
             logger.error(f"🎤 Error looking up speaker: {e}")
             return None
 
-    async def enroll_new_speaker(
-        self, speaker_name: str, audio_data: bytes, user_id: str
-    ) -> Dict:
-        """
-        Enroll a new speaker with audio data.
+    async def enrollment_catalog(self, user_id=None):
+        # Defer this dependency to break the import cycle through
+        # backend.services.speaker_enrollment -> backend.speaker_recognition_client.
+        from backend.services.speaker_enrollment import EnrollmentUnavailable
 
-        Args:
-            speaker_name: Display name for the speaker
-            audio_data: WAV audio bytes
-            user_id: User ID for the speaker (default: 1)
-
-        Returns:
-            Response dict from enrollment endpoint
-        """
-        if not self.enabled:
-            logger.warning("🎤 Speaker recognition disabled, cannot enroll speaker")
-            return {"error": "speaker_recognition_disabled"}
-
+        if not self.enabled or not self.service_url:
+            raise EnrollmentUnavailable()
         try:
-            # Opaque: the tenant is the `user_id` field, not part of the id.
-            speaker_id = f"speaker_{uuid.uuid4().hex[:12]}"
-
-            logger.info(
-                f"🎤 Enrolling new speaker '{speaker_name}' with ID: {speaker_id}"
-            )
-
-            async with aiohttp.ClientSession() as session:
-                form_data = aiohttp.FormData()
-                form_data.add_field(
-                    "file", audio_data, filename="segment.wav", content_type="audio/wav"
-                )
-                form_data.add_field("speaker_id", speaker_id)
-                form_data.add_field("speaker_name", speaker_name)
-                form_data.add_field("user_id", user_id)
-
-                async with session.post(
-                    f"{self.service_url}/enroll/upload",
-                    data=form_data,
-                    timeout=aiohttp.ClientTimeout(total=60),
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
+                async with session.get(
+                    f"{self.service_url}/enrollment/operations/catalog",
+                    params={"user_id": user_id} if user_id is not None else {},
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as response:
                     if response.status != 200:
-                        response_text = await response.text()
-                        logger.error(
-                            f"🎤 ❌ Speaker enrollment failed with status {response.status}: {response_text}"
-                        )
-                        return {"error": "enrollment_failed", "status": response.status}
+                        raise EnrollmentUnavailable()
+                    return await response.json()
+        except Exception:
+            raise EnrollmentUnavailable() from None
 
-                    result = await response.json()
-                    if result.get("status") == "already_enrolled":
-                        logger.info(
-                            "🎤 Enrollment for '%s' was already satisfied; no-op",
-                            speaker_name,
-                        )
-                    else:
-                        logger.info(
-                            "🎤 ✅ Successfully enrolled speaker '%s'", speaker_name
-                        )
-                    return result
+    async def enrollment_operation(
+        self,
+        action,
+        operation_id,
+        binding,
+        *,
+        catalog_id,
+        service_url,
+        audio_data=None,
+    ):
+        # Defer this dependency to break the import cycle through
+        # backend.services.speaker_enrollment -> backend.speaker_recognition_client.
+        from backend.services.speaker_enrollment import EnrollmentUnavailable
 
-        except aiohttp.ClientError as e:
-            logger.error(f"🎤 ❌ Failed to enroll speaker: {e}")
-            return {"error": "connection_failed", "message": str(e)}
-        except Exception as e:
-            logger.error(f"🎤 ❌ Error enrolling speaker: {e}")
-            return {"error": "unknown_error", "message": str(e)}
+        if (
+            not self.enabled
+            or self.service_url != service_url
+            or action not in {"prepare", "activate", "quarantine"}
+        ):
+            raise EnrollmentUnavailable()
+        headers = {
+            **getattr(self, "_gateway_headers", {}),
+            "X-Speaker-Catalog": catalog_id,
+        }
+        if action == "prepare":
+            form = aiohttp.FormData()
+            form.add_field("binding", json.dumps(binding, sort_keys=True))
+            form.add_field(
+                "file", audio_data, filename="segment.wav", content_type="audio/wav"
+            )
+            kwargs = {"data": form}
+        else:
+            kwargs = {
+                "json": (
+                    {"user_id": binding["user_id"]}
+                    if action == "quarantine"
+                    else binding
+                )
+            }
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.post(
+                    f"{service_url}/enrollment/operations/{operation_id}/{action}",
+                    timeout=aiohttp.ClientTimeout(
+                        total=120 if action == "prepare" else 30
+                    ),
+                    **kwargs,
+                ) as response:
+                    if response.status != 200:
+                        raise EnrollmentUnavailable()
+                    return await response.json()
+        except Exception:
+            raise EnrollmentUnavailable() from None
+
+    async def enroll_new_speaker(
+        self,
+        speaker_name: str,
+        audio_data: bytes,
+        user_id: str,
+        *,
+        conversation_ids=(),
+        visibility=None,
+        evidence_records=None,
+    ) -> Dict:
+        # Defer this dependency to break the import cycle through
+        # backend.services.speaker_enrollment -> backend.speaker_recognition_client.
+        from backend.services.speaker_enrollment import enroll
+
+        return await enroll(
+            self,
+            speaker_name=speaker_name,
+            speaker_id=None,
+            audio_data=audio_data,
+            user_id=user_id,
+            conversation_ids=conversation_ids,
+            visibility=visibility,
+            evidence_records=evidence_records,
+        )
 
     async def append_to_speaker(
-        self, speaker_id: str, audio_data: bytes, user_id: str
+        self,
+        speaker_id: str,
+        audio_data: bytes,
+        user_id: str,
+        *,
+        speaker_name,
+        conversation_ids=(),
+        visibility=None,
+        evidence_records=None,
     ) -> Dict:
-        """
-        Append audio to existing speaker's embedding (fine-tuning).
+        # Defer this dependency to break the import cycle through
+        # backend.services.speaker_enrollment -> backend.speaker_recognition_client.
+        from backend.services.speaker_enrollment import enroll
 
-        Args:
-            speaker_id: ID of existing speaker
-            audio_data: WAV audio bytes
-            user_id: Tenant the speaker must belong to
+        return await enroll(
+            self,
+            speaker_name=speaker_name,
+            speaker_id=speaker_id,
+            audio_data=audio_data,
+            user_id=user_id,
+            conversation_ids=conversation_ids,
+            visibility=visibility,
+            evidence_records=evidence_records,
+        )
 
-        Returns:
-            Response dict from append endpoint
-        """
-        if not self.enabled:
-            logger.warning("🎤 Speaker recognition disabled, cannot append to speaker")
-            return {"error": "speaker_recognition_disabled"}
-        if not user_id:
-            raise ValueError("user_id is required to append to a speaker")
-
-        try:
-            logger.info(f"🎤 Appending audio to speaker: {speaker_id}")
-
-            async with aiohttp.ClientSession() as session:
-                form_data = aiohttp.FormData()
-                form_data.add_field(
-                    "files",
-                    audio_data,
-                    filename="segment.wav",
-                    content_type="audio/wav",
-                )
-                form_data.add_field("speaker_id", speaker_id)
-                form_data.add_field("user_id", user_id)
-
-                async with session.post(
-                    f"{self.service_url}/enroll/append",
-                    data=form_data,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as response:
-                    if response.status != 200:
-                        response_text = await response.text()
-                        logger.error(
-                            f"🎤 ❌ Speaker append failed with status {response.status}: {response_text}"
-                        )
-                        return {"error": "append_failed", "status": response.status}
-
-                    result = await response.json()
-                    if result.get("status") == "already_enrolled":
-                        logger.info(
-                            "🎤 Speaker %s already contains this audio; no-op",
-                            speaker_id,
-                        )
-                    else:
-                        logger.info(
-                            "🎤 ✅ Successfully appended to speaker %s", speaker_id
-                        )
-                    return result
-
-        except aiohttp.ClientError as e:
-            logger.error(f"🎤 ❌ Failed to append to speaker: {e}")
-            return {"error": "connection_failed", "message": str(e)}
-        except Exception as e:
-            logger.error(f"🎤 ❌ Error appending to speaker: {e}")
-            return {"error": "unknown_error", "message": str(e)}
-
+    @guard_gallery
     async def score_enrollment_candidate(
         self, audio_wav_bytes: bytes, speaker_id: str
     ) -> Dict:
@@ -1637,7 +1695,9 @@ class SpeakerRecognitionClient:
             return {"error": "speaker_recognition_disabled"}
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 form_data = aiohttp.FormData()
                 form_data.add_field(
                     "file",
@@ -1649,21 +1709,23 @@ class SpeakerRecognitionClient:
 
                 async with session.post(
                     f"{self.service_url}/enrollment/candidates/score",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     data=form_data,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
                     if response.status != 200:
-                        response_text = await response.text()
+                        response_text = await checked_response(response, "text")
                         logger.warning(
                             f"🎤 /enrollment/candidates/score returned {response.status}: {response_text}"
                         )
                         return {"error": "score_failed", "status": response.status}
-                    return await response.json()
+                    return await checked_response(response, "json")
 
         except aiohttp.ClientError as e:
             logger.error(f"🎤 Failed to score enrollment candidate: {e}")
             return {"error": "connection_failed", "message": str(e)}
 
+    @guard_gallery
     async def get_enrollment_health(
         self, user_id: str, before: Optional[datetime] = None
     ) -> Dict:
@@ -1671,12 +1733,15 @@ class SpeakerRecognitionClient:
         if not self.enabled:
             return {"error": "speaker_recognition_disabled"}
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 params = {"user_id": user_id}
                 if before is not None:
                     params["before"] = before.isoformat()
                 async with session.get(
                     f"{self.service_url}/enrollment/health",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
@@ -1685,24 +1750,28 @@ class SpeakerRecognitionClient:
                             "error": "health_audit_failed",
                             "status": response.status,
                         }
-                    return await response.json()
+                    return await checked_response(response, "json")
         except aiohttp.ClientError as e:
             logger.error(f"🎤 Failed to audit enrollment health: {e}")
             return {"error": "connection_failed", "message": str(e)}
 
+    @guard_gallery
     async def get_enrollment_segment_audio(self, segment_id: int) -> Optional[bytes]:
         """Fetch one enrolled clip's audio for playback (None if unavailable)."""
         if not self.enabled:
             return None
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.get(
                     f"{self.service_url}/enrollment/segments/{segment_id}/audio",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
                     if response.status != 200:
                         return None
-                    return await response.read()
+                    return await checked_response(response, "read")
         except aiohttp.ClientError as e:
             logger.error(f"🎤 Failed to fetch enrollment segment audio: {e}")
             return None
@@ -1715,7 +1784,9 @@ class SpeakerRecognitionClient:
         if not self.enabled:
             return {"error": "speaker_recognition_disabled"}
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 form_data = aiohttp.FormData()
                 form_data.add_field("hard", "true" if hard else "false")
                 async with session.post(
@@ -1746,7 +1817,9 @@ class SpeakerRecognitionClient:
         if not user_id:
             raise ValueError("user_id is required to delete a speaker")
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.delete(
                     f"{self.service_url}/speakers/{speaker_id}",
                     params={
@@ -1774,7 +1847,9 @@ class SpeakerRecognitionClient:
         if not self.enabled:
             return {"error": "speaker_recognition_disabled"}
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 form_data = aiohttp.FormData()
                 form_data.add_field(
                     "file",
@@ -1794,6 +1869,7 @@ class SpeakerRecognitionClient:
             logger.error(f"🎤 Failed to extract evaluation embedding: {e}")
             return {"error": "connection_failed", "message": str(e)}
 
+    @guard_gallery
     async def score_cached_embeddings(
         self, speaker_id: str, embeddings: list[list[float]]
     ) -> Dict:
@@ -1801,9 +1877,12 @@ class SpeakerRecognitionClient:
         if not self.enabled:
             return {"error": "speaker_recognition_disabled"}
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.post(
                     f"{self.service_url}/enrollment/candidates/score-embeddings",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     json={"speaker_id": speaker_id, "embeddings": embeddings},
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as response:
@@ -1811,9 +1890,9 @@ class SpeakerRecognitionClient:
                         return {
                             "error": "embedding_score_failed",
                             "status": response.status,
-                            "message": await response.text(),
+                            "message": await checked_response(response, "text"),
                         }
-                    return await response.json()
+                    return await checked_response(response, "json")
         except aiohttp.ClientError as e:
             logger.error(f"🎤 Failed to score cached embeddings: {e}")
             return {"error": "connection_failed", "message": str(e)}
@@ -1823,7 +1902,9 @@ class SpeakerRecognitionClient:
         if not self.enabled:
             return {"error": "speaker_recognition_disabled"}
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.get(
                     f"{self.service_url}/enrollment/candidates/embedding-info",
                     timeout=aiohttp.ClientTimeout(total=10),
@@ -1837,6 +1918,7 @@ class SpeakerRecognitionClient:
         except aiohttp.ClientError as e:
             return {"error": "connection_failed", "message": str(e)}
 
+    @guard_gallery
     async def reidentify_clusters(
         self,
         clusters: Dict[str, list],
@@ -1861,9 +1943,12 @@ class SpeakerRecognitionClient:
         if exclusive is not None:
             payload["exclusive"] = exclusive
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.post(
                     f"{self.service_url}/v1/reidentify-clusters",
+                    headers=request_headers(getattr(self, "_gateway_headers", {})),
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
@@ -1873,7 +1958,7 @@ class SpeakerRecognitionClient:
                             "status": response.status,
                             "assignments": {},
                         }
-                    return await response.json()
+                    return await checked_response(response, "json")
         except Exception as e:
             return {"error": "connection_failed", "message": str(e), "assignments": {}}
 
@@ -1892,7 +1977,9 @@ class SpeakerRecognitionClient:
                 "file", audio_bytes, filename="conv.wav", content_type="audio/wav"
             )
             form_data.add_field("segments_data", json.dumps(segments))
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 async with session.post(
                     f"{self.service_url}/v1/embed-clusters",
                     data=form_data,
@@ -1910,6 +1997,7 @@ class SpeakerRecognitionClient:
         except Exception as e:
             return {"error": "connection_failed", "message": str(e), "clusters": {}}
 
+    @guard_gallery
     async def check_if_enrolled_speaker_present(
         self,
         redis_client,
@@ -2078,7 +2166,9 @@ class SpeakerRecognitionClient:
                 f"Performing health check on speaker service: {self.service_url}"
             )
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                headers=getattr(self, "_gateway_headers", {})
+            ) as session:
                 # Use the /health endpoint if available, otherwise try a simple endpoint
                 health_endpoints = ["/health", "/speakers"]
 

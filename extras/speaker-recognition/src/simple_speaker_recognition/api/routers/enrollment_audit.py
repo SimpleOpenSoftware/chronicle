@@ -25,6 +25,11 @@ from simple_speaker_recognition.core.enrollment_audit import (
     compute_audit,
     recompute_speaker_centroid,
 )
+from simple_speaker_recognition.core.gallery_privacy import (
+    allowed_speakers,
+    require_available,
+    require_unmanaged_segment,
+)
 from simple_speaker_recognition.core.unified_speaker_db import UnifiedSpeakerDB
 from simple_speaker_recognition.database import get_db_session
 from simple_speaker_recognition.database.models import (
@@ -145,7 +150,12 @@ async def _run_segment_backfill(job_id: int, user_id: str) -> None:
         job.started_at = datetime.utcnow()
         session.commit()
 
-        speakers = session.query(Speaker).filter(Speaker.user_id == user_id).all()
+        speakers = (
+            session.query(Speaker)
+            .filter(allowed_speakers())
+            .filter(Speaker.user_id == user_id)
+            .all()
+        )
         speaker_ids = {speaker.id for speaker in speakers}
         existing = {
             (row.speaker_id, os.path.basename(row.audio_file_path))
@@ -172,6 +182,7 @@ async def _run_segment_backfill(job_id: int, user_id: str) -> None:
         total = len(candidates)
         for index, (speaker_id, wav) in enumerate(candidates, start=1):
             try:
+                require_available(session, speaker_id)
                 duration = float(service.audio_backend.loader.get_duration(str(wav)))
                 wave = service.audio_backend.load_wave(wav)
                 vector = np.asarray(
@@ -181,6 +192,7 @@ async def _run_segment_backfill(job_id: int, user_id: str) -> None:
                 if not np.isfinite(norm) or norm <= 0:
                     raise ValueError("embedding was not finite")
                 vector /= norm
+                require_available(session, speaker_id)
                 relative_path = str(wav.resolve().relative_to(enrollment_dir))
                 session.add(
                     SpeakerAudioSegment(
@@ -286,6 +298,7 @@ async def segment_audio(segment_id: int):
         )
         if not seg:
             raise HTTPException(404, "Segment not found")
+        require_available(session, seg.speaker_id)
         path = _resolve_seg_path(seg)
     finally:
         session.close()
@@ -316,7 +329,12 @@ def _score_embeddings(embeddings: list[list[float]], speaker_id: str) -> list[di
     """Compare precomputed unit embeddings with one live speaker gallery."""
     session = get_db_session()
     try:
-        target = session.query(Speaker).filter(Speaker.id == speaker_id).first()
+        target = (
+            session.query(Speaker)
+            .filter(allowed_speakers())
+            .filter(Speaker.id == speaker_id)
+            .first()
+        )
         if not target:
             raise HTTPException(404, "Target speaker not found")
         centroid = (
@@ -339,6 +357,7 @@ def _score_embeddings(embeddings: list[list[float]], speaker_id: str) -> list[di
         others = []
         for other in (
             session.query(Speaker)
+            .filter(allowed_speakers())
             .filter(Speaker.id != speaker_id, Speaker.user_id == target.user_id)
             .all()
         ):
@@ -426,7 +445,12 @@ async def score_enrollment_candidate(
 
     session = get_db_session()
     try:
-        target = session.query(Speaker).filter(Speaker.id == speaker_id).first()
+        target = (
+            session.query(Speaker)
+            .filter(allowed_speakers())
+            .filter(Speaker.id == speaker_id)
+            .first()
+        )
         if not target:
             raise HTTPException(404, "Target speaker not found")
         centroid = (
@@ -450,6 +474,7 @@ async def score_enrollment_candidate(
         best_other = None
         others = (
             session.query(Speaker)
+            .filter(allowed_speakers())
             .filter(Speaker.id != speaker_id, Speaker.user_id == target.user_id)
             .all()
         )
@@ -535,11 +560,18 @@ async def relabel_segment(
         )
         if not seg:
             raise HTTPException(404, "Segment not found")
+        require_available(session, seg.speaker_id)
+        require_unmanaged_segment(session, seg)
         src_id = seg.speaker_id
         if src_id == target_speaker_id:
             raise HTTPException(400, "Segment is already assigned to that speaker")
 
-        target = session.query(Speaker).filter(Speaker.id == target_speaker_id).first()
+        target = (
+            session.query(Speaker)
+            .filter(allowed_speakers())
+            .filter(Speaker.id == target_speaker_id)
+            .first()
+        )
         if not target:
             raise HTTPException(404, "Target speaker not found")
 
@@ -585,6 +617,7 @@ async def review_enrollment_flag(
         )
         if not segment:
             raise HTTPException(404, "Segment not found")
+        require_available(session, segment.speaker_id)
 
         existing = (
             session.query(EnrollmentAuditDecision)
@@ -639,6 +672,8 @@ async def delete_segment(
         )
         if not seg:
             raise HTTPException(404, "Segment not found")
+        require_available(session, seg.speaker_id)
+        require_unmanaged_segment(session, seg)
         src_id = seg.speaker_id
         audio_file_path = seg.audio_file_path
 

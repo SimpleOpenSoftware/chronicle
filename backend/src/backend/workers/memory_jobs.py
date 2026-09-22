@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 
 from rq import get_current_job
 
+import backend.services.privacy as privacy
 from backend.controllers.queue_controller import (
     JOB_RESULT_TTL,
     memory_queue,
@@ -40,6 +41,7 @@ from backend.services.plugin_service import (
     dispatch_or_defer_space_event,
     dispatch_plugin_event,
 )
+from backend.services.recording_purpose import is_personal_recording
 from backend.services.sse_publisher import publish_sse_event
 from backend.users import get_user_by_id
 
@@ -224,6 +226,8 @@ async def process_memory_job(
     Returns:
         Dict with processing results
     """
+
+    await privacy.require_conversation(conversation_id)
     set_otel_session(conversation_id)
     start_time = time.time()
     logger.info(f"🔄 Starting memory processing for conversation {conversation_id}")
@@ -239,6 +243,13 @@ async def process_memory_job(
     # This is the final safety boundary. Scheduling paths should avoid enqueueing
     # memory work for annotation datasets, but a stale or manual job must still be
     # unable to mutate the user's vault.
+    if not is_personal_recording(conversation_model):
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "training_only",
+            "conversation_id": conversation_id,
+        }
     if conversation_model.memory_excluded:
         logger.info(
             f"Skipping memory processing for excluded conversation {conversation_id}"

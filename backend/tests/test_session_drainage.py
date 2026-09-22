@@ -12,6 +12,7 @@ loop. These tests pin the three properties of the replacement:
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 from fakeredis import aioredis as fake_aioredis
@@ -225,7 +226,12 @@ async def test_finished_session_settles_and_the_answer_is_recorded(
         session_controller, "pending_work_owners", record(_nothing_pending())
     )
 
-    body = _body(await get_streaming_status(_FakeRequest(redis)))
+    body = _body(
+        await get_streaming_status(
+            _FakeRequest(redis),
+            SimpleNamespace(user_id="test-admin", is_superuser=True),
+        )
+    )
 
     assert [s["session_id"] for s in body["completed_sessions"]] == ["s1"]
     assert body["active_sessions"] == []
@@ -245,9 +251,15 @@ async def test_settled_sessions_are_never_rescanned(streaming_status_env):
         session_controller, "pending_work_owners", record(_nothing_pending())
     )
 
-    await get_streaming_status(_FakeRequest(redis))
-    await get_streaming_status(_FakeRequest(redis))
-    await get_streaming_status(_FakeRequest(redis))
+    await get_streaming_status(
+        _FakeRequest(redis), SimpleNamespace(user_id="test-admin", is_superuser=True)
+    )
+    await get_streaming_status(
+        _FakeRequest(redis), SimpleNamespace(user_id="test-admin", is_superuser=True)
+    )
+    await get_streaming_status(
+        _FakeRequest(redis), SimpleNamespace(user_id="test-admin", is_superuser=True)
+    )
 
     # One scan, on the poll that settled it. The 50-day-old sessions that used to
     # cost a full job-history scan on every poll now cost nothing.
@@ -263,7 +275,12 @@ async def test_uninitialized_hash_is_not_reported_as_a_live_recording(
         session_controller, "pending_work_owners", record(_nothing_pending())
     )
 
-    body = _body(await get_streaming_status(_FakeRequest(redis)))
+    body = _body(
+        await get_streaming_status(
+            _FakeRequest(redis),
+            SimpleNamespace(user_id="test-admin", is_superuser=True),
+        )
+    )
 
     assert body["active_sessions"] == []
     assert body["completed_sessions"] == []

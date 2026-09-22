@@ -13,6 +13,7 @@ export interface VoiceCapabilities {
   input_route: InputRoute;
   output_route: OutputRoute;
   native_sample_rate: number;
+  incremental_playback: boolean;
   aec: EffectStatus;
   noise_suppression: EffectStatus;
   fallback_reason: 'aec_unavailable' | 'aec_unhealthy' | 'route_not_isolated' |

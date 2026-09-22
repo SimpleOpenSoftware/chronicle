@@ -398,6 +398,13 @@ def get_jobs(
                     all_jobs.append(
                         {
                             "job_id": job.id,
+                            "kwargs": job.kwargs or {},
+                            "_privacy_payload": {
+                                "func_name": job.func_name,
+                                "args": job.args,
+                                "kwargs": job.kwargs or {},
+                                "meta": job.meta or {},
+                            },
                             "job_type": func_name,
                             "user_id": user_id,
                             "status": status,
@@ -435,7 +442,7 @@ def get_jobs(
                         }
                     )
                 except Exception as e:
-                    logger.error(f"Error fetching job {job_id}: {e}")
+                    logger.error(f"Error fetching job {job_id}: {type(e).__name__}")
 
     # Sort by created_at (most recent first)
     all_jobs.sort(key=lambda x: x.get("created_at") or "", reverse=True)
@@ -514,7 +521,7 @@ def pending_work_owners() -> PendingWork:
             try:
                 job = Job.fetch(job_id, connection=redis_conn)
             except Exception as e:
-                logger.debug(f"Error checking job {job_id}: {e}")
+                logger.debug(f"Error checking job {job_id}: {type(e).__name__}")
                 continue
 
             session_id, client_id = _owner_of_job(job)
@@ -541,7 +548,9 @@ def _owner_of_job(job, _depth: int = 0) -> tuple:
         try:
             parent = Job.fetch(dependency_id, connection=redis_conn)
         except Exception as e:
-            logger.debug(f"Error fetching dependency {dependency_id}: {e}")
+            logger.debug(
+                f"Error fetching dependency {dependency_id}: {type(e).__name__}"
+            )
             continue
         resolved = _owner_of_job(parent, _depth + 1)
         if resolved[0] or resolved[1]:
@@ -555,10 +564,23 @@ _LIVE_JOB_STATUSES = {"queued", "started", "deferred", "scheduled"}
 
 
 def _job_is_live(job_id: str) -> bool:
-    """True if the given job exists in Redis and hasn't terminated."""
+    """A started job is live only while its registered worker still owns it."""
     try:
         job = Job.fetch(job_id, connection=redis_conn)
-        return job.get_status(refresh=True) in _LIVE_JOB_STATUSES
+        status = job.get_status(refresh=True)
+        if status == JobStatus.STARTED:
+            if not job.worker_name:
+                return False
+            worker = Worker.find_by_key(
+                Worker.redis_worker_namespace_prefix + job.worker_name,
+                connection=redis_conn,
+            )
+            return bool(
+                worker is not None
+                and worker.death_date is None
+                and worker.get_current_job_id() == job.id
+            )
+        return status in _LIVE_JOB_STATUSES
     except NoSuchJobError:
         return False
     except Exception:
@@ -1014,7 +1036,9 @@ def _clear_post_conversation_chain(conversation_id: str) -> list:
             job.delete(remove_from_queue=True)
             cleared.append(job_id)
         except Exception as e:
-            logger.error(f"Failed to delete stale chain job {job_id}: {e}")
+            logger.error(
+                f"Failed to delete stale chain job {job_id}: {type(e).__name__}"
+            )
     if cleared:
         logger.info(
             f"🧹 Cleared {len(cleared)} stale post-conversation job(s) for "
@@ -1417,7 +1441,7 @@ def get_queue_health() -> Dict[str, Any]:
         health["redis_connection"] = "healthy"
         health["worker_fleet"] = evaluate_fleet_health(redis_conn.get(FLEET_HEALTH_KEY))
     except Exception as e:
-        health["redis_connection"] = f"unhealthy: {e}"
+        health["redis_connection"] = f"unhealthy: {type(e).__name__}"
         return health
 
     # Check each queue. Registry sizes are read with ZCARD rather than len(registry):

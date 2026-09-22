@@ -35,9 +35,12 @@ from backend.controllers.queue_controller import (
 )
 from backend.models.conversation import Conversation
 from backend.redis_factory import create_async_redis
+from backend.redis_keys import parse_audio_stream_name
+from backend.services import privacy
 from backend.services.audio_service import get_audio_stream_service
 from backend.services.audio_stream.session_store import SessionStore
 from backend.services.plugin_service import get_plugin_router
+from backend.services.queue_privacy import QueuePrivacyFilter
 from backend.users import User
 
 logger = logging.getLogger(__name__)
@@ -61,8 +64,19 @@ _RESULT_MAX_ITEMS = 20
 _RESULT_MAX_DEPTH = 6
 
 
+def _job_privacy_payload(job):
+    result = {
+        "func_name": job.func_name,
+        "args": job.args,
+        "kwargs": job.kwargs or {},
+        "meta": job.meta or {},
+        "result": job.result,
+    }
+    return result
+
+
 def summarize_job_result(value, _depth: int = 0):
-    """Bound a job result to something safe to send in a list response."""
+    """Bound response size; the privacy filter must still check the full result."""
     if _depth >= _RESULT_MAX_DEPTH:
         return {"truncated": True}
     if value is None or isinstance(value, (bool, int, float)):
@@ -94,7 +108,8 @@ async def list_jobs(
 ):
     """List jobs with pagination and filtering."""
     try:
-        result = get_jobs(
+        result = await asyncio.to_thread(
+            get_jobs,
             limit=limit,
             offset=offset,
             queue_name=queue_name,
@@ -114,10 +129,15 @@ async def list_jobs(
             result["jobs"] = user_jobs
             result["pagination"]["total"] = len(user_jobs)
 
+        result["jobs"] = await QueuePrivacyFilter().project(
+            result["jobs"], default_owner=str(current_user.user_id)
+        )
         return result
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Failed to list jobs: {e}")
+        logger.error(f"Failed to list jobs: {type(e).__name__}")
         return {
             "error": "Failed to list jobs",
             "jobs": [],
@@ -148,10 +168,16 @@ async def get_job_status(
         try:
             status = get_job_status_from_rq(job)
         except RuntimeError as e:
-            logger.error(f"Failed to determine status for job {job_id}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(
+                f"Failed to determine status for job {job_id}: {type(e).__name__}"
+            )
+            raise HTTPException(status_code=500, detail="Job status unavailable")
 
-        response = {"job_id": job.id, "status": status}
+        response = {
+            "job_id": job.id,
+            "status": status,
+            "_privacy_payload": _job_privacy_payload(job),
+        }
 
         # Surface in-flight progress published by batch jobs (job.meta
         # "batch_progress" convention) so pollers can show done/total.
@@ -164,13 +190,19 @@ async def get_job_status(
             response["error_message"] = str(job.exc_info)
             response["exc_info"] = str(job.exc_info)
 
-        return response
+        return (
+            await QueuePrivacyFilter().project(
+                [response], default_owner=str(current_user.user_id)
+            )
+        )[0]
 
+    except privacy.PrivacyHeld:
+        raise
     except HTTPException:
         # Re-raise HTTPException unchanged (e.g., 403 Forbidden)
         raise
     except Exception as e:
-        logger.error(f"Failed to get job status {job_id}: {e}")
+        logger.error(f"Failed to get job status {job_id}: {type(e).__name__}")
         raise HTTPException(status_code=404, detail="Job not found")
 
 
@@ -190,10 +222,12 @@ async def get_job(job_id: str, current_user: User = Depends(current_active_user)
         try:
             status = get_job_status_from_rq(job)
         except RuntimeError as e:
-            logger.error(f"Failed to determine status for job {job_id}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(
+                f"Failed to determine status for job {job_id}: {type(e).__name__}"
+            )
+            raise HTTPException(status_code=500, detail="Job status unavailable")
 
-        return {
+        response = {
             "job_id": job.id,
             "status": status,
             "created_at": job.created_at.isoformat() if job.created_at else None,
@@ -207,12 +241,19 @@ async def get_job(job_id: str, current_user: User = Depends(current_active_user)
             "result": job.result,
             "error_message": str(job.exc_info) if job.exc_info else None,
         }
+        return (
+            await QueuePrivacyFilter().project(
+                [response], default_owner=str(current_user.user_id)
+            )
+        )[0]
 
+    except privacy.PrivacyHeld:
+        raise
     except HTTPException:
         # Re-raise HTTPException unchanged (e.g., 403 Forbidden)
         raise
     except Exception as e:
-        logger.error(f"Failed to get job {job_id}: {e}")
+        logger.error(f"Failed to get job {job_id}: {type(e).__name__}")
         raise HTTPException(status_code=404, detail="Job not found")
 
 
@@ -252,9 +293,10 @@ async def cancel_job(job_id: str, current_user: User = Depends(current_active_us
         # Re-raise HTTPException unchanged (e.g., 403 Forbidden)
         raise
     except Exception as e:
-        logger.error(f"Failed to cancel/delete job {job_id}: {e}")
+        logger.error(f"Failed to cancel/delete job {job_id}: {type(e).__name__}")
         raise HTTPException(
-            status_code=404, detail=f"Job not found or could not be canceled: {str(e)}"
+            status_code=404,
+            detail=f"Job not found or could not be canceled: {type(e).__name__}",
         )
 
 
@@ -298,6 +340,7 @@ async def get_jobs_by_client(
             all_jobs.append(
                 {
                     "job_id": job.id,
+                    "_privacy_payload": _job_privacy_payload(job),
                     "job_type": (
                         job.func_name.split(".")[-1] if job.func_name else "unknown"
                     ),
@@ -333,9 +376,13 @@ async def get_jobs_by_client(
                             # Recursively process dependent job
                             process_job_and_dependents(dep_job, queue_name, "waiting")
                         except Exception as e:
-                            logger.debug(f"Error fetching dependent job {dep_id}: {e}")
+                            logger.debug(
+                                f"Error fetching dependent job {dep_id}: {type(e).__name__}"
+                            )
             except Exception as e:
-                logger.debug(f"Error checking dependents for job {job.id}: {e}")
+                logger.debug(
+                    f"Error checking dependents for job {job.id}: {type(e).__name__}"
+                )
 
         # Find all jobs that match the session
         for queue_name in queues:
@@ -379,7 +426,7 @@ async def get_jobs_by_client(
                             process_job_and_dependents(job, queue_name, status_name)
 
                     except Exception as e:
-                        logger.debug(f"Error fetching job {job_id}: {e}")
+                        logger.debug(f"Error fetching job {job_id}: {type(e).__name__}")
                         continue
 
         # Sort by created_at
@@ -389,12 +436,17 @@ async def get_jobs_by_client(
             f"Found {len(all_jobs)} jobs for client {client_id} (including dependents)"
         )
 
+        all_jobs = await QueuePrivacyFilter().project(
+            all_jobs, default_owner=str(current_user.user_id)
+        )
         return {"client_id": client_id, "jobs": all_jobs, "total": len(all_jobs)}
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Failed to get jobs for client {client_id}: {e}")
+        logger.error(f"Failed to get jobs for client {client_id}: {type(e).__name__}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get jobs for client: {str(e)}"
+            status_code=500, detail=f"Failed to get jobs for client: {type(e).__name__}"
         )
 
 
@@ -416,9 +468,14 @@ async def get_events(
         events = router_instance.get_recent_events(
             limit=limit, event_type=event_type or None
         )
+        events = await QueuePrivacyFilter().project(
+            events, default_owner=str(current_user.user_id), event=True
+        )
         return {"events": events, "total": len(events)}
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Failed to get events: {e}")
+        logger.error(f"Failed to get events: {type(e).__name__}")
         return {"events": [], "total": 0}
 
 
@@ -463,8 +520,10 @@ async def clear_jobs(
 
         return {"deleted": total_removed}
     except Exception as e:
-        logger.error(f"Failed to clear jobs: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to clear jobs: {str(e)}")
+        logger.error(f"Failed to clear jobs: {type(e).__name__}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to clear jobs: {type(e).__name__}"
+        )
 
 
 @router.delete("/events")
@@ -483,8 +542,10 @@ async def clear_events(
         count = router_instance.clear_events()
         return {"deleted": count}
     except Exception as e:
-        logger.error(f"Failed to clear events: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to clear events: {str(e)}")
+        logger.error(f"Failed to clear events: {type(e).__name__}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to clear events: {type(e).__name__}"
+        )
 
 
 @router.get("/stats")
@@ -495,7 +556,7 @@ async def get_queue_stats_endpoint(current_user: User = Depends(current_active_u
         return stats
 
     except Exception as e:
-        logger.error(f"Failed to get queue stats: {e}")
+        logger.error(f"Failed to get queue stats: {type(e).__name__}")
         return {
             "total_jobs": 0,
             "queued_jobs": 0,
@@ -531,9 +592,9 @@ async def get_queue_worker_details(current_user: User = Depends(current_active_u
         return status
 
     except Exception as e:
-        logger.error(f"Failed to get queue worker details: {e}")
+        logger.error(f"Failed to get queue worker details: {type(e).__name__}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get worker details: {str(e)}"
+            status_code=500, detail=f"Failed to get worker details: {type(e).__name__}"
         )
 
 
@@ -554,7 +615,7 @@ async def get_stream_stats(
         cursor = b"0"
         while cursor and len(stream_keys) < limit:
             cursor, keys = await audio_service.redis.scan(
-                cursor, match=f"{audio_service.audio_stream_prefix}*", count=limit
+                cursor, match="audio:stream:*", count=limit
             )
             stream_keys.extend(keys[: limit - len(stream_keys)])
 
@@ -565,88 +626,35 @@ async def get_stream_stats(
                     stream_key.decode() if isinstance(stream_key, bytes) else stream_key
                 )
 
-                # Get basic stream info
-                info = await audio_service.redis.xinfo_stream(stream_name)
-
-                # Get consumer groups info
-                groups_info = []
-                try:
-                    groups = await audio_service.redis.xinfo_groups(stream_name)
-                    for group in groups:
-                        group_dict = {}
-                        # Parse group info (alternating key-value pairs)
-                        for i in range(0, len(group), 2):
-                            if i + 1 < len(group):
-                                key = (
-                                    group[i].decode()
-                                    if isinstance(group[i], bytes)
-                                    else str(group[i])
-                                )
-                                value = group[i + 1]
-                                if isinstance(value, bytes):
-                                    try:
-                                        value = value.decode()
-                                    except:
-                                        value = str(value)
-                                group_dict[key] = value
-
-                        # Get consumers for this group
-                        consumers = []
-                        try:
-                            consumers_raw = await audio_service.redis.xinfo_consumers(
-                                stream_name, group_dict.get("name", "")
-                            )
-                            for consumer in consumers_raw:
-                                consumer_dict = {}
-                                for i in range(0, len(consumer), 2):
-                                    if i + 1 < len(consumer):
-                                        key = (
-                                            consumer[i].decode()
-                                            if isinstance(consumer[i], bytes)
-                                            else str(consumer[i])
-                                        )
-                                        value = consumer[i + 1]
-                                        if isinstance(value, bytes):
-                                            try:
-                                                value = value.decode()
-                                            except:
-                                                value = str(value)
-                                        consumer_dict[key] = value
-                                consumers.append(consumer_dict)
-                        except Exception as ce:
-                            logger.debug(
-                                f"Could not fetch consumers for group {group_dict.get('name')}: {ce}"
-                            )
-
-                        groups_info.append(
-                            {
-                                "name": group_dict.get("name", "unknown"),
-                                "consumers": group_dict.get("consumers", 0),
-                                "pending": group_dict.get("pending", 0),
-                                "last_delivered_id": group_dict.get(
-                                    "last-delivered-id", "N/A"
-                                ),
-                                "consumer_details": consumers,
-                            }
-                        )
-                except Exception as ge:
-                    logger.debug(f"No consumer groups for stream {stream_name}: {ge}")
-
+                if not current_user.is_superuser:
+                    session_id = parse_audio_stream_name(stream_name).value
+                    view = await SessionStore(audio_service.redis).read(session_id)
+                    if not view or view.user_id != str(current_user.user_id):
+                        return None
+                info = await session_controller.stream_diagnostics(
+                    audio_service.redis, stream_name
+                )
                 return {
                     "stream_name": stream_name,
-                    "length": info[b"length"],
-                    "first_entry_id": (
-                        info[b"first-entry"][0].decode()
-                        if info[b"first-entry"]
-                        else None
-                    ),
-                    "last_entry_id": (
-                        info[b"last-entry"][0].decode() if info[b"last-entry"] else None
-                    ),
-                    "groups": groups_info,
+                    "length": info["stream_length"],
+                    "first_entry_id": info["first_entry_id"],
+                    "last_entry_id": info["last_entry_id"],
+                    "groups": [
+                        {
+                            "name": group["name"],
+                            "consumers": len(group["consumers"]),
+                            "pending": group["pending"],
+                            "last_delivered_id": group["last_delivered_id"],
+                            "consumer_details": group["consumers"],
+                        }
+                        for group in info["consumer_groups"]
+                    ],
                 }
+
             except Exception as e:
-                logger.error(f"Error getting info for stream {stream_key}: {e}")
+                logger.error(
+                    f"Error getting info for stream {stream_key}: {type(e).__name__}"
+                )
                 return None
 
         # Fetch all stream info in parallel
@@ -662,8 +670,12 @@ async def get_stream_stats(
         }
 
     except Exception as e:
-        logger.error(f"Failed to get stream stats: {e}", exc_info=True)
-        return {"error": str(e), "total_streams": 0, "streams": []}
+        logger.error(f"Failed to get stream stats: {type(e).__name__}")
+        return {
+            "error": "Failed to get stream stats",
+            "total_streams": 0,
+            "streams": [],
+        }
 
 
 class FlushJobsRequest(BaseModel):
@@ -693,14 +705,12 @@ def _summarize_job(job: Job, queue_name: str, status: str) -> dict:
         age_hours = round((now - ended_at).total_seconds() / 3600, 2)
     return {
         "job_id": job.id,
-        "job_type": (job.func_name or "").split(".")[-1]
-        or job.description
-        or "unknown",
+        "job_type": (job.func_name or "").split(".")[-1] or "unknown",
         "status": status,
         "queue": queue_name,
         "ended_at": ended_at.isoformat() if ended_at else None,
         "age_hours": age_hours,
-        "description": job.description,
+        "description": (job.func_name or "").split(".")[-1] or "Job",
         "client_id": meta.get("client_id"),
         "conversation_id": meta.get("conversation_id"),
         "session_level": bool(meta.get("session_level")),
@@ -747,7 +757,9 @@ async def flush_jobs(
                                 job.delete()
                                 total_removed += 1
                     except Exception as e:
-                        logger.error(f"Error processing job {job_id}: {e}")
+                        logger.error(
+                            f"Error processing job {job_id}: {type(e).__name__}"
+                        )
 
         if request.dry_run:
             return {
@@ -765,8 +777,10 @@ async def flush_jobs(
         }
 
     except Exception as e:
-        logger.error(f"Failed to flush jobs: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to flush jobs: {str(e)}")
+        logger.error(f"Failed to flush jobs: {type(e).__name__}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to flush jobs: {type(e).__name__}"
+        )
 
 
 @router.post("/flush-all")
@@ -825,7 +839,9 @@ async def flush_all_jobs(
                                 _summarize_job(job, queue_name, registry_name)
                             )
                         except Exception as e:
-                            logger.warning(f"Error inspecting job {job_id}: {e}")
+                            logger.warning(
+                                f"Error inspecting job {job_id}: {type(e).__name__}"
+                            )
 
             # Count (but never delete) the Redis keys this flush would remove
             redis_keys_matched = 0
@@ -939,7 +955,9 @@ async def flush_all_jobs(
 
                     except Exception as e:
                         # Job might already be deleted or not exist - try to remove from registry anyway
-                        logger.warning(f"Error deleting job {job_id}: {e}")
+                        logger.warning(
+                            f"Error deleting job {job_id}: {type(e).__name__}"
+                        )
                         try:
                             registry.remove(job_id)
                             logger.info(
@@ -1002,9 +1020,9 @@ async def flush_all_jobs(
         }
 
     except Exception as e:
-        logger.error(f"Failed to flush all jobs: {e}")
+        logger.error(f"Failed to flush all jobs: {type(e).__name__}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to flush all jobs: {str(e)}"
+            status_code=500, detail=f"Failed to flush all jobs: {type(e).__name__}"
         )
 
 
@@ -1020,6 +1038,10 @@ async def get_redis_sessions(
             store = SessionStore(redis_client)
             sessions = []
             async for view in store.iter_views(limit=limit):
+                if not current_user.is_superuser and view.user_id != str(
+                    current_user.user_id
+                ):
+                    continue
                 sessions.append(
                     {
                         "session_id": view.session_id,
@@ -1043,8 +1065,10 @@ async def get_redis_sessions(
             await redis_client.aclose()
 
     except Exception as e:
-        logger.error(f"Failed to get sessions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get sessions: {str(e)}")
+        logger.error(f"Failed to get sessions: {type(e).__name__}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get sessions: {type(e).__name__}"
+        )
 
 
 @router.post("/sessions/clear")
@@ -1080,9 +1104,9 @@ async def clear_old_sessions(
             await redis_client.aclose()
 
     except Exception as e:
-        logger.error(f"Failed to clear sessions: {e}", exc_info=True)
+        logger.error(f"Failed to clear sessions: {type(e).__name__}", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"Failed to clear sessions: {str(e)}"
+            status_code=500, detail=f"Failed to clear sessions: {type(e).__name__}"
         )
 
 
@@ -1104,6 +1128,7 @@ async def get_dashboard_data(
     """
     try:
         # Parse expanded clients list
+        visibility = QueuePrivacyFilter()
         expanded_client_ids = (
             [c.strip() for c in expanded_clients.split(",") if c.strip()]
             if expanded_clients
@@ -1167,6 +1192,7 @@ async def get_dashboard_data(
                             all_jobs.append(
                                 {
                                     "job_id": job.id,
+                                    "_privacy_payload": _job_privacy_payload(job),
                                     "job_type": (
                                         job.func_name.split(".")[-1]
                                         if job.func_name
@@ -1213,12 +1239,14 @@ async def get_dashboard_data(
                                 }
                             )
                         except Exception as e:
-                            logger.debug(f"Error fetching job {job_id}: {e}")
+                            logger.debug(
+                                f"Error fetching job {job_id}: {type(e).__name__}"
+                            )
                             continue
 
                 return all_jobs
             except Exception as e:
-                logger.error(f"Error fetching {status_name} jobs: {e}")
+                logger.error(f"Error fetching {status_name} jobs: {type(e).__name__}")
                 return []
 
         async def fetch_stats():
@@ -1226,7 +1254,7 @@ async def get_dashboard_data(
             try:
                 return get_job_stats()
             except Exception as e:
-                logger.error(f"Error fetching stats: {e}")
+                logger.error(f"Error fetching stats: {type(e).__name__}")
                 return {
                     "total_jobs": 0,
                     "queued_jobs": 0,
@@ -1239,9 +1267,11 @@ async def get_dashboard_data(
             """Fetch streaming status."""
             try:
                 # Use the actual request object from the parent function
-                return await session_controller.get_streaming_status(request)
+                return await session_controller.get_streaming_status(
+                    request, current_user, visibility=visibility.visibility
+                )
             except Exception as e:
-                logger.error(f"Error fetching streaming status: {e}")
+                logger.error(f"Error fetching streaming status: {type(e).__name__}")
                 return {"active_sessions": [], "stream_health": {}, "rq_queues": {}}
 
         async def fetch_client_jobs(client_id: str):
@@ -1313,6 +1343,7 @@ async def get_dashboard_data(
                                 all_jobs.append(
                                     {
                                         "job_id": job.id,
+                                        "_privacy_payload": _job_privacy_payload(job),
                                         "job_type": (
                                             job.func_name.split(".")[-1]
                                             if job.func_name
@@ -1344,12 +1375,16 @@ async def get_dashboard_data(
                                     }
                                 )
                             except Exception as e:
-                                logger.debug(f"Error fetching job {job_id}: {e}")
+                                logger.debug(
+                                    f"Error fetching job {job_id}: {type(e).__name__}"
+                                )
                                 continue
 
                 return {"client_id": client_id, "jobs": all_jobs}
             except Exception as e:
-                logger.error(f"Error fetching jobs for client {client_id}: {e}")
+                logger.error(
+                    f"Error fetching jobs for client {client_id}: {type(e).__name__}"
+                )
                 return {"client_id": client_id, "jobs": []}
 
         async def fetch_events():
@@ -1362,7 +1397,7 @@ async def get_dashboard_data(
                     return []
                 return router_instance.get_recent_events(limit=50)
             except Exception as e:
-                logger.error(f"Error fetching events: {e}")
+                logger.error(f"Error fetching events: {type(e).__name__}")
                 return []
 
         # Execute all fetches in parallel (using RQ standard status names)
@@ -1443,6 +1478,31 @@ async def get_dashboard_data(
                 }
             )
 
+        groups = [
+            queued_jobs,
+            started_jobs,
+            finished_jobs,
+            failed_jobs,
+            deferred_jobs,
+            scheduled_jobs,
+        ]
+        for group in groups:
+            group[:] = await visibility.project(
+                group, default_owner=str(current_user.user_id)
+            )
+        for key, group in client_jobs.items():
+            client_jobs[key] = await visibility.project(
+                group, default_owner=str(current_user.user_id)
+            )
+        events = await visibility.project(
+            events, default_owner=str(current_user.user_id), event=True
+        )
+        await visibility.assert_current()
+        if isinstance(streaming_status, dict) and any(
+            not row.get("privacy_held")
+            for row in streaming_status.get("active_sessions", [])
+        ):
+            await visibility.visibility.assert_current()
         return {
             "jobs": {
                 "queued": queued_jobs,
@@ -1460,8 +1520,10 @@ async def get_dashboard_data(
             "timestamp": asyncio.get_event_loop().time(),
         }
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Failed to get dashboard data: {e}", exc_info=True)
+        logger.error(f"Failed to get dashboard data: {type(e).__name__}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get dashboard data: {str(e)}"
+            status_code=500, detail=f"Failed to get dashboard data: {type(e).__name__}"
         )

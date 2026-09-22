@@ -26,6 +26,7 @@ from typing import List, Optional, Sequence
 from bson import Binary
 from pymongo.errors import DuplicateKeyError
 
+import backend.services.privacy as privacy
 from backend.models.audio_capture import (
     AudioCaptureSession,
     AudioRangeRef,
@@ -240,6 +241,8 @@ async def retrieve_audio_chunks(
     Exact edge clipping is intentionally handled by the PCM reconstruction helpers;
     callers that need playable audio must not concatenate this result directly.
     """
+
+    await privacy.require_conversation(conversation_id)
     resolved = await resolve_conversation_audio(conversation_id)
     chunks: list[AudioChunkDocument] = []
     seen: set[str] = set()
@@ -583,6 +586,8 @@ async def reconstruct_wav_from_claims(
     end_time: float | None = None,
 ) -> bytes:
     """Render capture evidence before a semantic Conversation exists."""
+
+    await privacy.require_audio_ranges(audio_ranges)
     if not audio_ranges:
         raise ValueError("No audio ranges supplied")
     resolved = await resolve_audio_ranges(audio_ranges)
@@ -957,19 +962,21 @@ async def convert_audio_to_chunks(
     else:
         raise ValueError(f"Unsupported capture origin: {origin!r}")
 
-    # Finite audio is content-addressed per user. Backup restores and repeated uploads
-    # may carry a new source/session ID for bytes already stored; keep the oldest
-    # surviving capture as canonical and return its immutable range instead of writing
-    # another physical copy. Open live streams have no whole-capture digest and never
-    # enter this path.
-    canonical = (
-        await AudioCaptureSession.find(
-            AudioCaptureSession.user_id == user_id,
-            AudioCaptureSession.content_sha256 == content_sha256,
+    # Imports may reuse an existing imported recording. Device captures instead
+    # retain their source/time identity even when their PCM is identical (for
+    # example silence or audio shared by microphone and system tracks). Their
+    # deterministic capture_session_id owns retries below.
+    canonical = None
+    if processing_profile == "imported":
+        canonical = (
+            await AudioCaptureSession.find(
+                AudioCaptureSession.user_id == user_id,
+                AudioCaptureSession.content_sha256 == content_sha256,
+                AudioCaptureSession.processing_profile == "imported",
+            )
+            .sort("+started_at")
+            .first_or_none()
         )
-        .sort("+started_at")
-        .first_or_none()
-    )
     if canonical is not None and canonical.capture_session_id != capture_session_id:
         canonical_chunks = (
             await AudioChunkDocument.find(

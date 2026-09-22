@@ -20,6 +20,21 @@ internal object DuplexAudioPolicy {
   ): Boolean = current != null &&
     (responseId == "*" || responseId == current.id) &&
     cancellationGeneration >= current.generation
+
+  fun audioLevel(pcm: ByteArray, byteCount: Int): Double {
+    val boundedBytes = minOf(byteCount, pcm.size)
+    val usableBytes = boundedBytes - (boundedBytes % 2)
+    if (usableBytes <= 0) return 0.0
+    var sumOfSquares = 0.0
+    var index = 0
+    while (index < usableBytes) {
+      val sample = ((pcm[index].toInt() and 0xff) or (pcm[index + 1].toInt() shl 8)).toShort()
+      val normalized = sample.toDouble() / 32_768.0
+      sumOfSquares += normalized * normalized
+      index += 2
+    }
+    return kotlin.math.min(1.0, kotlin.math.sqrt(sumOfSquares / (usableBytes / 2).toDouble()))
+  }
 }
 
 internal data class EpochResponse(

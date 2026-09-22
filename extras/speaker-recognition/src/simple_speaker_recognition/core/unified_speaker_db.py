@@ -9,6 +9,10 @@ from typing import Dict, List, Optional, Tuple, cast
 import faiss
 import numpy as np
 
+from simple_speaker_recognition.core.gallery_privacy import (
+    allowed_speakers,
+    require_available,
+)
 from simple_speaker_recognition.database import get_db_session
 from simple_speaker_recognition.database.models import Speaker, User
 from simple_speaker_recognition.database.queries import UserQueries
@@ -55,9 +59,13 @@ class UnifiedSpeakerDB:
 
     def _rebuild_faiss_mapping(self) -> None:
         """Rebuild FAISS index from SQLite data."""
+        # SQLite is authoritative. A deletion, empty database or failed rebuild
+        # must never leave the previous (possibly quarantined) vectors searchable.
+        self.index = faiss.IndexFlatIP(self.emb_dim)
+        self.faiss_to_speaker.clear()
         db = get_db_session()
         try:
-            speakers = db.query(Speaker).all()
+            speakers = db.query(Speaker).filter(allowed_speakers()).all()
             self.faiss_to_speaker.clear()
 
             if not speakers:
@@ -75,16 +83,21 @@ class UnifiedSpeakerDB:
                         embedding = np.array(
                             json.loads(embedding_data), dtype=np.float32
                         )
+                        if (
+                            embedding.shape != (self.emb_dim,)
+                            or not np.all(np.isfinite(embedding))
+                            or not np.isfinite(np.linalg.norm(embedding))
+                            or np.linalg.norm(embedding) <= 0
+                        ):
+                            raise ValueError("Invalid embedding vector")
                         vector_index = len(vectors)
                         vectors.append(embedding)
                         self.faiss_to_speaker[vector_index] = (
                             cast(str, speaker.user_id),
                             cast(str, speaker.id),
                         )
-                    except (json.JSONDecodeError, ValueError) as e:
-                        log.warning(
-                            "Invalid embedding data for speaker %s: %s", speaker.id, e
-                        )
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        log.warning("Skipping invalid gallery embedding")
 
             if vectors:
                 # Normalize all embeddings before adding to FAISS
@@ -97,8 +110,11 @@ class UnifiedSpeakerDB:
                     len(vectors),
                 )
 
-        except Exception as e:
-            log.error("Error rebuilding FAISS mapping: %s", e)
+        except Exception:
+            self.index = faiss.IndexFlatIP(self.emb_dim)
+            self.faiss_to_speaker.clear()
+            log.error("Speaker gallery rebuild failed; gallery held")
+            raise
         finally:
             db.close()
 
@@ -122,6 +138,7 @@ class UnifiedSpeakerDB:
         async with self._lock:
             db = get_db_session()
             try:
+                require_available(db, speaker_id)
                 # Check if speaker exists
                 existing_speaker = (
                     db.query(Speaker)
@@ -408,6 +425,7 @@ class UnifiedSpeakerDB:
         """Verify speaker identity against stored embedding."""
         db = get_db_session()
         try:
+            require_available(db, speaker_id)
             speaker = (
                 db.query(Speaker)
                 .filter(Speaker.id == speaker_id, Speaker.user_id == user_id)
@@ -435,7 +453,11 @@ class UnifiedSpeakerDB:
         """Get all speakers for a specific user."""
         db = get_db_session()
         try:
-            speakers = db.query(Speaker).filter(Speaker.user_id == user_id).all()
+            speakers = (
+                db.query(Speaker)
+                .filter(Speaker.user_id == user_id, allowed_speakers())
+                .all()
+            )
             return [
                 {
                     "id": cast(str, speaker.id),
@@ -461,7 +483,11 @@ class UnifiedSpeakerDB:
         """Get all speakers with their embeddings for a specific user."""
         db = get_db_session()
         try:
-            speakers = db.query(Speaker).filter(Speaker.user_id == user_id).all()
+            speakers = (
+                db.query(Speaker)
+                .filter(Speaker.user_id == user_id, allowed_speakers())
+                .all()
+            )
             result = {}
             for speaker in speakers:
                 embedding_data = cast(Optional[str], speaker.embedding_data)

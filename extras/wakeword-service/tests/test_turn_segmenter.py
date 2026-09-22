@@ -96,3 +96,26 @@ def test_dictation_policy_has_longer_complete_and_incomplete_grace():
 
     assert dictation.complete_grace_ms > conversational.complete_grace_ms
     assert dictation.incomplete_grace_ms > conversational.incomplete_grace_ms
+
+
+@pytest.mark.asyncio
+async def test_speech_offsets_exclude_preroll_and_endpoint_silence_on_device_clock():
+    segmenter = TurnSegmenter(TurnPolicy.conversational())
+    events = []
+    for sequence in range(12):
+        frame = _frame(sequence, speech=2 <= sequence < 5)
+        frame = TurnFrame(
+            **{
+                **frame.__dict__,
+                "device_monotonic_ms": 900_000 + sequence * 40,
+                "captured_at_ms": 1_000_000 + sequence * 40,
+            }
+        )
+        events += await segmenter.push(frame, semantic_complete=sequence >= 7)
+    soft = next(e for e in events if e.kind == "soft_ended")
+    committed = (await segmenter.advance(soft.deadline_ms))[0]
+    assert committed.speech_started_device_ms == 900_080
+    assert committed.speech_ended_device_ms == 900_200
+    assert committed.speech_started_at_ms == 1_000_080
+    assert committed.speech_ended_at_ms == 1_000_200
+    assert committed.ended_at_ms > 200

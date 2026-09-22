@@ -1,48 +1,24 @@
-import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { Trash2, Mic } from 'lucide-react'
 import Recordings from './Recordings'
 import Archive from './Archive'
 
 export default function RecordingsRouter() {
-  const [activeTab, setActiveTab] = useState<'classic' | 'archive'>('classic')
-
-  return (
-    <div>
-      {/* Tab Navigation */}
-      <div className="mb-6 border-b border-gray-200 dark:border-gray-700">
-        <nav className="-mb-px flex space-x-8">
-          <button
-            onClick={() => setActiveTab('classic')}
-            className={`
-              py-4 px-1 border-b-2 font-medium text-sm transition-colors
-              ${activeTab === 'classic'
-                ? 'border-blue-600 text-blue-600 dark:text-blue-400'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300'
-              }
-            `}
-          >
-            Classic View
-          </button>
-          <button
-            onClick={() => setActiveTab('archive')}
-            className={`
-              py-4 px-1 border-b-2 font-medium text-sm transition-colors
-              ${activeTab === 'archive'
-                ? 'border-orange-600 text-orange-600 dark:text-orange-400'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300'
-              }
-            `}
-          >
-            Archive
-          </button>
-        </nav>
-      </div>
-
-      {/* Content */}
-      {activeTab === 'classic' ? (
-        <Recordings />
-      ) : (
-        <Archive />
-      )}
-    </div>
-  )
+  const [params, setParams] = useSearchParams()
+  const trash = params.get('view') === 'trash'
+  const select = (showTrash: boolean) => {
+    const next = new URLSearchParams(params)
+    showTrash ? next.set('view', 'trash') : next.delete('view')
+    setParams(next)
+  }
+  return <div>
+    <nav aria-label="Recording views" className="mb-5 flex gap-2 border-b border-[var(--tape-line)] pb-3">
+      {[{ label: 'Recordings', icon: Mic, selected: !trash, trash: false }, { label: 'Trash', icon: Trash2, selected: trash, trash: true }].map(view => <button
+        key={view.label} type="button" aria-pressed={view.selected} onClick={() => select(view.trash)}
+        className={`inline-flex min-h-11 items-center gap-2 rounded-md px-3 text-sm font-medium ${view.selected ? 'bg-[var(--tape-selected)] text-[var(--tape-focus)]' : 'text-[var(--tape-activity)] hover:bg-[var(--tape-chip)]'}`}>
+        <view.icon className="h-4 w-4" />{view.label}
+      </button>)}
+    </nav>
+    {trash ? <Archive /> : <Recordings />}
+  </div>
 }

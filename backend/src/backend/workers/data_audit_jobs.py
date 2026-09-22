@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from beanie import PydanticObjectId
 from rq import get_current_job
 
+import backend.services.privacy as privacy
 from backend.config_loader import get_service_config
 from backend.llm_client import async_generate
 from backend.models.conversation import Conversation
@@ -547,7 +548,9 @@ async def export_annotation_dataset_job(
     total_dropped_seconds = 0.0
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+
         for cid in dict.fromkeys(conversation_ids):
+            await privacy.require_conversation(cid)
             summary: Dict[str, Any] = {
                 "conversation_id": cid,
                 "title": None,

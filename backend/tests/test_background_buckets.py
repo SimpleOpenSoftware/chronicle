@@ -415,8 +415,15 @@ class _StubUser:
     user_id = "test-user"
 
 
-def _stub_suppression_ledger(monkeypatch):
-    """No-DB stand-ins for the suppression ledger; returns captured records."""
+async def _stub_suppression_ledger(monkeypatch):
+    """Allowed synthetic target with a stand-in ledger; capture written records."""
+    await speaker_jobs.privacy.database().conversations.insert_one(
+        {
+            "conversation_id": "conversation",
+            "user_id": "test-user",
+            "client_id": "synthetic-control",
+        }
+    )
     captured: list[dict] = []
 
     async def no_override(_user_id, _conversation_id):
@@ -425,7 +432,10 @@ def _stub_suppression_ledger(monkeypatch):
     async def no_sticky(_user_id, _conversation_id):
         return {}
 
-    async def record(_conversation_id, _user_id, records, source, prune=True):
+    async def record(
+        _conversation_id, _user_id, records, source, prune=True, *, privacy_visibility
+    ):
+        await privacy_visibility.assert_current()
         captured.extend({**r, "source": source} for r in records)
         return len(records)
 
@@ -470,7 +480,7 @@ async def test_background_reference_overrides_weaker_foreground_match(monkeypatc
         async def extract_speaker_embedding(self, _wav):
             return {"embedding": [1.0, 0.0], "embedding_model": "test-model"}
 
-    async def match(_user, _embeddings, bucket_type, _model):
+    async def match(_user, _embeddings, bucket_type, _model, *, visibility):
         similarity = 0.72 if bucket_type == "background_speech" else 0.2
         return {"results": [{"bucket_similarity": similarity}]}
 
@@ -479,7 +489,7 @@ async def test_background_reference_overrides_weaker_foreground_match(monkeypatc
     monkeypatch.setattr(
         speaker_jobs.background_bucket_controller, "match_embeddings", match
     )
-    ledger = _stub_suppression_ledger(monkeypatch)
+    ledger = await _stub_suppression_ledger(monkeypatch)
 
     await speaker_jobs._apply_background_references(
         "conversation", segments, _StubUser(), SpeakerClient()
@@ -521,7 +531,7 @@ async def test_background_reference_does_not_override_stronger_foreground(monkey
         async def extract_speaker_embedding(self, _wav):
             return {"embedding": [1.0, 0.0], "embedding_model": "test-model"}
 
-    async def match(_user, _embeddings, bucket_type, _model):
+    async def match(_user, _embeddings, bucket_type, _model, *, visibility):
         similarity = 0.74 if bucket_type == "background_speech" else 0.2
         return {"results": [{"bucket_similarity": similarity}]}
 
@@ -530,7 +540,7 @@ async def test_background_reference_does_not_override_stronger_foreground(monkey
     monkeypatch.setattr(
         speaker_jobs.background_bucket_controller, "match_embeddings", match
     )
-    ledger = _stub_suppression_ledger(monkeypatch)
+    ledger = await _stub_suppression_ledger(monkeypatch)
 
     await speaker_jobs._apply_background_references(
         "conversation", segments, _StubUser(), SpeakerClient()
@@ -565,7 +575,7 @@ async def test_background_reference_reuses_identification_embedding(monkeypatch)
         async def extract_speaker_embedding(self, _wav):
             raise AssertionError("identification audio must not be embedded twice")
 
-    async def match(_user, embeddings, bucket_type, model):
+    async def match(_user, embeddings, bucket_type, model, *, visibility):
         assert embeddings == [[1.0, 0.0]]
         assert model == "wespeaker-test"
         similarity = 0.8 if bucket_type == "background_speech" else 0.2
@@ -578,7 +588,7 @@ async def test_background_reference_reuses_identification_embedding(monkeypatch)
     monkeypatch.setattr(
         speaker_jobs.background_bucket_controller, "match_embeddings", match
     )
-    _stub_suppression_ledger(monkeypatch)
+    await _stub_suppression_ledger(monkeypatch)
 
     await speaker_jobs._apply_background_references(
         "conversation", segments, _StubUser(), SpeakerClient()
@@ -617,7 +627,7 @@ async def test_background_reference_reconstructs_large_turn_sets_in_bounded_batc
         async def extract_speaker_embedding(self, _wav):
             return {"embedding": [1.0, 0.0], "embedding_model": "test-model"}
 
-    async def match(_user, _embeddings, _bucket_type, _model):
+    async def match(_user, _embeddings, _bucket_type, _model, *, visibility):
         return {"results": [{"bucket_similarity": 0.0}]}
 
     monkeypatch.setattr(speaker_jobs, "resolve_conversation_audio", resolve)
@@ -625,7 +635,7 @@ async def test_background_reference_reconstructs_large_turn_sets_in_bounded_batc
     monkeypatch.setattr(
         speaker_jobs.background_bucket_controller, "match_embeddings", match
     )
-    _stub_suppression_ledger(monkeypatch)
+    await _stub_suppression_ledger(monkeypatch)
 
     await speaker_jobs._apply_background_references(
         "conversation", segments, _StubUser(), SpeakerClient()

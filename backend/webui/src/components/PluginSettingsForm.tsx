@@ -4,6 +4,7 @@ import { systemApi } from '../services/api'
 import PluginListSidebar from './plugins/PluginListSidebar'
 import PluginConfigPanel from './plugins/PluginConfigPanel'
 import { Alert, Card } from './ui'
+import { pluginSaveFeedback } from './plugins/saveFeedback'
 
 interface PluginMetadata {
   plugin_id: string
@@ -57,6 +58,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [message, setMessage] = useState('')
+  const [messageTone, setMessageTone] = useState<'success' | 'warning'>('success')
   const [error, setError] = useState('')
   const [testResult, setTestResult] = useState<any>(null)
   const [connectivity, setConnectivity] = useState<Record<string, any>>({})
@@ -77,6 +79,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
     setLoading(true)
     setError('')
     setMessage('')
+    setConnectivity({})
 
     try {
       const response = await systemApi.getPluginsMetadata()
@@ -88,8 +91,6 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
         setSelectedPluginId(pluginsData[0].plugin_id)
       }
 
-      setMessage('Plugins loaded successfully')
-      setTimeout(() => setMessage(''), 3000)
 
       // Fetch live connectivity in background (non-blocking)
       systemApi.getPluginsConnectivity()
@@ -147,29 +148,6 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
     setSelectedPluginId(pluginId)
   }
 
-  const handleToggleEnabled = async (pluginId: string, enabled: boolean) => {
-    try {
-      // Update the plugin's enabled state
-      const plugin = plugins.find((p) => p.plugin_id === pluginId)
-      if (!plugin) return
-
-      await systemApi.updatePluginConfigStructured(pluginId, {
-        orchestration: {
-          enabled,
-          events: plugin.orchestration?.events || [],
-          condition: plugin.orchestration?.condition || { type: 'always' }
-        }
-      })
-
-      // Reload plugins to reflect changes
-      await loadPlugins()
-      setMessage(`Plugin ${enabled ? 'enabled' : 'disabled'} successfully`)
-      setTimeout(() => setMessage(''), 3000)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || `Failed to ${enabled ? 'enable' : 'disable'} plugin`)
-    }
-  }
-
   const handleConfigChange = (config: PluginConfig) => {
     setCurrentConfig(config)
     setErrors({})
@@ -192,6 +170,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
       setTestResult(response.data)
 
       if (response.data.success) {
+        setMessageTone('success')
         setMessage('Connection test successful')
         setTimeout(() => setMessage(''), 3000)
       }
@@ -226,17 +205,17 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
         }
       })
 
-      await systemApi.updatePluginConfigStructured(selectedPluginId, {
+      const response = await systemApi.updatePluginConfigStructured(selectedPluginId, {
         orchestration: currentConfig.orchestration,
         settings: currentConfig.settings,
         env_vars: Object.keys(envVarsToSend).length > 0 ? envVarsToSend : undefined
       })
 
-      setMessage('Configuration saved successfully. Restart backend to apply changes.')
-      setTimeout(() => setMessage(''), 5000)
-
-      // Reload plugins to reflect changes
+      setOriginalConfig(JSON.parse(JSON.stringify(currentConfig)))
       await loadPlugins()
+      const feedback = pluginSaveFeedback(response.data)
+      setMessageTone(feedback.tone)
+      setMessage(feedback.message)
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to save configuration')
     } finally {
@@ -249,6 +228,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
       setCurrentConfig(JSON.parse(JSON.stringify(originalConfig)))
       setErrors({})
       setTestResult(null)
+      setMessageTone('success')
       setMessage('Configuration reset to original values')
       setTimeout(() => setMessage(''), 3000)
     }
@@ -268,7 +248,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
               Plugin Configuration
             </h2>
             <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-              Configure plugins, manage orchestration, and test connections
+              Saving reloads backend plugins and requests a worker restart.
             </p>
           </div>
           <button
@@ -283,7 +263,7 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
 
         {/* Status Messages */}
         {message && (
-          <Alert tone="success" className="mx-6 mt-4">{message}</Alert>
+          <Alert tone={messageTone} className="mx-6 mt-4">{message}</Alert>
         )}
 
         {error && (
@@ -300,7 +280,6 @@ export default function PluginSettingsForm({ className }: PluginSettingsFormProp
               plugins={plugins}
               selectedPluginId={selectedPluginId}
               onSelectPlugin={handlePluginSelect}
-              onToggleEnabled={handleToggleEnabled}
               loading={loading}
               connectivity={connectivity}
             />

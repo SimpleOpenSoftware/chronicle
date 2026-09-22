@@ -5,7 +5,6 @@ import {
   Brain,
   CheckCircle,
   File,
-  FileArchive,
   PenLine,
   RefreshCw,
   Upload as UploadIcon,
@@ -291,7 +290,7 @@ export default function Upload() {
             }`}
           >
             <Brain className="h-4 w-4" />
-            Process memories
+            Personal recordings
           </button>
           <button
             type="button"
@@ -304,24 +303,26 @@ export default function Upload() {
             }`}
           >
             <PenLine className="h-4 w-4" />
-            Annotation workspace
+            Annotation data
           </button>
         </div>
         <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
           {annotationOnly
-            ? 'Import a Chronicle dataset with transcripts, or transcribe new audio without changing memory.'
-            : 'Transcribe audio and run the normal memory pipeline.'}
+            ? 'Excluded from memory.'
+            : 'Destination: Main'}
         </p>
       </div>
 
       {/* Google Drive Folder Upload */}
-      <div className="mb-6 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600">
-        <label className="block mb-2 font-medium text-gray-900 dark:text-gray-100">
+      <details className="mb-6 rounded-lg border border-[var(--tape-line)] p-3">
+        <summary className="cursor-pointer text-sm text-[var(--tape-focus)]">Import from Google Drive</summary>
+        <label htmlFor="gdrive-folder-id" className="mt-3 block mb-2 font-medium text-gray-900 dark:text-gray-100">
           Google Drive folder ID
         </label>
 
         <div className="flex flex-col gap-2 sm:flex-row">
           <Input
+            id="gdrive-folder-id"
             type="text"
             value={gdriveFolderId}
             onChange={(e) => setGdriveFolderId(e.target.value)}
@@ -345,7 +346,7 @@ export default function Upload() {
             {gdriveUploadStatus.message}
           </Alert>
         )}
-      </div>
+      </details>
 
       {/* Drop Zone */}
       <div
@@ -372,6 +373,7 @@ export default function Upload() {
         <input
           ref={fileInputRef}
           type="file"
+          aria-label="Choose audio files or an annotation dataset"
           multiple
           accept={`${annotationOnly ? '.zip,' : ''}audio/*,video/mp4,video/webm,.wav,.mp3,.m4a,.flac,.ogg,.mp4,.webm`}
           onChange={(e) => handleFileSelect(e.target.files)}
@@ -494,7 +496,7 @@ export default function Upload() {
         <div className="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium text-blue-700 dark:text-blue-300">
-              Processing audio files...
+              Submitting files...
             </span>
             <span className="text-sm text-blue-600 dark:text-blue-400">
               {uploadProgress}%
@@ -506,25 +508,9 @@ export default function Upload() {
               style={{ width: `${uploadProgress}%` }}
             />
           </div>
-          <p className="text-xs text-blue-600 dark:text-blue-400 mt-2">
-            Note: Processing may take up to 5 minutes depending on file size and quantity.
-          </p>
+
         </div>
       )}
-
-      <div className="mt-8 border-t border-gray-200 pt-4 text-sm text-gray-600 dark:border-gray-700 dark:text-gray-400">
-        {annotationOnly ? (
-          <div className="flex items-center gap-2">
-            <FileArchive className="h-4 w-4" />
-            Imported clips remain editable conversations but are permanently excluded from memory.
-          </div>
-        ) : (
-          <div className="flex items-center gap-2">
-            <Brain className="h-4 w-4" />
-            Uploaded audio follows the full transcription and memory pipeline.
-          </div>
-        )}
-      </div>
 
     </div>
   )

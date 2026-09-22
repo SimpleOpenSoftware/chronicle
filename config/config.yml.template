@@ -464,3 +464,11 @@ speaker_recognition:
   diarize_concurrent_chunks: 1  # Serialize 20-minute neural windows by default
   diarize_chunk_overlap: 5.0  # Overlap (seconds) between chunks
   backend_api_url: http://host.docker.internal:8000  # Backend API URL
+
+# Explicit compute placement. Configure the same coordinator on every node.
+# The authority stores its revisioned plan in config/service-deployments.sqlite3.
+# service_placement:
+#   node_id: workstation-linux
+#   coordinator_url: http://server.example.ts.net:8775
+#   authority: false  # true on exactly one node, the coordinator
+#   reconcile_excluded: true

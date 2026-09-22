@@ -52,6 +52,12 @@ _KEEP_PHRASES = {"keep", "keep it", "keep cart", "keep the cart", "use it"}
 _CLEAR_PHRASES = {"clear", "clear it", "clear cart", "clear the cart", "start over"}
 _SHOW_CART_PHRASES = {"cart", "show cart", "what is in my cart", "review cart"}
 _CONFIRM_ADDRESS_PHRASES = {
+    "हाँ",
+    "हां",
+    "हाँ यही",
+    "haan",
+    "han",
+    "haan yahi",
     "yes",
     "yes please",
     "yeah",
@@ -64,6 +70,11 @@ _CONFIRM_ADDRESS_PHRASES = {
     "confirm address",
 }
 _CHANGE_ADDRESS_PHRASES = {
+    "नहीं",
+    "नही",
+    "nahi",
+    "nahin",
+    "mat karo",
     "no",
     "nope",
     "change address",
@@ -1033,6 +1044,17 @@ class SwiggyInstamartPlugin(BasePlugin):
 
         polling_interval = int(data.get("pollingIntervalInMs") or 5000)
         max_polling = int(data.get("maxTimeToPollForInMs") or 300000)
+        state = {
+            **state,
+            "order_id": order_id,
+            "paas_id": paas_id,
+            "bridge_url": bridge_url,
+            "payment_status": "pending",
+        }
+        context.session.phase = "awaiting_payment"
+        context.session.plugin_state = state
+        if context.dialogue_thread_id:
+            await context.checkpoint()
         try:
             payment_job_id = enqueue_instamart_payment_monitor(
                 interaction_id=context.session.interaction_id,
@@ -1044,6 +1066,7 @@ class SwiggyInstamartPlugin(BasePlugin):
                 paas_id=paas_id,
                 polling_interval_ms=polling_interval,
                 max_polling_ms=max_polling,
+                dialogue_thread_id=context.dialogue_thread_id,
             )
         except (
             Exception

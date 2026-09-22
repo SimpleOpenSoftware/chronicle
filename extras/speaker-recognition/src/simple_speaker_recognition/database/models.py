@@ -109,6 +109,48 @@ class EnrollmentSession(Base):
         return f"<EnrollmentSession(id={self.id}, speaker_id='{self.speaker_id}', quality={self.quality_score})>"
 
 
+class SpeakerCatalogIdentity(Base):
+    """Stable identity of this writable database, preserved across restarts."""
+
+    __tablename__ = "speaker_catalog_identity"
+    id = Column(Integer, primary_key=True)
+    catalog_id = Column(String(32), nullable=False, unique=True)
+
+
+class EnrollmentOperation(Base):
+    """Durable evidence binding and revocation tombstone for staged enrollment.
+
+    Staged audio is retained separately from the active gallery. A tombstone may
+    arrive before prepare, so only the operation identity and tenant are required.
+    Segment identity is deliberately not a foreign key: deletion must not erase
+    the evidence ledger or permit a delayed activation.
+    """
+
+    __tablename__ = "enrollment_operations"
+
+    id = Column(String(32), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    state = Column(String(20), nullable=False)
+    binding = Column(Text)
+    audio_sha256 = Column(String(64))
+    audio_file_path = Column(Text)
+    embedding = Column(Text)
+    duration_seconds = Column(Float)
+    speaker_id = Column(String(100), index=True)
+    segment_id = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class SpeakerPrivacyHold(Base):
+    """An inseparable gallery stays held across rebuilds and ordinary edits."""
+
+    __tablename__ = "speaker_privacy_holds"
+    speaker_id = Column(String(100), primary_key=True)
+    user_id = Column(String(64), nullable=False)
+    operation_id = Column(String(32), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class SpeakerAudioSegment(Base):
     """Individual audio segments for speakers."""
 

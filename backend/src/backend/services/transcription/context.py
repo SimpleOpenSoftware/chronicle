@@ -5,14 +5,44 @@ Combines static hot words from the prompt registry with per-user dynamic
 jargon cached in Redis by the ``asr_jargon_extraction`` cron job.
 """
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 from backend.prompt_registry import get_prompt_registry
 from backend.redis_factory import create_async_redis
+from backend.services import privacy
 
 logger = logging.getLogger(__name__)
+
+
+def jargon_cache_key(user_id, snapshot):
+    revision = hashlib.sha256(
+        json.dumps(snapshot.revisions, sort_keys=True).encode()
+    ).hexdigest()
+    return f"asr:jargon:references-v1:{user_id}:{revision}"
+
+
+async def cached_jargon(user_id, redis_client):
+    snapshot = await privacy.load_snapshot(user_id)
+    await privacy.assert_current(user_id, snapshot)
+    cached = await redis_client.get(jargon_cache_key(user_id, snapshot))
+    text, receipt = "", []
+    if cached:
+        try:
+            data = json.loads(cached)
+            text, receipt = data["text"], data["privacy_reference_receipt"]
+            if not isinstance(text, str) or not isinstance(receipt, list):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            raise privacy.PrivacyHeld() from None
+        if not snapshot.permits_record({"privacy_reference_receipt": receipt}):
+            raise privacy.PrivacyHeld()
+    snapshot.watch_all_sources()
+    await privacy.assert_current(user_id, snapshot)
+    return text, snapshot, receipt
 
 
 @dataclass
@@ -26,6 +56,8 @@ class TranscriptionContext:
     hot_words: str = ""
     user_jargon: str = ""
     user_id: Optional[str] = None
+    privacy_checks: list = field(default_factory=list, repr=False)
+    reference_receipt: list[str] = field(default_factory=list, repr=False)
 
     @property
     def combined(self) -> str:
@@ -48,8 +80,8 @@ class TranscriptionContext:
     def to_metadata(self) -> dict:
         """Return a dict suitable for Langfuse span metadata."""
         return {
-            "hot_words": self.hot_words[:200] if self.hot_words else "",
-            "user_jargon": self.user_jargon[:200] if self.user_jargon else "",
+            "hot_words_length": len(self.hot_words),
+            "user_jargon_length": len(self.user_jargon),
             "user_id": self.user_id,
             "combined_length": len(self.combined),
         }
@@ -74,31 +106,26 @@ async def gather_transcription_context(
         hot_words = ""
 
     user_jargon = ""
+    checks = []
+    receipt = []
     if user_id:
         try:
             redis_client = create_async_redis(decode_responses=True)
             try:
-                user_jargon = await redis_client.get(f"asr:jargon:{user_id}") or ""
+                user_jargon, snapshot, receipt = await cached_jargon(
+                    user_id, redis_client
+                )
+                if user_jargon:
+                    checks.append((str(user_id), snapshot))
             finally:
                 await redis_client.aclose()
         except Exception:
-            pass  # Redis unavailable → skip dynamic jargon
+            user_jargon, checks, receipt = "", [], []
 
     return TranscriptionContext(
         hot_words=hot_words or "",
         user_jargon=user_jargon,
         user_id=user_id,
+        privacy_checks=checks,
+        reference_receipt=receipt,
     )
-
-
-async def get_asr_context(user_id: Optional[str] = None) -> str:
-    """Build combined ASR context string (backward-compatible alias).
-
-    Args:
-        user_id: If provided, also look up per-user jargon from Redis.
-
-    Returns:
-        Newline-separated context string for ASR providers.
-    """
-    ctx = await gather_transcription_context(user_id)
-    return ctx.combined

@@ -18,7 +18,7 @@ const mediaEpisode = {
   status: 'provisional',
   confirmed_at: null,
   confirmed_fields: ['title', 'kind'],
-  memory_policy: 'auto',
+  requires_activity_review: true, memory_eligible: true, memory_policy: 'auto',
   salience: 'routine',
   confidence: 0.91,
   activity_mode: 'foreground',

@@ -13,12 +13,16 @@ The vault is the only store; there is no separate search index. All knowledge ab
 how the vault is shaped lives in the memory agent's prompts (see ``..agent``).
 """
 
+import hashlib
 import logging
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
+
+import backend.services.chat_runs as chat_runs
+import backend.services.privacy as privacy
 
 # The deterministic Daily ``## Episodes`` index is a projection of active timeline
 # episodes, shared with the incremental projection layer so a settled-day write and a
@@ -49,6 +53,7 @@ from ..conversation_note import (
     write_source_fallback_conversation_note,
 )
 from ..scope import MemoryScope, MemoryScopeResolver
+from ..session_write import SessionDraftResult, SessionWriteInput
 from ..telemetry import (
     memory_attempt,
     memory_span,
@@ -131,6 +136,15 @@ def _repair_guidance(findings: List[Any]) -> str:
     return " ".join(lines) + "\n" + render_findings(findings)
 
 
+def _session_write_completed(result, verify_expected: bool) -> bool:
+    """Distinguish deliberate edits/no-op from a model stopping mid-investigation."""
+    if result.truncated or result.stalled or (verify_expected and not result.verified):
+        return False
+    if result.touched:
+        return True
+    return not result.errors and bool(result.summary.strip())
+
+
 class MemoryService(MemoryServiceBase):
     """Memory service backed by an agentic Markdown vault (the ground truth).
 
@@ -149,6 +163,8 @@ class MemoryService(MemoryServiceBase):
         self.vault = ConvDocVaultManager()
         self.scope_resolver = MemoryScopeResolver(self.vault._base_dir.parent)
         self.last_day_source_episode_keys_by_path: dict[str, list[str]] = {}
+        self.last_day_source_evidence_keys_by_path: dict[str, list[str]] = {}
+        self.last_day_inference_artifacts: list[dict] = []
 
     def _scope_root(self, user_id: str, memory_space_id: Optional[str]) -> Path:
         if not memory_space_id:
@@ -509,6 +525,163 @@ class MemoryService(MemoryServiceBase):
     # ADD DAY MEMORY
     # =========================================================================
 
+    async def draft_session_memory(
+        self, source: SessionWriteInput, user_id: str
+    ) -> SessionDraftResult:
+        """Draft a reviewed session in this service's isolated vault.
+
+        No activity index is written. A completed no-op is valid; an interrupted
+        investigation is not. The caller owns proposal publication and approval.
+        """
+        # Defer this dependency to break the import cycle through backend.services.memory ->
+        # backend.services.memory.service_factory -> backend.services.memory.providers.chronicle.
+        from ..agent.memory_agent import VERIFY_CAPABLE_BACKENDS
+
+        await self._ensure_initialized()
+        root = self.vault.user_root(user_id)
+        seed_vault_scaffold(root)
+        before = self._vault_note_set(root)
+        draft = SessionDraftResult(outcome="failed")
+        text = source.render()
+        verify_expected = (
+            self.config.write_agent_backend in VERIFY_CAPABLE_BACKENDS
+            and (self.config.write_recovery_backend or "direct")
+            in VERIFY_CAPABLE_BACKENDS
+        )
+        result = None
+        with memory_span(
+            "memory_write_session",
+            attributes={
+                "chronicle.memory.operation": "write_session",
+                "chronicle.memory.session_key": source.session_key,
+                "chronicle.memory.source_run_id": source.proposal_id,
+                "chronicle.memory.source_episode_ids": list(source.episode_ids),
+                "chronicle.memory.source_conversation_ids": list(
+                    source.conversation_ids
+                ),
+                "chronicle.memory.local_date": source.event_date or "undated",
+                "chronicle.user_id": user_id,
+            },
+        ) as span:
+            set_observation_io(span, input={"session": text_payload(text)})
+            for attempt in ("primary", "recovery"):
+                if attempt == "recovery" and not self.config.write_recovery_backend:
+                    break
+                result = await self._run_session_attempt(
+                    root,
+                    source,
+                    attempt,
+                    "Finish only the supported useful changes; no Daily entry is required.",
+                )
+                if result is not None:
+                    draft.retain_attempt(result)
+                    if _session_write_completed(result, verify_expected):
+                        break
+
+            findings = await self._session_draft_findings(
+                root, before, text, draft.touched
+            )
+            if findings and result is not None:
+                repair = await self._run_session_attempt(
+                    root,
+                    source,
+                    "verify_repair",
+                    _repair_guidance(findings),
+                )
+                if repair is not None:
+                    draft.retain_attempt(repair)
+                # The latest attempt owns completion. A failed repair cannot hide
+                # behind earlier success, and a completed repair can finish recovery.
+                result = repair
+                findings = await self._session_draft_findings(
+                    root, before, text, draft.touched
+                )
+
+            await self._record_agent_touches(
+                user_id,
+                source.session_key,
+                root,
+                draft.touched,
+                before,
+                removed=result.removed if result else None,
+            )
+            blocking = [f for f in findings if f.rule in _BLOCKING_VAULT_RULES]
+            if blocking or result is None:
+                draft.outcome = "failed"
+            elif result.truncated or result.stalled:
+                draft.outcome = "partial" if not findings else "failed"
+            elif _session_write_completed(result, verify_expected):
+                draft.outcome = "complete"
+            else:
+                draft.outcome = "failed"
+            if findings:
+                memory_logger.warning(
+                    "Session %s has unresolved vault findings: %s",
+                    source.session_key,
+                    "; ".join(f"{f.path} [{f.rule}]" for f in findings),
+                )
+            set_observation_io(
+                span, output={"outcome": draft.outcome, "touched": draft.touched}
+            )
+            memory_logger.info("Session %s draft %s", source.session_key, draft.outcome)
+            return draft
+
+    async def _run_session_attempt(self, root, source, attempt, guidance):
+        with memory_attempt(attempt):
+            try:
+                agent_class = (
+                    self._recovery_agent_class()
+                    if attempt == "recovery"
+                    else self._write_agent_class()
+                )
+                if agent_class is None:
+                    return None
+                return await self._write_agent_instance(agent_class, root).run(
+                    source.render(),
+                    source.event_date or "undated",
+                    date=source.source_date,
+                    guidance=guidance,
+                    record="session",
+                    source_permissions=source.permissions,
+                )
+            except Exception as exc:
+                memory_logger.warning(
+                    "Session %s %s failed (%s)",
+                    source.session_key,
+                    attempt,
+                    _safe_exception_diagnostic(exc),
+                )
+                return None
+
+    async def _session_draft_findings(self, root, before, source, touched):
+        # Defer this dependency to break the import cycle through backend.services.memory ->
+        # backend.services.memory.service_factory -> backend.services.memory.providers.chronicle.
+        from ..agent.memory_agent import (
+            allow_new_categories,
+            forbidden_folders,
+            immutable_sections,
+            required_notes,
+        )
+
+        findings = verify_vault_changes(
+            root,
+            before,
+            required=required_notes("session", ""),
+            forbidden_folders=forbidden_folders("session"),
+            immutable_sections=immutable_sections("session"),
+            forbid_new_categories=not allow_new_categories("session"),
+        )
+        findings.extend(
+            await self._review_write(
+                root,
+                source=source,
+                before=before,
+                touched=touched,
+                record="session",
+            )
+        )
+        return findings
+
     async def add_day_memory(
         self,
         day_digest: str,
@@ -628,6 +801,7 @@ class MemoryService(MemoryServiceBase):
             required_notes,
         )
 
+        record = "day"
         verify_expected = (
             self.config.write_agent_backend in VERIFY_CAPABLE_BACKENDS
             and (self.config.write_recovery_backend or "direct")
@@ -635,10 +809,18 @@ class MemoryService(MemoryServiceBase):
         )
         provenance: dict[str, set[str]] = {}
         self.last_day_source_episode_keys_by_path = {}
+        self.last_day_source_evidence_keys_by_path = {}
+        self.last_day_inference_artifacts = []
 
         def retain_provenance(agent_result) -> None:
             if agent_result is None:
                 return
+            self.last_day_inference_artifacts.extend(agent_result.inference_artifacts)
+            for path, keys in agent_result.source_evidence_keys_by_path.items():
+                self.last_day_source_evidence_keys_by_path[path] = sorted(
+                    set(self.last_day_source_evidence_keys_by_path.get(path, []))
+                    | set(keys)
+                )
             for path, keys in agent_result.source_episode_keys_by_path.items():
                 provenance.setdefault(path, set()).update(keys)
             self.last_day_source_episode_keys_by_path = {
@@ -746,7 +928,7 @@ class MemoryService(MemoryServiceBase):
                         local_date,
                         date=trusted_date,
                         guidance=guidance,
-                        record="day",
+                        record=record,
                     )
                     retain_provenance(result)
                 except Exception as exc:  # noqa: BLE001 - recovery/caller handles it
@@ -772,7 +954,7 @@ class MemoryService(MemoryServiceBase):
         # agent. It may legitimately touch only People/Topic/category notes, or verify
         # the vault and make no edits when the day contains no durable information.
         def _required() -> tuple[str, ...]:
-            return required_notes("day", local_date)
+            return required_notes(record, local_date)
 
         # Enforce ownership after the agent too. If it ignored the prompt and rewrote
         # the index, restore the concise source-backed form without spending another
@@ -784,9 +966,9 @@ class MemoryService(MemoryServiceBase):
             user_root,
             existing_before,
             required=_required(),
-            forbidden_folders=forbidden_folders("day"),
-            immutable_sections=immutable_sections("day"),
-            forbid_new_categories=not allow_new_categories("day"),
+            forbidden_folders=forbidden_folders(record),
+            immutable_sections=immutable_sections(record),
+            forbid_new_categories=not allow_new_categories(record),
         )
         findings.extend(day_range_findings())
         # Structural checks pass on a well-formed duplicate. A second, read-only agent
@@ -798,7 +980,7 @@ class MemoryService(MemoryServiceBase):
                 source=day_digest,
                 before=existing_before,
                 touched=list(result.touched) if result else [],
-                record="day",
+                record=record,
             )
         )
         repair_class = self._write_agent_class()
@@ -817,7 +999,7 @@ class MemoryService(MemoryServiceBase):
                         local_date,
                         date=trusted_date,
                         guidance=_repair_guidance(findings),
-                        record="day",
+                        record=record,
                     )
                 except Exception as exc:  # noqa: BLE001 - a failed repair is not fatal
                     memory_logger.warning(
@@ -836,9 +1018,9 @@ class MemoryService(MemoryServiceBase):
                 user_root,
                 existing_before,
                 required=_required(),
-                forbidden_folders=forbidden_folders("day"),
-                immutable_sections=immutable_sections("day"),
-                forbid_new_categories=not allow_new_categories("day"),
+                forbidden_folders=forbidden_folders(record),
+                immutable_sections=immutable_sections(record),
+                forbid_new_categories=not allow_new_categories(record),
             )
             findings.extend(day_range_findings())
             # Re-review too: the repair edited notes, and only a second read can say
@@ -849,7 +1031,7 @@ class MemoryService(MemoryServiceBase):
                     source=day_digest,
                     before=existing_before,
                     touched=list(result.touched) if result else [],
-                    record="day",
+                    record=record,
                 )
             )
         if findings:
@@ -1533,6 +1715,69 @@ class MemoryService(MemoryServiceBase):
             query, user_id, limit, memory_space_id=memory_space_id
         )
 
+    async def retrieve_for_chat(
+        self,
+        query: str,
+        user_id: str,
+        *,
+        memory_space_id=None,
+        notes_only: bool = False,
+    ):
+        """Return vault evidence without the indexed-memory result adapter."""
+        if not self._initialized:
+            await self.initialize()
+        if memory_space_id:
+            await self.scope_resolver.require_space(
+                MemoryScope(str(user_id), memory_space_id)
+            )
+
+        # Defer this dependency to break the import cycle through backend.services.chat_context ->
+        # backend.services.chat_sources -> backend.services.memory ->
+        # backend.services.memory.service_factory -> backend.services.memory.providers.chronicle.
+        from backend.services.chat_context import VaultNoteEvidence, VaultRetrieval
+
+        # Defer this dependency to break the import cycle through backend.services.memory ->
+        # backend.services.memory.service_factory -> backend.services.memory.providers.chronicle.
+        from ..agent.memory_agent import is_search_failure_answer
+
+        result, _ = await self._run_search_agent(
+            query, user_id, 20, memory_space_id=memory_space_id, notes_only=notes_only
+        )
+        if not result.answer.strip() or is_search_failure_answer(result.answer):
+            raise VaultSearchUnavailable(
+                "The vault retrieval agent did not produce a usable answer"
+            )
+        notes = []
+        for note in result.notes:
+            text = note["content"]
+            path = note["path"]
+            revision = hashlib.sha256(text.encode()).hexdigest()
+            notes.append(
+                VaultNoteEvidence(
+                    id="V"
+                    + hashlib.sha256((path + revision).encode()).hexdigest()[:12],
+                    path=path,
+                    title=Path(path).stem,
+                    text=text[:8000],
+                    revision=revision,
+                    coverage=(
+                        "Consulted excerpt"
+                        if len(text) <= 8000
+                        else "First 8,000 characters of consulted excerpt"
+                    ),
+                )
+            )
+        return VaultRetrieval(
+            answer=result.answer,
+            notes=notes,
+            coverage=(
+                "Retrieval incomplete"
+                if result.truncated or result.errors
+                else "Notes consulted by vault retrieval; not an exhaustive vault inventory"
+            ),
+            run_id=chat_runs.current_run().id if chat_runs.current_run() else None,
+        )
+
     async def _search_vault_grep(
         self,
         query: str,
@@ -1640,6 +1885,7 @@ class MemoryService(MemoryServiceBase):
         limit: int,
         *,
         memory_space_id: Optional[str] = None,
+        notes_only: bool = False,
     ):
         """Run and trace one configured retrieval backend without exposing note text."""
         # Lazy: ..agent imports llm_client, which imports this package's config back.
@@ -1648,6 +1894,10 @@ class MemoryService(MemoryServiceBase):
         backend = (
             getattr(self.config, "search_agent_backend", "direct") or "direct"
         ).lower()
+        if notes_only and backend != "pi":
+            raise VaultSearchUnavailable(
+                "Notes-only voice retrieval requires the configured Pi search backend"
+            )
         with memory_span(
             "memory_search",
             attributes={
@@ -1686,6 +1936,7 @@ class MemoryService(MemoryServiceBase):
                     self._scope_root(user_id, memory_space_id),
                     operation="memory_search",
                     user_id=user_id,
+                    **({"notes_only": True} if notes_only else {}),
                 )
             else:
                 raise ValueError(f"Unsupported memory search backend: {backend}")
@@ -1769,6 +2020,7 @@ class MemoryService(MemoryServiceBase):
         limit: Optional[int] = None,
         *,
         memory_space_id: Optional[str] = None,
+        excluded_paths: frozenset[str] = frozenset(),
     ) -> List[MemoryEntry]:
         """Enumerate a user's vault notes as MemoryEntry objects (newest first).
 
@@ -1778,7 +2030,12 @@ class MemoryService(MemoryServiceBase):
         if not root.exists():
             return []
         paths = sorted(
-            (p for p in root.rglob("*.md") if not is_scaffold_note(p, root)),
+            (
+                p
+                for p in root.rglob("*.md")
+                if not is_scaffold_note(p, root)
+                and p.relative_to(root).as_posix().casefold() not in excluded_paths
+            ),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -1810,7 +2067,13 @@ class MemoryService(MemoryServiceBase):
             await self.scope_resolver.require_space(
                 MemoryScope(str(user_id), memory_space_id)
             )
-        return self._vault_entries(user_id, limit, memory_space_id=memory_space_id)
+
+        excluded = frozenset(
+            p.casefold() for p in await privacy.quarantined_vault_paths(user_id)
+        )
+        return self._vault_entries(
+            user_id, limit, memory_space_id=memory_space_id, excluded_paths=excluded
+        )
 
     async def count_memories(
         self, user_id: str, *, memory_space_id: Optional[str] = None
@@ -1836,6 +2099,12 @@ class MemoryService(MemoryServiceBase):
             return None
 
         # Memory ids are vault-relative note paths (see add_memory).
+        from backend.services.privacy import quarantined_vault_paths
+
+        if memory_id.casefold() in {
+            p.casefold() for p in await quarantined_vault_paths(user_id)
+        }:
+            return None
         root = self._scope_root(user_id, memory_space_id)
         fp = root / memory_id
         if not fp.is_file():
@@ -1858,6 +2127,11 @@ class MemoryService(MemoryServiceBase):
 
         root = self._scope_root(user_id, memory_space_id)
         conv_note = root / "Conversations" / f"{Path(source_id).name}.md"
+
+        if conv_note.relative_to(root).as_posix().casefold() in {
+            p.casefold() for p in await privacy.quarantined_vault_paths(user_id)
+        }:
+            return []
         if not conv_note.is_file():
             return []
         entry = self._vault_entry_from_path(

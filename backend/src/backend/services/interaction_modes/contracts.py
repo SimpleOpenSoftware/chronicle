@@ -113,6 +113,7 @@ class InteractionSession:
     turn_number: int = 0
     ended_at: Optional[float] = None
     end_reason: Optional[str] = None
+    revision: int = 0
 
     @property
     def idle_deadline(self) -> float:
@@ -144,12 +145,21 @@ class InteractionSession:
 
 
 @dataclass
+class DialoguePluginInput:
+    """A typed dialogue input does not invent a captured audio interval."""
+
+    input_id: str
+    text: str
+
+
+@dataclass
 class InteractionContext:
     """Context supplied to a mode plugin for a start, turn, or end callback."""
 
     session: InteractionSession
-    input: Optional[InteractionInput]
+    input: Optional[InteractionInput | DialoguePluginInput]
     services: Any = None
+    dialogue_thread_id: Optional[str] = None
     end_reason: Optional[str] = None
     # A plugin must await this after recording an intent in ``session`` and
     # before starting a non-idempotent external side effect. It is absent only

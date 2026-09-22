@@ -92,7 +92,7 @@ export default function UnknownSpeakerDiscovery() {
         <div>
           <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Discover unknown speakers</h2>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Cluster conversation-local unknown labels by voice across active conversations and imported datasets.
+            Find matching voices among unidentified speakers.
           </p>
         </div>
         <Button onClick={discover} disabled={discovering} icon={discovering ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}>
@@ -100,7 +100,7 @@ export default function UnknownSpeakerDiscovery() {
         </Button>
       </div>
       {error && <Alert tone="danger" className="mt-4">{error}</Alert>}
-      {!cluster && !discovering && <p className="mt-4 text-sm italic text-gray-400">No cross-conversation unknown-speaker clusters awaiting review.</p>}
+      {!cluster && !discovering && <p className="mt-4 text-sm italic text-gray-400">No suggested voice matches to review.</p>}
       {cluster && (
         <div className="mt-5 rounded-lg border border-gray-200 p-4 dark:border-gray-700">
           <p className="font-medium text-gray-900 dark:text-gray-100">

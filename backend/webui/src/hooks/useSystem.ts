@@ -12,13 +12,25 @@ export interface SystemHealthSummary {
   status: 'healthy' | 'degraded' | 'critical'
 }
 
+function parseSystemHealth(data: unknown): SystemHealthSummary {
+  const record = data as Partial<SystemHealthSummary> | null
+  if (!record || typeof record !== 'object'
+    || !['healthy', 'degraded', 'critical'].includes(String(record.status))
+    || typeof record.overall_healthy !== 'boolean'
+    || !record.services || typeof record.services !== 'object' || Array.isArray(record.services)
+    || Object.values(record.services).some(service => !service || typeof service !== 'object' || typeof service.healthy !== 'boolean')) {
+    throw new Error('Invalid system health response')
+  }
+  return record as SystemHealthSummary
+}
+
 /** Lightweight fleet heartbeat for persistent navigation chrome. */
 export function useSystemHealthSummary(isAdmin: boolean) {
   return useQuery<SystemHealthSummary>({
     queryKey: ['system', 'healthSummary'],
     queryFn: async () => {
       const response = await systemApi.getHealth()
-      return response.data
+      return parseSystemHealth(response.data)
     },
     enabled: isAdmin,
     staleTime: 15_000,
@@ -33,11 +45,11 @@ export function useSystemData(isAdmin: boolean) {
     queryKey: ['system', 'data'],
     queryFn: async () => {
       const [health, readiness, metrics, diagnostics, clients] = await Promise.allSettled([
-        systemApi.getHealth(),
+        systemApi.getHealth().then(response => ({ data: parseSystemHealth(response.data) })),
         systemApi.getReadiness(),
         systemApi.getMetrics().catch(() => ({ data: null })),
         systemApi.getConfigDiagnostics().catch(() => ({ data: null })),
-        systemApi.getActiveClients().catch(() => ({ data: [] })),
+        systemApi.getActiveClients(),
       ])
 
       return {
@@ -45,7 +57,7 @@ export function useSystemData(isAdmin: boolean) {
         readinessData: readiness.status === 'fulfilled' ? readiness.value.data : null,
         metricsData: metrics.status === 'fulfilled' ? metrics.value.data : null,
         configDiagnostics: diagnostics.status === 'fulfilled' ? diagnostics.value.data : null,
-        activeClients: clients.status === 'fulfilled' ? clients.value.data || [] : [],
+        activeClientCount: clients.status === 'fulfilled' ? clients.value.data.total_count : null,
       }
     },
     enabled: isAdmin,
@@ -132,6 +144,8 @@ export interface ModelView {
   model_provider: string
   model_name: string
   model_url: string
+  deployment?: string | null
+  deployment_endpoint?: string | null
   api_family: string
   api_key: string // masked ('••••••••') for inline secrets; ${oc.env:...} shown verbatim
   api_key_is_set: boolean

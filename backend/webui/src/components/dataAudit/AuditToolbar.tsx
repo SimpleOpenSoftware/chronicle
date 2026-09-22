@@ -1,4 +1,4 @@
-import { CheckCircle2, GitMerge, Loader2, PackageOpen, Trash2, UserCheck, VolumeX } from 'lucide-react'
+import { CheckCircle2, GitMerge, Loader2, PackageOpen, UserCheck, VolumeX } from 'lucide-react'
 import { Button } from '../ui'
 
 interface Props {
@@ -8,7 +8,6 @@ interface Props {
   // Conversations still lacking cached VAD analysis; null = not loaded yet.
   unanalyzedCount: number | null
   analyzing: boolean
-  archiving: boolean
   // Pending speaker-triage decisions and how many conversations they span.
   triagePendingCount: number
   triageConversationCount: number
@@ -16,7 +15,6 @@ interface Props {
   onApplyTriage: () => void
   onAnalyze: () => void
   onMerge: () => void
-  onArchive: () => void
   onExport: () => void
 }
 
@@ -26,14 +24,12 @@ export default function AuditToolbar({
   mergeEligible,
   unanalyzedCount,
   analyzing,
-  archiving,
   triagePendingCount,
   triageConversationCount,
   applyingTriage,
   onApplyTriage,
   onAnalyze,
   onMerge,
-  onArchive,
   onExport,
 }: Props) {
   const nothingToAnalyze = unanalyzedCount === 0 && !analyzing
@@ -49,7 +45,7 @@ export default function AuditToolbar({
             size="md"
             onClick={onApplyTriage}
             disabled={applyingTriage}
-            title="Apply all speaker-triage decisions: relabel transcripts, enroll voiceprints, reprocess memory"
+            title="Apply speaker corrections and queue memory processing"
             icon={
               applyingTriage ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -114,14 +110,9 @@ export default function AuditToolbar({
         >
           Merge selected
         </Button>
-        <button
-          onClick={onArchive}
-          disabled={selectedCount === 0 || archiving}
-          className="flex items-center space-x-2 px-4 py-2 rounded-lg text-sm font-medium border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          {archiving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-          <span>Archive selected</span>
-        </button>
+        <span className="text-xs text-gray-500 dark:text-gray-400" title="Raw capture audio cannot be archived until a capture-retention policy is configured.">
+          Audio archival unavailable
+        </span>
       </div>
     </div>
   )

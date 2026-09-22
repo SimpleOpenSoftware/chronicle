@@ -9,6 +9,9 @@ from typing import Any
 import numpy as np
 from fastapi import HTTPException
 
+import simple_speaker_recognition.core.gallery_privacy as gallery_privacy
+import simple_speaker_recognition.database as database
+
 log = logging.getLogger("speaker_service")
 
 
@@ -141,6 +144,9 @@ def require_speaker_owner(speaker_id: str, user_id: str) -> str:
             "Tenant %s requested speaker %s owned by %s", user_id, speaker_id, owner
         )
         raise HTTPException(404, f"Speaker not found: {speaker_id}")
+
+    with database.get_db_session() as session:
+        gallery_privacy.require_available(session, speaker_id)
     return owner
 
 

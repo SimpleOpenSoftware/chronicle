@@ -69,6 +69,7 @@ enum InputRoute {
   INPUT_ROUTE_WIRED_MIC = 3;
   INPUT_ROUTE_USB = 4;
   INPUT_ROUTE_REMOTE = 5;
+  INPUT_ROUTE_UNKNOWN = 6;
 }
 
 enum OutputRoute {
@@ -95,6 +96,7 @@ enum PlaybackState {
   PLAYBACK_STATE_DONE = 2;
   PLAYBACK_STATE_CANCELLED = 3;
   PLAYBACK_STATE_FAILED = 4;
+  PLAYBACK_STATE_PROGRESS = 5;
 }
 
 enum ButtonState {
@@ -142,6 +144,7 @@ message CaptureCapabilities {
   uint32 native_sample_rate_hz = 4;
   EffectStatus acoustic_echo_cancellation = 5;
   EffectStatus noise_suppression = 6;
+  bool incremental_playback = 7;
 }
 
 message ClientHello {
@@ -181,6 +184,8 @@ message PlaybackAcknowledgement {
   PlaybackState state = 4;
   uint64 monotonic_timestamp_us = 5;
   ProtocolErrorCode error_code = 6;
+  uint64 rendered_samples = 7;
+  uint64 buffered_samples = 8;
 }
 
 message Heartbeat { uint64 monotonic_timestamp_us = 1; }
@@ -198,6 +203,7 @@ message ClientControl {
     PlaybackAcknowledgement playback_acknowledgement = 14;
     Heartbeat heartbeat = 15;
     ButtonEvent button_event = 16;
+    ConversationCommand conversation_command = 17;
   }
 }
 
@@ -234,6 +240,8 @@ message PlaybackOffer {
   AudioSpec audio_spec = 5;
   google.protobuf.Duration duration = 6;
   bool barge_in_allowed = 7;
+  bool incremental = 8;
+  uint32 pre_skip_samples = 9;
 }
 
 message CancelPlayback {
@@ -262,10 +270,15 @@ message ServerControl {
     ProtocolError error = 16;
     CapturePacketAccepted capture_packet_accepted = 17;
     TranscriptUpdate transcript_update = 18;
+    ConversationState conversation_state = 19;
+    PlaybackFinished playback_finished = 20;
+    VoiceProcessingUpdate voice_processing_update = 21;
   }
 }
 
 message CaptureMediaPacket {
+  // Native device uptime of the first sample; absent for sources without this clock.
+  optional uint64 device_monotonic_timestamp_us = 7;
   CaptureBinding binding = 1;
   uint64 sequence = 2;
   google.protobuf.Timestamp captured_at = 3;
@@ -297,6 +310,9 @@ message DeviceDownlinkEvent {
     PlaybackOffer playback_offer = 1;
     PlaybackMediaPacket playback = 2;
     CancelPlayback cancel_playback = 3;
+    PlaybackFinished playback_finished = 4;
+    ConversationState conversation_state = 5;
+    VoiceProcessingUpdate voice_processing_update = 6;
   }
 }
 
@@ -311,6 +327,7 @@ message CaptureStreamOpened {
 }
 
 message CanonicalPcmFrame {
+  optional uint64 device_monotonic_timestamp_us = 9;
   CaptureBinding binding = 1;
   uint64 sequence = 2;
   google.protobuf.Timestamp captured_at = 3;
@@ -332,4 +349,177 @@ message CaptureStreamEvent {
     CaptureStreamEnded ended = 3;
     ProtocolError failed = 4;
   }
+}
+
+// Durable diagnostic observations. No transcript, response text, or audio payload.
+message InteractionTimingEvent {
+  string event_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+  string audio_session_id = 4;
+  uint64 capture_epoch = 5;
+  string turn_id = 6;
+  uint32 turn_revision = 7;
+  string response_id = 8;
+  uint64 generation = 9;
+  string stage = 10;
+  string clock_domain = 11;
+  double timestamp_ms = 12;
+  double observed_at_ms = 13;
+  optional double duration_ms = 14;
+  string outcome = 15;
+  string detail = 16;
+}
+
+// Engaged conversation is independent from the capture lifecycle.
+enum ConversationAction {
+  CONVERSATION_ACTION_UNSPECIFIED = 0;
+  CONVERSATION_ACTION_START = 1;
+  CONVERSATION_ACTION_END = 2;
+  CONVERSATION_ACTION_CANCEL_TASK = 3;
+  CONVERSATION_ACTION_SNAPSHOT = 4;
+  CONVERSATION_ACTION_PAUSE_TASK = 5;
+  CONVERSATION_ACTION_RESUME_TASK = 6;
+}
+enum SpeechEngine {
+  SPEECH_ENGINE_UNSPECIFIED = 0;
+  SPEECH_ENGINE_MODULAR = 1;
+  SPEECH_ENGINE_REALTIME = 2;
+}
+enum ConversationPhase {
+  CONVERSATION_PHASE_UNSPECIFIED = 0;
+  CONVERSATION_PHASE_LISTENING = 1;
+  CONVERSATION_PHASE_THINKING = 2;
+  CONVERSATION_PHASE_SPEAKING = 3;
+  CONVERSATION_PHASE_ENDED = 4;
+}
+enum VoiceTaskStatus {
+  VOICE_TASK_STATUS_UNSPECIFIED = 0;
+  VOICE_TASK_STATUS_QUEUED = 1;
+  VOICE_TASK_STATUS_RUNNING = 2;
+  VOICE_TASK_STATUS_COMPLETED = 3;
+  VOICE_TASK_STATUS_FAILED = 4;
+  VOICE_TASK_STATUS_CANCEL_REQUESTED = 5;
+  VOICE_TASK_STATUS_CANCELLED = 6;
+  VOICE_TASK_STATUS_UNKNOWN = 7;
+}
+message ConversationCommand {
+  CaptureBinding binding = 1;
+  ConversationAction action = 2;
+  SpeechEngine engine = 3;
+  string task_id = 4;
+  string interaction_id = 5;
+  string thread_id = 6;
+  uint64 task_revision = 7;
+}
+message VoiceTaskSnapshot {
+  string task_id = 1;
+  string tool_name = 2;
+  VoiceTaskStatus status = 3;
+  string detail = 4;
+}
+message ConversationState {
+  CaptureBinding binding = 1;
+  string interaction_id = 2;
+  uint64 revision = 3;
+  ConversationPhase phase = 4;
+  SpeechEngine engine = 5;
+  repeated VoiceTaskSnapshot tasks = 6;
+  string detail = 7;
+  string transcript = 8;
+  string response_text = 9;
+  bool vault_retrieval_enabled = 10;
+  uint64 response_generation = 11;
+  string response_effect_id = 12;
+  string thread_id = 13;
+}
+// Ephemeral observations of actual backend work, independent of playback phase.
+// Sequence increases within one response effect. finished clears work
+// flags only; it does not imply that the browser has rendered all queued audio.
+message VoiceProcessingUpdate {
+  CaptureBinding binding = 1;
+  string interaction_id = 2;
+  uint64 generation = 3;
+  uint64 sequence = 4;
+  ResponseId response_id = 5;
+  bool transcribing = 6;
+  bool generating_text = 7;
+  bool synthesizing_speech = 8;
+  bool generating_response = 9;
+  bool finished = 10;
+  string effect_id = 11;
+  // Revision of the transition admitting this effect, not publication time.
+  uint64 state_revision = 12;
+}
+
+message PlaybackFinished {
+  CaptureBinding binding = 1;
+  ResponseId response_id = 2;
+  uint64 generation = 3;
+  uint64 total_samples = 4;
+}
+
+// Durable outbox entries reference application-owned session/task state.
+enum VoiceEffectKind {
+  VOICE_EFFECT_KIND_UNSPECIFIED = 0;
+  VOICE_EFFECT_KIND_RESPONSE = 1;
+  VOICE_EFFECT_KIND_TASK = 2;
+  VOICE_EFFECT_KIND_PUBLISH_STATE = 3;
+  VOICE_EFFECT_KIND_CANCEL_TASK = 4;
+}
+message VoiceEffect {
+  string effect_id = 1;
+  string interaction_id = 2;
+  VoiceEffectKind kind = 3;
+  uint64 generation = 4;
+  string task_id = 5;
+}
+
+// Immutable dialogue evidence; raw microphone evidence remains capture-owned.
+message VoiceJournalMessage {
+  string role = 1;
+  string content = 2;
+  bool interrupted = 3;
+}
+message VoiceJournalExcerpt {
+  string path = 1;
+  string revision = 2;
+  string text = 3;
+  string coverage = 4;
+}
+message VoiceJournalTask {
+  string task_id = 1;
+  string name = 2;
+  string status = 3;
+  string request = 4;
+  string answer = 5;
+  string remote_run_id = 6;
+  repeated VoiceJournalExcerpt evidence = 7;
+}
+message VoiceJournalTurn {
+  string work_id = 1;
+  TurnId turn_id = 2;
+  uint64 turn_revision = 3;
+  double start_ms = 4;
+  double end_ms = 5;
+  string status = 6;
+}
+message VoiceJournalEntry {
+  string event_id = 1;
+  string interaction_id = 2;
+  uint64 revision = 3;
+  string user_id = 4;
+  string client_id = 5;
+  CaptureBinding binding = 6;
+  string memory_space_id = 7;
+  string phase = 8;
+  string status = 9;
+  repeated VoiceJournalMessage messages = 10;
+  repeated VoiceJournalTask tasks = 11;
+  ResponseId response_id = 12;
+  uint64 rendered_samples = 13;
+  google.protobuf.Timestamp recorded_at = 14;
+  repeated VoiceJournalTurn turns = 15;
+  string thread_id = 16;
+  repeated string utterance_ids = 17;
 }

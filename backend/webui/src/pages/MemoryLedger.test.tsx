@@ -64,3 +64,32 @@ describe('Memory Ledger review workspace', () => {
     await waitFor(() => expect(setTimezone).toHaveBeenCalledWith(Intl.DateTimeFormat().resolvedOptions().timeZone))
   })
 })
+
+describe('Memory Ledger history provenance and failures', () => {
+  function renderHistory() {
+    localStorage.setItem('root_token', 'test-token')
+    vi.spyOn(authApi, 'getMe').mockResolvedValue({ data: { id: 'user-1', email: 'user@example.com', is_superuser: true } } as never)
+    return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <AuthProvider><MemoryRouter initialEntries={['/memory-ledger?view=history']}><MemoryLedger /></MemoryRouter></AuthProvider>
+    </QueryClientProvider>)
+  }
+
+  it('provides all episode sources and the recording independently of diff availability', async () => {
+    vi.spyOn(memoryApi, 'getAudit').mockResolvedValue({ data: { entries: [{
+      id: 'change-1', note_path: 'People/Ada.md', operation: 'update', source_kind: 'extraction', source_label: 'Day episodes',
+      extra: { relevant_episode_keys: ['episode-key-a', 'episode-key-b'] }, conversation_id: 'recording-one', has_diff: false,
+    }] } } as never)
+    renderHistory()
+    fireEvent.click(await screen.findByText('Sources · 1 recording · 2 episodes'))
+    expect(screen.getByRole('link', { name: 'Recording' })).toHaveAttribute('href', '/recordings/recording-one')
+    expect(screen.getByRole('link', { name: 'Episode 1' })).toHaveAttribute('href', '/timeline/key/episode-key-a')
+    expect(screen.getByRole('link', { name: 'Episode 2' })).toHaveAttribute('href', '/timeline/key/episode-key-b')
+  })
+
+  it('does not display an empty ledger after the history request fails', async () => {
+    vi.spyOn(memoryApi, 'getAudit').mockRejectedValue(new Error('History unavailable'))
+    renderHistory()
+    expect(await screen.findByText('History unavailable')).toBeVisible()
+    expect(screen.queryByText('No vault changes were returned.')).not.toBeInTheDocument()
+  })
+})

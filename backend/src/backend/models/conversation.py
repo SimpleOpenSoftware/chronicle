@@ -5,12 +5,22 @@ This module contains Beanie Document and Pydantic models for conversations
 and transcript versions.
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from beanie import Document, Indexed
+from beanie import (
+    Delete,
+    Document,
+    Indexed,
+    Insert,
+    Replace,
+    Save,
+    SaveChanges,
+    after_event,
+)
 from pydantic import BaseModel, Field, computed_field
 from pymongo import IndexModel
 
@@ -602,6 +612,20 @@ class Conversation(Document):
             failure_stage=failure_stage,
         )
         return (self.processing_status, self.failure_stage) != prev
+
+    @after_event(Insert, Replace, Save, SaveChanges, Delete)
+    async def update_search_projection(self):
+
+        # Defer this dependency to break the import cycle through backend.services.source_search
+        # -> backend.models.conversation.
+        from backend.services.source_search import index_recording
+
+        try:
+            await index_recording(self.conversation_id)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Search update deferred to recovery", exc_info=True
+            )
 
     class Settings:
         name = "conversations"

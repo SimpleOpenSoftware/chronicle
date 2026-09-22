@@ -53,23 +53,12 @@ export const isTokenExpired = (token: string | null, skewSeconds = 60): boolean 
   return Date.now() / 1000 >= exp - skewSeconds;
 };
 
-/** Listeners notified whenever a fresh token is obtained (login or refresh). */
 type TokenListener = (token: string) => void;
 const tokenListeners = new Set<TokenListener>();
 
 export const onTokenRefreshed = (listener: TokenListener): (() => void) => {
   tokenListeners.add(listener);
   return () => tokenListeners.delete(listener);
-};
-
-const notifyToken = (token: string) => {
-  tokenListeners.forEach(l => {
-    try {
-      l(token);
-    } catch (e) {
-      console.warn('[Auth] token listener error:', e);
-    }
-  });
 };
 
 // De-dupe concurrent refreshes: many callers may hit a 401 at once.
@@ -106,7 +95,7 @@ export const login = async (
   await saveAuthEmail(email);
   await saveAuthPassword(password);
   await saveJwtToken(token);
-  notifyToken(token);
+  tokenListeners.forEach(listener => listener(token));
   return token;
 };
 

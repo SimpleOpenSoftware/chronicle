@@ -259,7 +259,7 @@ export default function DriftPanel() {
                     <tr key={c.conversation_id} className="border-b border-gray-100 dark:border-gray-800 align-top">
                       <td className="py-1.5 pr-3">
                         <a
-                          href={`/recordings/${c.conversation_id}`}
+                          href={`/data-audit/recordings/${c.conversation_id}`}
                           className="font-medium text-blue-600 dark:text-blue-400 hover:underline"
                         >
                           {c.title}

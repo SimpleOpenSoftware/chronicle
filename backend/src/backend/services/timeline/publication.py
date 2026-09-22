@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
+import backend.services.privacy as privacy
 from backend.models.timeline import (
     DirtyEvidenceRange,
     TimelineDay,
@@ -642,6 +643,8 @@ async def _default_operation_applier(
     if operation.kind == "insert_episode_revision":
         encoded = payload.get("episode", payload)
         successor = TimelineEpisode.model_validate(encoded)
+
+        await privacy.require_record(successor, journal.user_id)
         existing = await TimelineEpisode.find_one(
             TimelineEpisode.user_id == journal.user_id,
             TimelineEpisode.episode_key == successor.episode_key,
@@ -1035,11 +1038,35 @@ async def publish_timeline_revision(
             operations=operations,
             evidence_fence=evidence_fence,
         )
-        return await _roll_forward_publication_locked(
+        completed = await _roll_forward_publication_locked(
             journal,
             apply_operation=apply_operation,
             conflict_notifier=conflict_notifier,
         )
+    try:
+        # Defer this dependency to break the import cycle through
+        # backend.services.timeline.sessions -> backend.services.timeline.consolidation ->
+        # backend.services.timeline.publication.
+        from .sessions import queue_published_sessions
+
+        await queue_published_sessions(completed)
+        # Defer this dependency to break the import cycle through backend.services.source_search
+        # -> backend.services.timeline.consolidation -> backend.services.timeline.publication.
+        from backend.services.source_search import index_day
+
+        for plan in completed.affected_days:
+            day = await TimelineDay.find_one(
+                TimelineDay.user_id == user_id,
+                TimelineDay.local_date == plan.local_date,
+                TimelineDay.timezone == plan.timezone,
+            )
+            if day:
+                await index_day(day)
+    except Exception:
+        logger.warning(
+            "Session preparation enqueue deferred to recovery", exc_info=True
+        )
+    return completed
 
 
 async def run_guarded_publication_action(

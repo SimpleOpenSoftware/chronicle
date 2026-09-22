@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+import backend.services.privacy as privacy
 from backend.llm_client import async_chat_with_tools
 
 from ..telemetry import (
@@ -317,11 +318,19 @@ async def _review_impl(
     max_tool_calls: int = MAX_REVIEW_TOOL_CALLS,
 ) -> ReviewResult:
     tools = VaultTools(vault_root)
+
+    owner = privacy.processing_owner(vault_root.name)
+    policy = await privacy.guard_payload(owner, source)
+    tools.privacy_excluded_paths = await privacy.quarantined_vault_paths(
+        owner, snapshot=policy
+    )
+    excluded = {path.casefold() for path in tools.privacy_excluded_paths}
     real_paths = {
         rel.casefold(): rel
         for rel in (
             path.relative_to(vault_root).as_posix() for path in vault_root.rglob("*.md")
         )
+        if rel.casefold() not in excluded
     }
     task, source_truncated = _review_task(source, added, record)
     schemas = REVIEW_TOOL_SCHEMAS
@@ -331,7 +340,7 @@ async def _review_impl(
         schemas = [
             s
             for s in VAULT_SEARCH_TOOL_SCHEMAS
-            if s["function"]["name"] in {"grep", "glob", "read_note"}
+            if s["function"]["name"] in {"grep", "glob", "read_note", "read_slice"}
         ] + [assessment_tool]
         system = (
             "You are Chronicle's read-only memory freshness reviewer. Compare the entire "
@@ -355,9 +364,11 @@ async def _review_impl(
 
     for round_idx in range(max_rounds):
         result.rounds = round_idx + 1
+        await privacy.assert_current(owner, policy)
         response = await async_chat_with_tools(
             messages, tools=schemas, operation=operation
         )
+        await privacy.assert_current(owner, policy)
         usage = getattr(response, "usage", None)
         if usage is not None:
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -447,6 +458,8 @@ async def _review_impl(
         messages,
         result,
         operation,
+        owner=owner,
+        policy=policy,
         allow_unsupported=not source_truncated,
         real_paths=real_paths,
     )
@@ -457,6 +470,8 @@ async def _forced_verdict(
     result: ReviewResult,
     operation: str,
     *,
+    owner: str,
+    policy,
     allow_unsupported: bool = True,
     real_paths: Mapping[str, str] | None = None,
 ) -> ReviewResult:
@@ -472,6 +487,7 @@ async def _forced_verdict(
     """
 
     result.warnings.append("asked for a verdict with the search tools withdrawn")
+
     ask = list(messages) + [
         {
             "role": "user",
@@ -483,10 +499,13 @@ async def _forced_verdict(
         }
     ]
     try:
+        await privacy.assert_current(owner, policy)
         response = await async_chat_with_tools(
             ask, tools=[_REPORT_FINDINGS_TOOL], operation=operation
         )
+        await privacy.assert_current(owner, policy)
     except Exception as exc:  # noqa: BLE001 - a failed verdict is simply no verdict
+        await privacy.assert_current(owner, policy)
         result.warnings.append(f"forced verdict failed: {type(exc).__name__}")
         return result
 
@@ -535,6 +554,10 @@ async def review_vault_write(
     bad write, not a gate that can fail a good one.
     """
 
+    owner = privacy.processing_owner(vault_root.name)
+    policy = await privacy.guard_payload(
+        owner, {"source": source, "notes": [{"path": path} for path in touched]}
+    )
     added, line_count = render_added(vault_root, before, touched)
     if not added.strip():
         return ReviewResult(reported=True)
@@ -565,11 +588,14 @@ async def review_vault_write(
                 operation=operation,
                 max_rounds=max_rounds,
             )
+        except privacy.PrivacyHeld:
+            raise
         except Exception as exc:  # noqa: BLE001 - a failed review must not fail a write
             logger.warning("memory write review failed: %s", type(exc).__name__)
             result = ReviewResult(
                 warnings=[f"review failed: {type(exc).__name__}"],
             )
+        await privacy.assert_current(owner, policy)
         set_safe_span_attributes(
             span,
             {

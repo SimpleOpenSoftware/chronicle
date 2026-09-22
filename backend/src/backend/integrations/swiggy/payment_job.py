@@ -11,6 +11,7 @@ from typing import Any
 
 from rq import Queue
 
+import backend.services.dialogue.payment as payment
 from backend.integrations.swiggy import FileTokenStore, Server, SwiggyClient
 from backend.models.job import async_job
 from backend.redis_factory import create_sync_redis
@@ -34,6 +35,7 @@ def enqueue_instamart_payment_monitor(
     paas_id: str,
     polling_interval_ms: int,
     max_polling_ms: int,
+    dialogue_thread_id: str | None = None,
 ) -> str:
     """Enqueue one bounded poller and return its deterministic RQ job id."""
     safe_order = re.sub(r"[^A-Za-z0-9_-]", "", order_id)[:80]
@@ -52,6 +54,7 @@ def enqueue_instamart_payment_monitor(
             paas_id=paas_id,
             polling_interval_ms=polling_interval_ms,
             max_polling_ms=max_polling_ms,
+            dialogue_thread_id=dialogue_thread_id,
             job_id=job_id,
             job_timeout=PAYMENT_JOB_TIMEOUT_SECONDS,
             result_ttl=24 * 60 * 60,
@@ -74,10 +77,17 @@ async def monitor_instamart_payment_job(
     paas_id: str,
     polling_interval_ms: int,
     max_polling_ms: int,
+    dialogue_thread_id: str | None = None,
     redis_client=None,
 ) -> dict[str, Any]:
     """Poll gently to a bounded deadline, then finalize exactly once if needed."""
-    interaction_store = InteractionStore(redis_client)
+    if dialogue_thread_id:
+
+        interaction_store = await payment.DialoguePaymentStore.open(
+            dialogue_thread_id, user_id
+        )
+    else:
+        interaction_store = InteractionStore(redis_client)
     # Checkout enqueues this job just before the interaction processor commits the
     # returned awaiting-payment state. A fast RQ worker can start first, so wait for
     # that state barrier before monitoring or trying to end the session.
@@ -96,6 +106,12 @@ async def monitor_instamart_payment_job(
     status = "unknown"
     terminal = False
     try:
+        if session is not None and session.status == "ended":
+            return {
+                "status": session.plugin_state.get("payment_status", "unknown"),
+                "reason": "already_resolved",
+                "order_id": order_id,
+            }
         if not state_committed:
             raise RuntimeError(
                 "payment monitor started before its order state was committed"
@@ -216,13 +232,18 @@ async def monitor_instamart_payment_job(
     }
     event_type = "interaction.ended" if mode_ended else "interaction.payment"
     await publish_sse(redis_client, user_id, event_type, payload)
-    await speak_on_device(
-        redis_client,
-        ClientId.from_value(client_id),
-        SessionId.from_value(audio_session_id),
-        reply,
-        generation=session.response_generation if session is not None else None,
-        turn_id=session.response_turn_id if session is not None else None,
-        turn_revision=(session.response_turn_revision if session is not None else 0),
-    )
+    if dialogue_thread_id:
+        await interaction_store.publish(interaction_id, order_id, reply)
+    else:
+        await speak_on_device(
+            redis_client,
+            ClientId.from_value(client_id),
+            SessionId.from_value(audio_session_id),
+            reply,
+            generation=session.response_generation if session is not None else None,
+            turn_id=session.response_turn_id if session is not None else None,
+            turn_revision=(
+                session.response_turn_revision if session is not None else 0
+            ),
+        )
     return {"status": status, "reason": reason, "order_id": order_id}

@@ -22,6 +22,7 @@ class AudioEpisodeClaim:
     source: InteractionSource
     interval: AudioInterval
     claimed_at: float
+    owner_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class AudioEpisodeArbiter:
         interval: AudioInterval,
         source: InteractionSource,
         now: float | None = None,
+        owner_id: str | None = None,
     ) -> AudioEpisodeClaimResult:
         key = _claims_key(
             user_id,
@@ -75,6 +77,7 @@ class AudioEpisodeArbiter:
             source=source,
             interval=interval,
             claimed_at=claimed_at,
+            owner_id=owner_id,
         )
         while True:
             async with self.redis.pipeline(transaction=True) as pipe:
@@ -90,6 +93,7 @@ class AudioEpisodeArbiter:
                             source=value["source"],
                             interval=AudioInterval(**value["interval"]),
                             claimed_at=float(value["claimed_at"]),
+                            owner_id=value.get("owner_id"),
                         )
                         if (
                             existing.interval.end_ms >= interval.start_ms
@@ -97,7 +101,10 @@ class AudioEpisodeArbiter:
                             >= MIN_DUPLICATE_OVERLAP_RATIO
                         ):
                             await pipe.unwatch()
-                            return AudioEpisodeClaimResult(False, existing)
+                            return AudioEpisodeClaimResult(
+                                owner_id is not None and existing.owner_id == owner_id,
+                                existing,
+                            )
 
                     member = json.dumps(
                         {

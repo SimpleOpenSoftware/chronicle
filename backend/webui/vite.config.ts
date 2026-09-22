@@ -4,6 +4,9 @@ import path from 'node:path'
 
 export default defineConfig({
   plugins: [react()],
+  // Generated contracts live outside the app directory; resolve their runtime
+  // through this app's installed dependency in both local and container builds.
+  resolve: { dedupe: ['@bufbuild/protobuf'] },
   base: process.env.VITE_BASE_PATH || '/',
   server: {
     fs: {

@@ -20,6 +20,7 @@ import yaml
 from dotenv import dotenv_values
 from dotenv import set_key as dotenv_set_key
 
+import backend.services.privacy as privacy
 from backend.config_loader import get_plugins_yml_path
 from backend.models.memory_space import DeferredSpaceEvent
 from backend.plugins import BasePlugin, PluginConnectivityError, PluginRouter
@@ -1015,6 +1016,10 @@ async def dispatch_plugin_event(
     Raises:
         RuntimeError: If require_router=True and no plugin router is available
     """
+
+    privacy_snapshot = await privacy.guard_payload(
+        user_id, {"data": data, "metadata": metadata}
+    )
     plugin_router = await ensure_plugin_router()
 
     if not plugin_router:
@@ -1025,6 +1030,7 @@ async def dispatch_plugin_event(
             )
         return None
 
+    await privacy.assert_current(user_id, privacy_snapshot)
     logger.info(f"🔌 DISPATCH: {event.value} event ({description})")
 
     plugin_results = await plugin_router.dispatch_event(
@@ -1033,6 +1039,7 @@ async def dispatch_plugin_event(
         data=data,
         metadata=metadata or {},
     )
+    await privacy.assert_current(user_id, privacy_snapshot)
 
     result_count = len(plugin_results) if plugin_results else 0
     logger.info(f"🔌 RESULT: {event.value} dispatched to {result_count} plugins")

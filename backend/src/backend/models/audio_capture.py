@@ -242,8 +242,11 @@ class AudioCaptureSession(Document):
             IndexModel(
                 [("user_id", 1), ("content_sha256", 1)],
                 unique=True,
-                partialFilterExpression={"content_sha256": {"$type": "string"}},
-                name="unique_user_pcm_content",
+                partialFilterExpression={
+                    "content_sha256": {"$type": "string"},
+                    "processing_profile": "imported",
+                },
+                name="unique_user_imported_pcm_content",
             ),
         ]
 

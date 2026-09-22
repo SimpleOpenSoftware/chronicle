@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from collections.abc import Callable
 
 import numpy as np
@@ -34,6 +35,16 @@ PENDING_CLAIM_MIN_IDLE_MS = 30_000
 PENDING_RECOVERY_INTERVAL_SECONDS = 5.0
 VAD_FRAME_SAMPLES = 512
 SAMPLE_RATE = 16_000
+MAX_DELIVERY_LAG_MS = float(os.getenv("ACTIVE_TURN_MAX_DELIVERY_LAG_MS", "2000"))
+PERFORMANCE_WINDOW = 1200
+
+
+def _percentile_ms(values: deque[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))
+    return round(ordered[index], 1)
 
 
 class SileroSmartTurnModels:
@@ -129,16 +140,85 @@ class ActiveTurnConsumer:
         self.error_count = 0
         self.last_success_at: float | None = None
         self.last_consumed_id: str | None = None
+        self._stream_progress: dict[str, dict] = {}
+        self._lagging_streams: set[str] = set()
+        self._processing_ms: deque[float] = deque(maxlen=PERFORMANCE_WINDOW)
+
+    def _record_stream_progress(
+        self,
+        stream: str,
+        message_id: str,
+        *,
+        processed_at_ms: float | None = None,
+        processing_ms: float | None = None,
+    ) -> None:
+        if processed_at_ms is None:
+            processed_at_ms = time.time() * 1000
+        try:
+            produced_at_ms = float(message_id.split("-", 1)[0])
+        except (TypeError, ValueError, IndexError):
+            produced_at_ms = processed_at_ms
+        progress = self._stream_progress.setdefault(
+            stream, {"stream": stream, "frames_consumed": 0}
+        )
+        progress.update(
+            {
+                "last_consumed_id": message_id,
+                "last_success_at": processed_at_ms / 1000,
+                "delivery_lag_ms": round(max(0.0, processed_at_ms - produced_at_ms), 1),
+            }
+        )
+        progress["frames_consumed"] += 1
+        if processing_ms is not None:
+            processing_ms = max(0.0, processing_ms)
+            progress["processing_ms"] = round(processing_ms, 1)
+            self._processing_ms.append(processing_ms)
+        delivery_lag_ms = progress["delivery_lag_ms"]
+        if delivery_lag_ms > MAX_DELIVERY_LAG_MS:
+            if stream not in self._lagging_streams:
+                logger.warning(
+                    "Active-turn consumer is behind real time for '%s': %.0fms "
+                    "delivery lag (threshold %.0fms, last id %s)",
+                    stream,
+                    delivery_lag_ms,
+                    MAX_DELIVERY_LAG_MS,
+                    message_id,
+                )
+            self._lagging_streams.add(stream)
+        elif stream in self._lagging_streams:
+            self._lagging_streams.remove(stream)
+            logger.info("Active-turn consumer caught up for '%s'", stream)
 
     def health(self) -> dict:
+        active_streams = {
+            stream for stream, task in self._tasks.items() if not task.done()
+        }
+        streams = [
+            dict(progress)
+            for stream, progress in self._stream_progress.items()
+            if stream in active_streams
+        ]
+        lagging_streams = sum(
+            progress.get("delivery_lag_ms", 0) > MAX_DELIVERY_LAG_MS
+            for progress in streams
+        )
+        lags = [progress.get("delivery_lag_ms", 0.0) for progress in streams]
         return {
+            "healthy": self.running and lagging_streams == 0,
             "running": self.running,
-            "active_streams": sum(not task.done() for task in self._tasks.values()),
+            "active_streams": len(active_streams),
             "frames_consumed": self.frames_consumed,
             "turns_committed": self.turns_committed,
             "error_count": self.error_count,
             "last_success_at": self.last_success_at,
             "last_consumed_id": self.last_consumed_id,
+            "delivery_lag_threshold_ms": MAX_DELIVERY_LAG_MS,
+            "delivery_lag_max_ms": max(lags) if lags else None,
+            "lagging_streams": lagging_streams,
+            "processing_p50_ms": _percentile_ms(self._processing_ms, 0.50),
+            "processing_p95_ms": _percentile_ms(self._processing_ms, 0.95),
+            "processing_max_ms": _percentile_ms(self._processing_ms, 1.0),
+            "streams": streams,
         }
 
     async def start(self) -> None:
@@ -270,9 +350,20 @@ class ActiveTurnConsumer:
                 if data_purpose is None:
                     raise ValueError("audio-v2 frame has no data purpose")
                 if event.frame.binding.voice_session_id.value:
+                    processing_started = time.perf_counter()
                     await self.handle_frame(
                         event.frame,
                         data_purpose=data_purpose,
+                    )
+                    msg_id = (
+                        message_id.decode()
+                        if isinstance(message_id, bytes)
+                        else message_id
+                    )
+                    self._record_stream_progress(
+                        stream,
+                        msg_id,
+                        processing_ms=(time.perf_counter() - processing_started) * 1000,
                     )
         except Exception:
             logger.exception("Active-turn frame failed on %s", stream)
@@ -324,6 +415,12 @@ class ActiveTurnConsumer:
                 duration_ms=duration_ms,
                 pcm=pcm,
                 speech=speech,
+                captured_at_ms=frame_event.captured_at.ToMilliseconds(),
+                device_monotonic_ms=(
+                    frame_event.device_monotonic_timestamp_us / 1000
+                    if frame_event.HasField("device_monotonic_timestamp_us")
+                    else None
+                ),
             )
             events = await segmenter.push(frame, semantic_complete=semantic_complete)
             await self._publish_events(events, data_purpose=data_purpose)
@@ -370,6 +467,19 @@ class ActiveTurnConsumer:
                 "ended_at_ms": str(event.ended_at_ms),
                 "reason": event.reason,
             }
+            metadata.update(
+                {
+                    key: str(value)
+                    for key, value in {
+                        "speech_started_device_ms": event.speech_started_device_ms,
+                        "speech_ended_device_ms": event.speech_ended_device_ms,
+                        "speech_started_at_ms": event.speech_started_at_ms,
+                        "speech_ended_at_ms": event.speech_ended_at_ms,
+                    }.items()
+                    if value is not None
+                }
+            )
+            metadata["committed_at_ms"] = str(time.time() * 1000)
             await self.redis_client.xadd(
                 TURN_EVENTS_STREAM,
                 {"event": json.dumps(metadata, separators=(",", ":"))},

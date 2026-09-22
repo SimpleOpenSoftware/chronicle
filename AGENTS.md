@@ -712,9 +712,10 @@ tailscale ip -4
 - **Python**: Black formatter with 100-character line length, isort for imports
 - **TypeScript**: Standard React Native conventions
 - **Import Guidelines**:
-  - NEVER import modules in the middle of functions or files
-  - ALL imports must be at the top of the file after the docstring
+  - In production code, put imports at the top of the file after the docstring
   - Use lazy imports sparingly and only when absolutely necessary for circular import issues
+  - Tests and fixtures may use function-local imports to keep individual test runs
+    isolated from unrelated dependencies; they are exempt from the import-placement hook
   - Group imports: standard library, third-party, local imports
   - **Enforced** by `scripts/check_import_placement.py`, which runs as a pre-commit
     and pre-push hook and in the `Code Style` CI workflow. An import nested inside a

@@ -1,3 +1,4 @@
+import { sourceDate } from '../utils/sourceTime';
 import ReconciliationProgress from '../components/timeline/ReconciliationProgress';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
@@ -42,6 +43,10 @@ import {
 } from '../components/ui';
 import type { StateTone } from '../components/ui';
 
+function queueDate(value: string | number): Date {
+  return typeof value === 'string' ? sourceDate(value) : new Date(value);
+}
+
 interface QueueStats {
   total_jobs: number;
   queued_jobs: number;
@@ -62,6 +67,8 @@ interface Filters {
 }
 
 interface StreamingSession {
+  privacy_held?: boolean;
+  privacy_reason?: string;
   session_id: string;
   user_id: string;
   client_id: string;
@@ -94,6 +101,8 @@ interface StreamConsumerGroup {
 }
 
 interface StreamHealth {
+  session_id: string;
+  client_id: string;
   stream_length?: number;
   consumer_groups?: StreamConsumerGroup[];
   total_pending?: number;
@@ -130,6 +139,8 @@ interface StreamingStatus {
 }
 
 interface EventRecord {
+  privacy_held?: boolean;
+  description?: string;
   timestamp: number;
   event: string;
   user_id: string;
@@ -170,12 +181,23 @@ const EmptyState = ({ children }: { children: React.ReactNode }) => (
   </div>
 );
 
+/** RQ registry snapshots can contain the same job in more than one group. */
+function uniqueJobs(jobs: any[]): any[] {
+  const byId = new Map<string, any>();
+  for (const job of jobs) {
+    if (!job?.job_id || byId.has(job.job_id)) continue;
+    byId.set(job.job_id, job);
+  }
+  return [...byId.values()];
+}
+
 const Queue: React.FC = () => {
   const queryClient = useQueryClient();
 
   // UI-only state
   const [selectedJob, setSelectedJob] = useState<any | null>(null);
   const [loadingJobDetails, setLoadingJobDetails] = useState(false);
+  const detailRequest = useRef(0);
   const [filters, setFilters] = useState<Filters>({
     status: '',
     job_type: ''
@@ -248,7 +270,7 @@ const Queue: React.FC = () => {
     () => Array.from(expandedConversations).sort(),
     [expandedConversations]
   );
-  const { data: dashboardData, isLoading: loading, isFetching: refreshing } = useQueueDashboard(expandedConversationIds);
+  const { data: dashboardData, isLoading: loading, isFetching: refreshing, error: dashboardError } = useQueueDashboard(expandedConversationIds);
 
   // Derive state from dashboard data
   const { jobs, conversationJobs, stats, streamingStatus, events } = useMemo<{
@@ -258,7 +280,7 @@ const Queue: React.FC = () => {
     streamingStatus: StreamingStatus | null;
     events: EventRecord[];
   }>(() => {
-    if (!dashboardData) {
+    if (!dashboardData || dashboardError) {
       return { jobs: [], conversationJobs: {}, stats: null, streamingStatus: null, events: [] };
     }
 
@@ -269,7 +291,7 @@ const Queue: React.FC = () => {
     const failedJobs = dashboardData.jobs?.failed || [];
     const deferredJobs = dashboardData.jobs?.deferred || [];  // chained jobs waiting on a dependency
     const scheduledJobs = dashboardData.jobs?.scheduled || [];
-    const allFetchedJobs = [...queuedJobs, ...startedJobs, ...finishedJobs, ...failedJobs, ...deferredJobs, ...scheduledJobs];
+    const allFetchedJobs = uniqueJobs([...queuedJobs, ...startedJobs, ...finishedJobs, ...failedJobs, ...deferredJobs, ...scheduledJobs]);
 
     // Group jobs by conversation_id
     const jobsByConversation: {[conversationId: string]: any[]} = {};
@@ -289,9 +311,7 @@ const Queue: React.FC = () => {
     if (dashboardConvJobs) {
       Object.entries(dashboardConvJobs).forEach(([conversationId, cJobs]: [string, any]) => {
         const existingJobs = jobsByConversation[conversationId] || [];
-        const existingJobIds = new Set(existingJobs.map((j: any) => j.job_id));
-        const newJobs = cJobs.filter((j: any) => !existingJobIds.has(j.job_id));
-        jobsByConversation[conversationId] = [...existingJobs, ...newJobs];
+        jobsByConversation[conversationId] = uniqueJobs([...existingJobs, ...cJobs]);
       });
     }
 
@@ -302,7 +322,23 @@ const Queue: React.FC = () => {
       streamingStatus: dashboardData.streaming_status || null,
       events: dashboardData.events || [],
     };
-  }, [dashboardData]);
+  }, [dashboardData, dashboardError]);
+
+  // A failed privacy refresh must not leave previously fetched payloads on screen.
+  useEffect(() => {
+    if (dashboardError) {
+      detailRequest.current += 1;
+      setSelectedJob(null);
+      setSelectedEvent(null);
+      setFlushPreview(null);
+    }
+  }, [dashboardError]);
+  const visibleEvent = !dashboardError && selectedEvent
+    ? events.find(event => event.timestamp === selectedEvent.timestamp && event.event === selectedEvent.event)
+    : undefined;
+  const currentJobSummary = jobs.find(job => job.job_id === selectedJob?.job_id);
+  const visibleJob = dashboardError ? null
+    : currentJobSummary?.privacy_held ? currentJobSummary : selectedJob;
 
   // Job Type filter options come from the jobs actually loaded rather than a
   // hardcoded list, which had drifted to four names that are not job types at all.
@@ -348,12 +384,15 @@ const Queue: React.FC = () => {
 
 
   const viewJobDetails = async (jobId: string) => {
+    const request = ++detailRequest.current;
+    setSelectedJob(null);
     setLoadingJobDetails(true);
     try {
       const response = await queueApi.getJob(jobId);
-      setSelectedJob(response.data);
+      if (request === detailRequest.current) setSelectedJob(response.data);
     } catch (error) {
-      console.error('Error fetching job details:', error);
+      if (request !== detailRequest.current) return;
+      setSelectedJob(null);
       alert('Failed to fetch job details');
     } finally {
       setLoadingJobDetails(false);
@@ -583,7 +622,7 @@ const Queue: React.FC = () => {
   };
 
   const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleString();
+    return queueDate(dateString).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' });
   };
 
   // Short display names for the Jobs table. Keyed on the RQ job function names in
@@ -643,10 +682,10 @@ const Queue: React.FC = () => {
   const formatDuration = (job: any) => {
     if (!job.started_at) return '-';
 
-    const start = new Date(job.started_at).getTime();
+    const start = queueDate(job.started_at).getTime();
     // For failed/finished jobs, use completed_at or ended_at. For running jobs, use current time.
     const end = job.completed_at || job.ended_at
-      ? new Date((job.completed_at || job.ended_at)!).getTime()
+      ? queueDate((job.completed_at || job.ended_at)!).getTime()
       : (job.status === 'started' ? Date.now() : start); // Don't show increasing time for failed jobs
     // RQ's started_at/ended_at can be sub-millisecond out of order for near-instant
     // jobs, yielding a tiny negative; clamp so we never render e.g. "-27ms".
@@ -699,19 +738,11 @@ const Queue: React.FC = () => {
           <div>
             <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">Queue & Events</h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">
-              Live updates via SSE
+              Jobs and audio processing
             </p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="danger"
-            size="md"
-            icon={<Trash2 className="w-4 h-4" />}
-            onClick={() => setShowFlushModal(true)}
-          >
-            Flush Jobs
-          </Button>
           <Button
             variant="primary"
             size="md"
@@ -721,8 +752,16 @@ const Queue: React.FC = () => {
           >
             Refresh
           </Button>
+          <details className="relative">
+            <summary className="cursor-pointer text-sm text-gray-600 dark:text-gray-300">Maintenance</summary>
+            <div className="absolute right-0 z-20 mt-2 flex flex-col gap-2 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800">
+              <Button variant="secondary" onClick={reclaimStreams}>Reclaim finished streams</Button>
+              <Button variant="danger" onClick={() => setShowFlushModal(true)}>Flush jobs…</Button>
+            </div>
+          </details>
         </div>
       </div>
+      {dashboardError && <Alert role="alert" tone="danger">Queue details are hidden until their privacy status can be checked. Refresh to try again.</Alert>}
 
       {/* Stats Cards */}
       {stats && (
@@ -745,28 +784,17 @@ const Queue: React.FC = () => {
       {streamingStatus && (
         <Card raised padded={false} className="overflow-hidden">
           <div className="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
-            <SectionTitle>Audio Streaming &amp; Conversations</SectionTitle>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="secondary"
-                size="md"
-                icon={<RotateCcw className="w-4 h-4" />}
-                title="Reclaim the write-ahead log of finished recordings now. Runs automatically every 15 minutes; nothing is deleted until Redis proves every consumer has drained it."
-                onClick={reclaimStreams}
-              >
-                Reclaim Finished Streams
-              </Button>
-            </div>
+            <SectionTitle>Audio processing</SectionTitle>
           </div>
 
           <div className="p-6 space-y-6">
             {/* Stream Workers Section - Shows audio streams + listen jobs */}
             <div>
-              <GroupTitle className="mb-3">Stream Workers (Client Sessions)</GroupTitle>
+              <GroupTitle className="mb-3">Retained audio streams</GroupTitle>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {streamingStatus?.stream_health && Object.entries(streamingStatus.stream_health).map(([streamKey, health]) => {
-                  // Extract client_id from stream key (format: audio:stream:{client_id})
-                  const clientId = streamKey.replace('audio:stream:', '');
+                  const clientId = health.client_id;
+                  const session = streamingStatus.active_sessions?.find(s => s.session_id === health.session_id);
 
                   // Find all listen jobs for this client with deduplication
                   const allJobsRaw = Object.values(conversationJobs).flat().filter(job => job != null);
@@ -792,30 +820,33 @@ const Queue: React.FC = () => {
                   // Completed ones have already exited and shouldn't be shown here
                   const listenJobs = allListenJobs.length > 0
                     ? [allListenJobs.sort((a, b) =>
-                        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+                        queueDate(b.created_at).getTime() - queueDate(a.created_at).getTime()
                       )[0]]
                     : [];
 
                   return (
                     <div key={streamKey} className="p-4 bg-gray-50 rounded-lg border border-gray-200 dark:bg-gray-900/40 dark:border-gray-700">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{streamKey}</span>
-                        <StateBadge tone="success">Active</StateBadge>
+                      <div className="flex items-start justify-between gap-2 mb-2">
+                        <span className="min-w-0 flex-1 break-words text-sm font-medium text-gray-900 dark:text-gray-100" title={streamKey}>{clientId || 'Unlinked stream'}</span>
+                        <StateBadge className="shrink-0" tone={health.error ? "danger" : "neutral"}>{health.error ? "Unavailable" : health.exists === false ? "Not present" : "Retained"}</StateBadge>
                       </div>
 
+                      {session?.privacy_held && (
+                        <p role="status" className="mb-2 text-xs text-amber-700 dark:text-amber-300">{session.privacy_reason || 'Private or unscreened session details held'}</p>
+                      )}
                       <div className="space-y-2">
                         <div className="flex justify-between text-xs">
                           <span className="text-gray-600 dark:text-gray-400">Stream Length:</span>
-                          <span className="font-medium text-gray-900 dark:text-gray-100">{health.stream_length}</span>
+                          <span className="font-medium text-gray-900 dark:text-gray-100">{health.stream_length ?? "Unknown"}</span>
                         </div>
                         <div className="flex justify-between text-xs">
                           <span className="text-gray-600 dark:text-gray-400">Age:</span>
-                          <span className="font-medium text-gray-900 dark:text-gray-100">{(health.stream_age_seconds || 0).toFixed(0)}s</span>
+                          <span className="font-medium text-gray-900 dark:text-gray-100">{health.stream_age_seconds == null ? "Unknown" : `${health.stream_age_seconds.toFixed(0)}s`}</span>
                         </div>
                         <div className="flex justify-between text-xs">
                           <span className="text-gray-600 dark:text-gray-400">Pending:</span>
-                          <span className={`font-medium ${health.total_pending && health.total_pending > 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-green-600 dark:text-green-400'}`}>
-                            {health.total_pending}
+                          <span className={`font-medium ${health.total_pending == null ? 'text-gray-500 dark:text-gray-400' : health.total_pending > 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-green-600 dark:text-green-400'}`}>
+                            {health.total_pending ?? "Unknown"}
                           </span>
                         </div>
                         {health.consumer_groups && health.consumer_groups.map((group) => (
@@ -838,7 +869,7 @@ const Queue: React.FC = () => {
                             <div className="text-xs text-gray-600 dark:text-gray-400 mb-1">Current Speech Detection:</div>
                             {listenJobs.map((job) => {
                               const runtime = job.started_at
-                                ? Math.floor((Date.now() - new Date(job.started_at).getTime()) / 1000)
+                                ? Math.floor((Date.now() - queueDate(job.started_at).getTime()) / 1000)
                                 : 0;
                               const minutes = Math.floor(runtime / 60);
                               const seconds = runtime % 60;
@@ -875,13 +906,13 @@ const Queue: React.FC = () => {
                                     {job.created_at && (
                                       <div className="flex justify-between">
                                         <span>Created:</span>
-                                        <span className="text-gray-800 dark:text-gray-200">{new Date(job.created_at).toLocaleTimeString()}</span>
+                                        <span className="text-gray-800 dark:text-gray-200">{queueDate(job.created_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
                                       </div>
                                     )}
                                     {job.meta?.speech_detected_at && (
                                       <div className="flex justify-between">
                                         <span>Speech Detected:</span>
-                                        <span className="text-green-700 dark:text-green-400 font-medium">{new Date(job.meta.speech_detected_at).toLocaleString()}</span>
+                                        <span className="text-green-700 dark:text-green-400 font-medium">{queueDate(job.meta.speech_detected_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
                                       </div>
                                     )}
                                     {job.meta?.status && (
@@ -900,7 +931,7 @@ const Queue: React.FC = () => {
                                     return (
                                       <div className="text-xs space-y-1 pl-4 mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
                                         <div className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Speech Detection Events:</div>
-                                        {session.last_event && (
+                                        {!session.privacy_held && session.last_event && (
                                           <div className="flex justify-between">
                                             <span className="text-gray-600 dark:text-gray-400">Last Event:</span>
                                             <span className="text-gray-800 dark:text-gray-200 font-mono text-xs">{session.last_event.split(':')[0]}</span>
@@ -918,7 +949,7 @@ const Queue: React.FC = () => {
                                             }`}>{session.speaker_check_status}</span>
                                           </div>
                                         )}
-                                        {session.identified_speakers && (
+                                        {!session.privacy_held && session.identified_speakers && (
                                           <div className="flex justify-between">
                                             <span className="text-gray-600 dark:text-gray-400">Speakers:</span>
                                             <span className="text-green-700 dark:text-green-400 font-medium">{session.identified_speakers}</span>
@@ -1049,9 +1080,9 @@ const Queue: React.FC = () => {
                                 </div>
                                 <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 truncate">
                                   Conversation: {conversationId.substring(0, 8)}... •
-                                  {createdAt && `Started: ${new Date(createdAt).toLocaleTimeString()} • `}
+                                  {createdAt && `Started: ${queueDate(createdAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })} • `}
                                   Words: {wordCount}
-                                  {lastUpdate && ` • Updated: ${new Date(lastUpdate).toLocaleTimeString()}`}
+                                  {lastUpdate && ` • Updated: ${queueDate(lastUpdate).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}`}
                                 </div>
                                 {transcript && (
                                   <div className="mt-1 text-xs text-gray-700 dark:text-gray-300 italic truncate">
@@ -1117,9 +1148,9 @@ const Queue: React.FC = () => {
                                   const jobsWithTiming = jobs
                                     .filter(j => j && j.started_at)
                                     .map(job => {
-                                      const startTime = new Date(job.started_at!).getTime();
+                                      const startTime = queueDate(job.started_at!).getTime();
                                       const endTime = job.completed_at || job.ended_at
-                                        ? new Date((job.completed_at || job.ended_at)!).getTime()
+                                        ? queueDate((job.completed_at || job.ended_at)!).getTime()
                                         : (job.status === 'started' ? Date.now() : startTime);
 
                                       return {
@@ -1213,7 +1244,7 @@ const Queue: React.FC = () => {
                                                     left: `${startPercent}%`,
                                                     width: `${widthPercent}%`
                                                   }}
-                                                  title={`Started: ${new Date(startTime).toLocaleTimeString()}\nDuration: ${formatDuration(duration)}`}
+                                                  title={`Started: ${queueDate(startTime).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}\nDuration: ${formatDuration(duration)}`}
                                                 >
                                                   <span className="text-xs text-white font-medium px-2 truncate">
                                                     {formatDuration(duration)}
@@ -1239,7 +1270,7 @@ const Queue: React.FC = () => {
                                 <div className="space-y-1">
                                   {jobs
                                     .filter(j => j != null && j.job_id)
-                                    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+                                    .sort((a, b) => queueDate(a.created_at).getTime() - queueDate(b.created_at).getTime())
                                     .map((job, index) => (
                                     <div key={job.job_id} className={`p-2 bg-gray-50 dark:bg-gray-900/40 rounded border ${getJobTypeColor(job.job_type, job.status).borderColor}`} style={{ borderLeftWidth: '12px' }}>
                                       <div
@@ -1268,7 +1299,7 @@ const Queue: React.FC = () => {
                                         <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
                                           <div>
                                             {job.started_at && (
-                                              <span>Started: {new Date(job.started_at).toLocaleTimeString()}</span>
+                                              <span>Started: {queueDate(job.started_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
                                             )}
                                             {job.started_at && (
                                               <span> • Duration: {formatDuration(job)}</span>
@@ -1472,7 +1503,7 @@ const Queue: React.FC = () => {
                     .map(([conversationId, jobs]) => {
                       // Find the open_conversation_job for created_at
                       const openConvJob = jobs.find(j => j.job_type === 'open_conversation_job');
-                      const createdAt = openConvJob?.created_at ? new Date(openConvJob.created_at).getTime() : 0;
+                      const createdAt = openConvJob?.created_at ? queueDate(openConvJob.created_at).getTime() : 0;
                       return { conversationId, jobs, createdAt };
                     })
                     .filter(({ createdAt }) => {
@@ -1571,7 +1602,7 @@ const Queue: React.FC = () => {
                                   Conversation: {conversationId.substring(0, 8)}... •
                                   Words: {wordCount}
                                   {createdAt && (
-                                    <> • Created: {new Date(createdAt).toLocaleString()}</>
+                                    <> • Created: {queueDate(createdAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</>
                                   )}
                                 </div>
                                 {/* Show title/summary for completed, or transcript for in-progress or when no title exists */}
@@ -1638,9 +1669,9 @@ const Queue: React.FC = () => {
                                     const jobsWithTiming = jobs
                                       .filter(j => j && j.started_at)
                                       .map(job => {
-                                        const startTime = new Date(job.started_at!).getTime();
+                                        const startTime = queueDate(job.started_at!).getTime();
                                         const endTime = job.completed_at || job.ended_at
-                                          ? new Date((job.completed_at || job.ended_at)!).getTime()
+                                          ? queueDate((job.completed_at || job.ended_at)!).getTime()
                                           : (job.status === 'started' ? Date.now() : startTime);
 
                                         return {
@@ -1734,7 +1765,7 @@ const Queue: React.FC = () => {
                                                       left: `${startPercent}%`,
                                                       width: `${widthPercent}%`
                                                     }}
-                                                    title={`Started: ${new Date(startTime).toLocaleTimeString()}\nDuration: ${formatDuration(duration)}${job.meta?.batch_progress ? `\n${job.meta.batch_progress.message}` : ''}`}
+                                                    title={`Started: ${queueDate(startTime).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}\nDuration: ${formatDuration(duration)}${job.meta?.batch_progress ? `\n${job.meta.batch_progress.message}` : ''}`}
                                                   >
                                                     <span className="text-xs text-white font-medium px-2 truncate">
                                                       {job.status === 'started' && job.meta?.batch_progress
@@ -1762,7 +1793,7 @@ const Queue: React.FC = () => {
                                   <div className="space-y-1">
                                     {jobs
                                       .filter(j => j != null && j.job_id)
-                                      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+                                      .sort((a, b) => queueDate(a.created_at).getTime() - queueDate(b.created_at).getTime())
                                       .map((job, index) => (
                                       <div key={job.job_id} className={`p-2 bg-gray-50 dark:bg-gray-900/40 rounded border ${getJobTypeColor(job.job_type, job.status).borderColor}`} style={{ borderLeftWidth: '12px' }}>
                                         <div className="flex items-center justify-between">
@@ -1799,7 +1830,7 @@ const Queue: React.FC = () => {
                                           <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 space-y-0.5 pl-4">
                                             <div>
                                               {job.started_at && (
-                                                <span>Started: {new Date(job.started_at).toLocaleTimeString()}</span>
+                                                <span>Started: {queueDate(job.started_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
                                               )}
                                               {job.started_at && (
                                                 <span> • Duration: {formatDuration(job)}</span>
@@ -2047,7 +2078,7 @@ const Queue: React.FC = () => {
                       return (
                         <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                           <td className="px-4 py-2 text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap">
-                            {new Date(evt.timestamp * 1000).toLocaleTimeString()}
+                            {queueDate(evt.timestamp * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}
                           </td>
                           <td className="px-4 py-2">
                             <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${getEventColor(evt.event)}`}>
@@ -2189,10 +2220,10 @@ const Queue: React.FC = () => {
                   if (filters.job_type && job.job_type !== filters.job_type) return false;
                   return true;
                 })
-                .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).map((job) => (
+                .sort((a, b) => queueDate(b.created_at).getTime() - queueDate(a.created_at).getTime()).map((job) => (
                 <tr key={job.job_id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                   <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                    {new Date(job.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    {queueDate(job.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td className="px-4 py-3 max-w-xs">
                     <div className="text-xs font-mono text-gray-600 dark:text-gray-400 truncate" title={job.meta?.conversation_id || 'N/A'}>
@@ -2273,7 +2304,7 @@ const Queue: React.FC = () => {
       {/* Old Jobs Table and Pagination - Removed in favor of session-based view above */}
 
       {/* Job Details Modal */}
-      {selectedJob && (
+      {visibleJob && (
         <Modal
           open
           onClose={() => setSelectedJob(null)}
@@ -2292,124 +2323,124 @@ const Queue: React.FC = () => {
               </div>
             ) : (
               <div className="space-y-4">
-                {selectedJob.meta?.progress && <ReconciliationProgress progress={selectedJob.meta.progress} status={selectedJob.status} />}
+                {visibleJob.meta?.progress && <ReconciliationProgress progress={visibleJob.meta.progress} status={visibleJob.status} />}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <Label>Job ID</Label>
-                    <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{selectedJob.job_id}</p>
+                    <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{visibleJob.job_id}</p>
                   </div>
                   <div>
                     <Label>Status</Label>
-                    <StateBadge tone={getStatusTone(selectedJob.status)}>
-                      {getStatusIcon(selectedJob.status)}
-                      <span className="ml-1">{selectedJob.status.charAt(0).toUpperCase() + selectedJob.status.slice(1)}</span>
+                    <StateBadge tone={getStatusTone(visibleJob.status)}>
+                      {getStatusIcon(visibleJob.status)}
+                      <span className="ml-1">{visibleJob.status.charAt(0).toUpperCase() + visibleJob.status.slice(1)}</span>
                     </StateBadge>
                   </div>
-                  {selectedJob.description && (
+                  {visibleJob.description && (
                     <div className="col-span-2">
                       <Label>Description</Label>
-                      <p className="text-sm text-gray-900 dark:text-gray-100">{selectedJob.description}</p>
+                      <p className="text-sm text-gray-900 dark:text-gray-100">{visibleJob.description}</p>
                     </div>
                   )}
-                  {selectedJob.func_name && (
+                  {visibleJob.func_name && (
                     <div className="col-span-2">
                       <Label>Function Name</Label>
-                      <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{selectedJob.func_name}</p>
+                      <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{visibleJob.func_name}</p>
                     </div>
                   )}
                   <div>
                     <Label>Created</Label>
-                    <p className="text-sm text-gray-900 dark:text-gray-100">{selectedJob.created_at ? formatDate(selectedJob.created_at) : '-'}</p>
+                    <p className="text-sm text-gray-900 dark:text-gray-100">{visibleJob.created_at ? formatDate(visibleJob.created_at) : '-'}</p>
                   </div>
                   <div>
                     <Label>Started</Label>
-                    <p className="text-sm text-gray-900 dark:text-gray-100">{selectedJob.started_at ? formatDate(selectedJob.started_at) : '-'}</p>
+                    <p className="text-sm text-gray-900 dark:text-gray-100">{visibleJob.started_at ? formatDate(visibleJob.started_at) : '-'}</p>
                   </div>
                   <div>
                     <Label>Ended</Label>
-                    <p className="text-sm text-gray-900 dark:text-gray-100">{selectedJob.ended_at ? formatDate(selectedJob.ended_at) : '-'}</p>
+                    <p className="text-sm text-gray-900 dark:text-gray-100">{visibleJob.ended_at ? formatDate(visibleJob.ended_at) : '-'}</p>
                   </div>
                 </div>
 
-                {selectedJob.args && selectedJob.args.length > 0 && (
+                {visibleJob.args && visibleJob.args.length > 0 && (
                   <div>
                     <Label>Arguments</Label>
                     <pre className="text-xs text-gray-900 dark:text-gray-100 bg-gray-50 dark:bg-gray-900 p-2 rounded overflow-auto max-h-64 whitespace-pre-wrap break-words">
-                      {JSON.stringify(selectedJob.args, null, 2)}
+                      {JSON.stringify(visibleJob.args, null, 2)}
                     </pre>
                   </div>
                 )}
 
-                {selectedJob.kwargs && Object.keys(selectedJob.kwargs).length > 0 && (
+                {visibleJob.kwargs && Object.keys(visibleJob.kwargs).length > 0 && (
                   <div>
                     <Label>Keyword Arguments</Label>
                     <pre className="text-xs text-gray-900 dark:text-gray-100 bg-gray-50 dark:bg-gray-900 p-2 rounded overflow-auto max-h-64 whitespace-pre-wrap break-words">
-                      {JSON.stringify(selectedJob.kwargs, null, 2)}
+                      {JSON.stringify(visibleJob.kwargs, null, 2)}
                     </pre>
                   </div>
                 )}
 
-                {selectedJob.error_message && (
+                {visibleJob.error_message && (
                   <div>
                     <Label>Error</Label>
                     <pre className="text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-2 rounded overflow-auto max-h-64 whitespace-pre-wrap break-words">
-                      {selectedJob.error_message}
+                      {visibleJob.error_message}
                     </pre>
                   </div>
                 )}
 
-                {selectedJob.result && (
+                {visibleJob.result && (
                   <div>
                     <Label>Result</Label>
                     <pre className="text-xs text-gray-900 dark:text-gray-100 bg-green-50 dark:bg-green-900/20 p-2 rounded overflow-auto max-h-64 whitespace-pre-wrap break-words">
-                      {JSON.stringify(selectedJob.result, null, 2)}
+                      {JSON.stringify(visibleJob.result, null, 2)}
                     </pre>
                   </div>
                 )}
 
                 {/* Formatted Job Metadata - Job-specific displays */}
-                {selectedJob.meta && Object.keys(selectedJob.meta).length > 0 && (
+                {visibleJob.meta && Object.keys(visibleJob.meta).length > 0 && (
                   <div>
                     <Label className="mb-2">Job Metadata</Label>
 
                     {/* open_conversation_job formatted metadata */}
-                    {selectedJob.func_name?.includes('open_conversation_job') && (
+                    {visibleJob.func_name?.includes('open_conversation_job') && (
                       <div className="bg-blue-50 dark:bg-blue-900/20 p-3 rounded mb-3 space-y-2">
-                        {selectedJob.meta.word_count !== undefined && (
+                        {visibleJob.meta.word_count !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Word Count:</span> {selectedJob.meta.word_count}
+                            <span className="font-medium">Word Count:</span> {visibleJob.meta.word_count}
                           </div>
                         )}
-                        {selectedJob.meta.speakers && selectedJob.meta.speakers.length > 0 && (
+                        {visibleJob.meta.speakers && visibleJob.meta.speakers.length > 0 && (
                           <div className="text-sm">
-                            <span className="font-medium">Speakers:</span> {selectedJob.meta.speakers.join(', ')}
+                            <span className="font-medium">Speakers:</span> {visibleJob.meta.speakers.join(', ')}
                           </div>
                         )}
-                        {selectedJob.meta.transcript_length !== undefined && (
+                        {visibleJob.meta.transcript_length !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Transcript Length:</span> {selectedJob.meta.transcript_length} chars
+                            <span className="font-medium">Transcript Length:</span> {visibleJob.meta.transcript_length} chars
                           </div>
                         )}
-                        {selectedJob.meta.duration_seconds !== undefined && (
+                        {visibleJob.meta.duration_seconds !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Duration:</span> {selectedJob.meta.duration_seconds.toFixed(1)}s
+                            <span className="font-medium">Duration:</span> {visibleJob.meta.duration_seconds.toFixed(1)}s
                           </div>
                         )}
-                        {selectedJob.meta.inactivity_seconds !== undefined && (
+                        {visibleJob.meta.inactivity_seconds !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Idle Time:</span> {Math.floor(selectedJob.meta.inactivity_seconds)}s
+                            <span className="font-medium">Idle Time:</span> {Math.floor(visibleJob.meta.inactivity_seconds)}s
                           </div>
                         )}
-                        {selectedJob.meta.chunks_processed !== undefined && (
+                        {visibleJob.meta.chunks_processed !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Chunks Processed:</span> {selectedJob.meta.chunks_processed}
+                            <span className="font-medium">Chunks Processed:</span> {visibleJob.meta.chunks_processed}
                           </div>
                         )}
-                        {selectedJob.meta.transcript && (
+                        {visibleJob.meta.transcript && (
                           <div className="mt-2">
                             <div className="text-sm font-medium mb-1">Transcript:</div>
                             <div className="text-sm italic text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 p-2 rounded border border-gray-200 dark:border-gray-700 max-h-32 overflow-y-auto">
-                              "{selectedJob.meta.transcript}"
+                              "{visibleJob.meta.transcript}"
                             </div>
                           </div>
                         )}
@@ -2417,20 +2448,20 @@ const Queue: React.FC = () => {
                     )}
 
                     {/* process_memory_job formatted metadata */}
-                    {selectedJob.func_name?.includes('process_memory_job') && selectedJob.meta.memory_details && selectedJob.meta.memory_details.length > 0 && (
+                    {visibleJob.func_name?.includes('process_memory_job') && visibleJob.meta.memory_details && visibleJob.meta.memory_details.length > 0 && (
                       <div className="bg-pink-50 dark:bg-pink-900/20 p-3 rounded mb-3 space-y-2">
                         <div className="text-sm">
-                          <span className="font-medium">Memories Created:</span> {selectedJob.meta.memories_created || selectedJob.meta.memory_details.length}
+                          <span className="font-medium">Memories Created:</span> {visibleJob.meta.memories_created || visibleJob.meta.memory_details.length}
                         </div>
-                        {selectedJob.meta.processing_time !== undefined && (
+                        {visibleJob.meta.processing_time !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Processing Time:</span> {selectedJob.meta.processing_time.toFixed(1)}s
+                            <span className="font-medium">Processing Time:</span> {visibleJob.meta.processing_time.toFixed(1)}s
                           </div>
                         )}
                         <div className="mt-2">
                           <div className="text-sm font-medium mb-1">Memory Details:</div>
                           <div className="space-y-1">
-                            {selectedJob.meta.memory_details.map((mem: any, idx: number) => (
+                            {visibleJob.meta.memory_details.map((mem: any, idx: number) => (
                               <div key={idx} className="text-xs bg-pink-100 dark:bg-pink-900/30 text-gray-800 dark:text-gray-200 p-2 rounded border border-pink-200 dark:border-pink-800">
                                 {mem.text}
                               </div>
@@ -2441,52 +2472,52 @@ const Queue: React.FC = () => {
                     )}
 
                     {/* stream_speech_detection_job formatted metadata */}
-                    {selectedJob.func_name?.includes('stream_speech_detection_job') && (
+                    {visibleJob.func_name?.includes('stream_speech_detection_job') && (
                       <div className="bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded mb-3 space-y-2">
-                        {selectedJob.meta.speech_detected_at && (
+                        {visibleJob.meta.speech_detected_at && (
                           <div className="text-sm">
-                            <span className="font-medium">Speech Detected At:</span> {new Date(selectedJob.meta.speech_detected_at).toLocaleString()}
+                            <span className="font-medium">Speech Detected At:</span> {queueDate(visibleJob.meta.speech_detected_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}
                           </div>
                         )}
-                        {selectedJob.meta.detected_speakers && selectedJob.meta.detected_speakers.length > 0 && (
+                        {visibleJob.meta.detected_speakers && visibleJob.meta.detected_speakers.length > 0 && (
                           <div className="text-sm">
-                            <span className="font-medium">Detected Speakers:</span> {selectedJob.meta.detected_speakers.join(', ')}
+                            <span className="font-medium">Detected Speakers:</span> {visibleJob.meta.detected_speakers.join(', ')}
                           </div>
                         )}
-                        {selectedJob.meta.conversation_job_id && (
+                        {visibleJob.meta.conversation_job_id && (
                           <div className="text-sm">
-                            <span className="font-medium">Conversation Job:</span> {selectedJob.meta.conversation_job_id}
+                            <span className="font-medium">Conversation Job:</span> {visibleJob.meta.conversation_job_id}
                           </div>
                         )}
                       </div>
                     )}
 
                     {/* transcribe_full_audio_job formatted metadata */}
-                    {selectedJob.func_name?.includes('transcribe_full_audio_job') && (selectedJob.meta.title || selectedJob.meta.summary) && (
+                    {visibleJob.func_name?.includes('transcribe_full_audio_job') && (visibleJob.meta.title || visibleJob.meta.summary) && (
                       <div className="bg-purple-50 dark:bg-purple-900/20 p-3 rounded mb-3 space-y-2">
-                        {selectedJob.meta.title && (
+                        {visibleJob.meta.title && (
                           <div className="text-sm">
-                            <span className="font-medium">Title:</span> {selectedJob.meta.title}
+                            <span className="font-medium">Title:</span> {visibleJob.meta.title}
                           </div>
                         )}
-                        {selectedJob.meta.summary && (
+                        {visibleJob.meta.summary && (
                           <div className="text-sm">
-                            <span className="font-medium">Summary:</span> {selectedJob.meta.summary}
+                            <span className="font-medium">Summary:</span> {visibleJob.meta.summary}
                           </div>
                         )}
-                        {selectedJob.meta.transcript_length !== undefined && (
+                        {visibleJob.meta.transcript_length !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Transcript Length:</span> {selectedJob.meta.transcript_length} chars
+                            <span className="font-medium">Transcript Length:</span> {visibleJob.meta.transcript_length} chars
                           </div>
                         )}
-                        {selectedJob.meta.word_count !== undefined && (
+                        {visibleJob.meta.word_count !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Word Count:</span> {selectedJob.meta.word_count}
+                            <span className="font-medium">Word Count:</span> {visibleJob.meta.word_count}
                           </div>
                         )}
-                        {selectedJob.meta.processing_time !== undefined && (
+                        {visibleJob.meta.processing_time !== undefined && (
                           <div className="text-sm">
-                            <span className="font-medium">Processing Time:</span> {selectedJob.meta.processing_time.toFixed(1)}s
+                            <span className="font-medium">Processing Time:</span> {visibleJob.meta.processing_time.toFixed(1)}s
                           </div>
                         )}
                       </div>
@@ -2498,7 +2529,7 @@ const Queue: React.FC = () => {
                         Raw Metadata JSON
                       </summary>
                       <pre className="text-xs text-gray-900 dark:text-gray-100 bg-blue-50 dark:bg-blue-900/20 p-2 rounded overflow-auto max-h-64 mt-2 whitespace-pre-wrap break-words">
-                        {JSON.stringify(selectedJob.meta, null, 2)}
+                        {JSON.stringify(visibleJob.meta, null, 2)}
                       </pre>
                     </details>
                   </div>
@@ -2509,7 +2540,7 @@ const Queue: React.FC = () => {
       )}
 
       {/* Event Detail Modal */}
-      {selectedEvent && (
+      {visibleEvent && (
         <Modal
           open
           onClose={() => setSelectedEvent(null)}
@@ -2523,25 +2554,26 @@ const Queue: React.FC = () => {
           }
         >
             <div className="space-y-4">
+              {visibleEvent.privacy_held && <p role="status">Private or unscreened event details held</p>}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <Label>Time</Label>
-                  <p className="text-sm text-gray-900 dark:text-gray-100">{new Date(selectedEvent.timestamp * 1000).toLocaleString()}</p>
+                  <p className="text-sm text-gray-900 dark:text-gray-100">{queueDate(visibleEvent.timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</p>
                 </div>
                 <div>
                   <Label>Event</Label>
-                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${getEventColor(selectedEvent.event)}`}>
-                    {selectedEvent.event}
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${getEventColor(visibleEvent.event)}`}>
+                    {visibleEvent.event}
                   </span>
                 </div>
                 <div>
                   <Label>User</Label>
-                  <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{selectedEvent.user_id}</p>
+                  <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{visibleEvent.user_id}</p>
                 </div>
-                {selectedEvent.metadata?.client_id && (
+                {visibleEvent.metadata?.client_id && (
                   <div>
                     <Label>Client</Label>
-                    <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{selectedEvent.metadata.client_id}</p>
+                    <p className="text-sm text-gray-900 dark:text-gray-100 font-mono">{visibleEvent.metadata.client_id}</p>
                   </div>
                 )}
               </div>
@@ -2549,7 +2581,7 @@ const Queue: React.FC = () => {
               <div>
                 <Label className="mb-2">Plugin Results</Label>
                 <div className="space-y-2">
-                  {(selectedEvent.plugins_executed || []).map((p, i) => {
+                  {(visibleEvent.plugins_executed || []).map((p, i) => {
                     const skipped = !!p.data?.skipped;
                     const tone: { card: string; badge: StateTone; text: string; label: string } = skipped
                       ? { card: 'bg-gray-50 border-gray-200 dark:bg-gray-900/40 dark:border-gray-700', badge: 'neutral', text: 'text-gray-700 dark:text-gray-300', label: 'Skipped' }
@@ -2587,13 +2619,13 @@ const Queue: React.FC = () => {
                 </div>
               </div>
 
-              {selectedEvent.metadata && Object.keys(selectedEvent.metadata).length > 0 && (
+              {visibleEvent.metadata && Object.keys(visibleEvent.metadata).length > 0 && (
                 <details>
                   <summary className="text-sm font-medium text-gray-700 dark:text-gray-300 cursor-pointer hover:text-gray-900 dark:hover:text-gray-100">
                     Raw Metadata
                   </summary>
                   <pre className="text-xs text-gray-900 dark:text-gray-100 bg-gray-50 dark:bg-gray-900 p-2 rounded overflow-auto max-h-40 mt-2 whitespace-pre-wrap break-words">
-                    {JSON.stringify(selectedEvent.metadata, null, 2)}
+                    {JSON.stringify(visibleEvent.metadata, null, 2)}
                   </pre>
                 </details>
               )}

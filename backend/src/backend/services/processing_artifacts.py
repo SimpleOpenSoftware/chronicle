@@ -16,6 +16,7 @@ from typing import Any, Sequence
 
 from pymongo.errors import DuplicateKeyError
 
+import backend.services.privacy as privacy
 from backend.models.audio_capture import (
     AbsoluteWord,
     AudioRangeRef,
@@ -196,6 +197,12 @@ async def persist_transcript_artifact(
     raw_response: dict[str, Any] | None = None,
 ) -> TranscriptArtifact:
     """Persist one immutable ASR result, idempotently by processing retry key."""
+
+    visibility = privacy.ConversationPrivacyFilter()
+    if raw_response and "privacy_reference_receipt" in raw_response:
+        await visibility.require_reference_receipt(
+            user_id, raw_response["privacy_reference_receipt"]
+        )
     if not audio_ranges:
         raise ValueError("transcript artifact requires an audio claim")
     payload = {
@@ -205,6 +212,8 @@ async def persist_transcript_artifact(
         "words": words,
         "segments": segments,
     }
+    if raw_response and "privacy_reference_receipt" in raw_response:
+        payload["privacy_reference_receipt"] = raw_response["privacy_reference_receipt"]
     digest = _content_digest(payload)
     existing = await TranscriptArtifact.find_one(
         TranscriptArtifact.retry_key == retry_key
@@ -214,6 +223,7 @@ async def persist_transcript_artifact(
             raise ProcessingArtifactConflict(
                 f"transcript retry key {retry_key!r} has different output"
             )
+        await visibility.assert_current()
         return existing
 
     response = dict(raw_response or {})
@@ -236,7 +246,8 @@ async def persist_transcript_artifact(
         raw_response=response,
     )
     try:
-        await artifact.insert()
+        async with visibility.publication():
+            await artifact.insert()
         return artifact
     except DuplicateKeyError:
         winner = await TranscriptArtifact.find_one(
@@ -246,6 +257,7 @@ async def persist_transcript_artifact(
             raise ProcessingArtifactConflict(
                 f"transcript retry key {retry_key!r} raced with different output"
             )
+        await visibility.assert_current()
         return winner
 
 
@@ -431,6 +443,10 @@ async def persist_timing_normalized_revision(
             "normalization_sha256": normalization_digest,
         },
     }
+    if "privacy_reference_receipt" in source_version.metadata:
+        metadata["privacy_reference_receipt"] = source_version.metadata[
+            "privacy_reference_receipt"
+        ]
     if transcript_artifact_ids:
         metadata["transcript_artifact_ids"] = transcript_artifact_ids
 
@@ -549,6 +565,10 @@ async def persist_word_timed_revision(
         },
     }
     provider_capabilities = (source_version.metadata or {}).get("provider_capabilities")
+    if "privacy_reference_receipt" in source_version.metadata:
+        metadata["privacy_reference_receipt"] = source_version.metadata[
+            "privacy_reference_receipt"
+        ]
     if provider_capabilities:
         metadata["provider_capabilities"] = provider_capabilities
     if transcript_artifact_ids:

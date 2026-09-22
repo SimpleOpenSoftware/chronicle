@@ -1,12 +1,13 @@
 import { useNavigate, useLocation } from 'react-router-dom'
-import { Radio, Square, Zap, Archive } from 'lucide-react'
+import { Radio, Square } from 'lucide-react'
 import { useRecording } from '../../contexts/RecordingContext'
 import { useWakeFeedback } from '../../hooks/useWakeFeedback'
 
 export default function GlobalRecordingIndicator() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { isRecording, recordingDuration, mode, stopRecording, formatDuration } = useRecording()
+  const { isRecording, currentStep, recordingDuration, stopRecording, formatDuration } = useRecording()
+  const stopping = currentStep === 'stopping'
   const { phase } = useWakeFeedback()
 
   // Don't show if not recording
@@ -57,8 +58,8 @@ export default function GlobalRecordingIndicator() {
   return (
     <div className={`flex items-center gap-3 px-3 py-1.5 border rounded-lg transition-colors duration-300 ${c.wrap}`}>
       {/* Pulsing dot — amber while listening, red otherwise */}
-      <div className="relative flex items-center" title={listening ? 'Wake word detected — listening…' : followup ? 'Listening for follow-up… (no wake word needed)' : 'Recording'}>
-        <span className={`absolute inline-flex h-3 w-3 rounded-full opacity-75 animate-ping ${c.ping}`} />
+      <div className="relative flex items-center" title={stopping ? 'Microphone off — finishing recording' : listening ? 'Wake word detected — listening…' : followup ? 'Listening for follow-up… (no wake word needed)' : 'Recording'}>
+        {!stopping && <span className={`absolute inline-flex h-3 w-3 rounded-full opacity-75 animate-ping ${c.ping}`} />}
         <span className={`relative inline-flex h-3 w-3 rounded-full ${c.dot}`} />
       </div>
 
@@ -68,7 +69,7 @@ export default function GlobalRecordingIndicator() {
           {formatDuration(recordingDuration)}
         </span>
         <span className={`flex items-center gap-1 ${c.mode}`}>
-          {listening ? (
+          {stopping ? <span>Finishing recording…</span> : listening ? (
             <>
               <Radio className="h-3 w-3" />
               <span>Listening</span>
@@ -78,15 +79,10 @@ export default function GlobalRecordingIndicator() {
               <Radio className="h-3 w-3" />
               <span>Follow-up</span>
             </>
-          ) : mode === 'streaming' ? (
-            <>
-              <Zap className="h-3 w-3" />
-              <span>Streaming</span>
-            </>
           ) : (
             <>
-              <Archive className="h-3 w-3" />
-              <span>Batch</span>
+              <Radio className="h-3 w-3" />
+              <span>Recording</span>
             </>
           )}
         </span>
@@ -106,8 +102,9 @@ export default function GlobalRecordingIndicator() {
         {/* Stop button */}
         <button
           onClick={stopRecording}
+          disabled={stopping}
           className={`p-1.5 rounded transition-colors text-white ${c.stop}`}
-          title="Stop Recording"
+          title={stopping ? 'Finishing recording' : 'Stop Recording'}
         >
           <Square className="h-4 w-4" />
         </button>

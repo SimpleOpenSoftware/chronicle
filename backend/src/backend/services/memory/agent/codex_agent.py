@@ -37,6 +37,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ...codex_langfuse import upload_codex_trace
 from ...inference_artifacts import canonical_hash, persist_inference_run
+from ..session_write import WriteSourcePermissions
 from ..telemetry import (
     current_memory_attempt,
     memory_span,
@@ -346,8 +347,11 @@ class CodexMemoryAgent:
         vault_summary: str = "",
         guidance: str = "",
         record: str = "conversation",
+        source_permissions: WriteSourcePermissions | None = None,
         images: Optional[List[Tuple[str, bytes]]] = None,
     ) -> MemoryAgentResult:
+        if source_permissions is not None:
+            raise ValueError("Codex writing cannot enforce session source permissions")
         available, detail = codex_executor_available()
         if not available:
             return MemoryAgentResult(

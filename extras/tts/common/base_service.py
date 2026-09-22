@@ -147,6 +147,8 @@ def create_tts_app(service: BaseTTSService) -> FastAPI:
         text: str = Form(...),
         reference_audio: Optional[UploadFile] = File(None),
         reference_text: Optional[str] = Form(None),
+        language: Optional[str] = Form(None),
+        voice: Optional[str] = Form(None),
         temperature: Optional[float] = Form(None),
         top_p: Optional[float] = Form(None),
         repetition_penalty: Optional[float] = Form(None),
@@ -168,6 +170,15 @@ def create_tts_app(service: BaseTTSService) -> FastAPI:
 
         # Collect non-None generation kwargs
         gen_kwargs = {}
+        if language is not None:
+            supported = service.get_supported_languages()
+            if supported is not None and language not in supported:
+                raise HTTPException(
+                    status_code=422, detail="Unsupported speech language"
+                )
+            gen_kwargs["language"] = language
+        if voice is not None:
+            gen_kwargs["voice"] = voice
         if temperature is not None:
             gen_kwargs["temperature"] = temperature
         if top_p is not None:
@@ -220,6 +231,8 @@ def create_tts_app(service: BaseTTSService) -> FastAPI:
 
         except HTTPException:
             raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as e:
             error_time = time.time() - request_start
             logger.exception(f"Error after {error_time:.3f}s: {e}")

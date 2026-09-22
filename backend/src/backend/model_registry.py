@@ -25,6 +25,8 @@ from pydantic import (
     model_validator,
 )
 
+import backend.service_deployment as service_deployment
+
 # Import config merging for defaults.yml + config.yml integration
 # OmegaConf handles environment variable resolution (${VAR:-default} syntax)
 from backend.config import get_config, get_config_yml_path
@@ -39,6 +41,7 @@ LLM_OPERATION_DEFAULT_ROLES: Dict[str, str] = {
     "followup_resolution": "fast_llm",
     "plugin_assistant": "fast_llm",
     "timeline_merge": "fast_llm",
+    "timeline_session_account": "fast_llm",
 }
 
 # Tailnet service-URL discovery cache. A model whose model_url is empty but which
@@ -172,6 +175,9 @@ class ModelDef(BaseModel):
             "transcribed. User overrides are stored under backend.asr.context.<name>."
         ),
     )
+    deployment: Optional[str] = None
+    deployment_endpoint: Optional[str] = None
+
     discovery_service: Optional[str] = Field(
         default=None,
         description=(
@@ -233,6 +239,11 @@ class ModelDef(BaseModel):
         Tailnet later' setup needs no re-config when the node comes online. URLs
         without a scheme get http:// prepended. Returns '' when nothing is available.
         """
+        if self.deployment:
+
+            return service_deployment.gateway_url(
+                self.deployment, self.deployment_endpoint
+            )
         if self.model_url:
             return _with_scheme(self.model_url)
         if self.discovery_service:
@@ -246,6 +257,21 @@ class ModelDef(BaseModel):
     @model_validator(mode="after")
     def validate_model(self) -> ModelDef:
         """Cross-field validation."""
+        if bool(self.deployment) != bool(self.deployment_endpoint):
+            raise ValueError("deployment and deployment_endpoint must be set together")
+        if self.deployment:
+            if (
+                self.model_url
+                or self.discovery_service
+                or self.discovery_default
+                or self.discovery_path
+            ):
+                raise ValueError(
+                    "Managed models cannot also configure model_url or discovery"
+                )
+
+            object.__setattr__(self, "api_key", service_deployment.gateway_token())
+
         # Ensure embedding models have dimensions specified
         if self.model_type == "embedding" and not self.embedding_dimensions:
             # Common defaults

@@ -10,6 +10,9 @@ import time
 
 from redis import exceptions as redis_exceptions
 
+import backend.database as database
+import backend.services.dialogue.worker as worker_module
+import backend.services.interaction_modes.voice.runtime_journal as runtime_journal
 from backend.client_manager import initialize_redis_for_client_manager
 from backend.heartbeat import beat
 from backend.observability.otel_setup import force_flush_otel, init_otel
@@ -26,6 +29,8 @@ from backend.services.interaction_modes.processor import (
     InteractionDispatch,
     InteractionProcessor,
 )
+from backend.services.interaction_modes.voice.runtime import VoiceConversationRuntime
+from backend.services.interaction_modes.voice.tools import VoiceTools
 from backend.services.observability.loop_monitor import start_loop_monitor
 from backend.services.plugin_service import (
     init_plugin_router,
@@ -52,14 +57,21 @@ logger = logging.getLogger(__name__)
 
 
 class InteractionModeWorker:
-    def __init__(self, redis_client, plugin_router):
+    def __init__(
+        self, redis_client, plugin_router, *, voice_runtime=None, journal_projector=None
+    ):
         self.redis = redis_client
         self.plugin_router = plugin_router
         self.processor = InteractionProcessor(redis_client, plugin_router)
+        self.journal_projector = journal_projector
+        self.voice_runtime = voice_runtime or VoiceConversationRuntime(
+            redis_client, tools=VoiceTools.from_config(plugin_router)
+        )
         self.turn_router = CommittedTurnRouter(
             redis_client,
             plugin_router.interaction_registry,
             command_dispatcher=self._dispatch_committed_command,
+            voice_runtime=self.voice_runtime,
         )
         self.running = False
 
@@ -123,6 +135,9 @@ class InteractionModeWorker:
     async def stop(self) -> None:
         self.running = False
         await self.turn_router.stop()
+        await self.voice_runtime.stop()
+        if self.journal_projector is not None:
+            await self.journal_projector.stop()
 
     async def _setup_group(self) -> None:
         try:
@@ -135,6 +150,14 @@ class InteractionModeWorker:
         await self._setup_group()
         self.running = True
         turn_router_task = asyncio.create_task(self.turn_router.run())
+        voice_task = asyncio.create_task(self.voice_runtime.run())
+
+        dialogue_task = asyncio.create_task(worker_module.run_dialogue_worker())
+        journal_task = (
+            asyncio.create_task(self.journal_projector.run())
+            if self.journal_projector is not None
+            else None
+        )
         last_pending_recovery = 0.0
         logger.info("InteractionModeWorker listening on %s", INPUT_STREAM)
         try:
@@ -142,6 +165,15 @@ class InteractionModeWorker:
                 if turn_router_task.done():
                     turn_router_task.result()
                     raise RuntimeError("committed-turn router exited unexpectedly")
+                if voice_task.done():
+                    voice_task.result()
+                    raise RuntimeError("voice conversation runtime exited unexpectedly")
+                if dialogue_task.done():
+                    dialogue_task.result()
+                    raise RuntimeError("shared dialogue worker exited unexpectedly")
+                if journal_task is not None and journal_task.done():
+                    journal_task.result()
+                    raise RuntimeError("voice journal projector exited unexpectedly")
                 await beat(self.redis, "interaction-mode")
                 if (
                     time.monotonic() - last_pending_recovery
@@ -183,12 +215,21 @@ class InteractionModeWorker:
                     for message_id, fields in entries:
                         await self._handle(message_id, fields)
         finally:
+            dialogue_task.cancel()
+            await asyncio.gather(dialogue_task, return_exceptions=True)
             await self.turn_router.stop()
+            await self.voice_runtime.stop()
+            if journal_task is not None:
+                await self.journal_projector.stop()
+                journal_task.cancel()
+                await asyncio.gather(journal_task, return_exceptions=True)
+            voice_task.cancel()
             turn_router_task.cancel()
             try:
                 await turn_router_task
             except asyncio.CancelledError:
                 pass
+            await asyncio.gather(voice_task, return_exceptions=True)
 
     async def _recover_pending(self) -> int:
         """Claim inputs stranded by a dead worker after its safety lock expires."""
@@ -303,7 +344,14 @@ async def main() -> None:
         sys.exit(1)
     await initialize_plugins(plugin_router)
     recovery_task = asyncio.create_task(run_plugin_recovery(plugin_router))
-    worker = InteractionModeWorker(redis_client, plugin_router)
+
+    worker = InteractionModeWorker(
+        redis_client,
+        plugin_router,
+        journal_projector=runtime_journal.VoiceJournalProjector(
+            redis_client, database.get_database()["voice_conversation_journal"]
+        ),
+    )
 
     def signal_handler(signum, frame):
         logger.info("Received signal %s, shutting down", signum)

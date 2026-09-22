@@ -3,12 +3,15 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 from redis import exceptions as redis_exceptions
 
+from backend.audio_contract.v2 import audio_pb2
 from backend.heartbeat import beat
 from backend.services.response_coordinator import WAKE_INTERACTION_EVENTS_STREAM
+from backend.services.voice_latency import VoiceTimingLedger
 from backend.services.wakeword.interaction_ledger import (
     WakeInteractionFact,
     WakeInteractionLedger,
@@ -34,9 +37,15 @@ _ORDINALS = {
 class WakeInteractionEventConsumer:
     """Consume response facts atomically emitted with Redis response transitions."""
 
-    def __init__(self, redis_client, ledger: WakeInteractionLedger):
+    def __init__(
+        self,
+        redis_client,
+        ledger: WakeInteractionLedger,
+        timing_ledger: VoiceTimingLedger | None = None,
+    ):
         self.redis_client = redis_client
         self.ledger = ledger
+        self.timing_ledger = timing_ledger
         self.consumer_name = "wake-interaction-ledger-worker"
         self.running = False
 
@@ -56,7 +65,11 @@ class WakeInteractionEventConsumer:
         await self._setup_group()
         self.running = True
         await self._recover_pending_once()
+        last_recovery = time.monotonic()
         while self.running:
+            if time.monotonic() - last_recovery >= 15:
+                await self._recover_pending_once()
+                last_recovery = time.monotonic()
             await beat(self.redis_client, "wake-interaction-ledger")
             messages = await self.redis_client.xreadgroup(
                 GROUP_NAME,
@@ -110,6 +123,14 @@ class WakeInteractionEventConsumer:
             )
 
     async def _handle(self, fields: dict) -> None:
+        timing = fields.get(b"timing") or fields.get("timing")
+        if timing is not None:
+            if self.timing_ledger is None:
+                raise RuntimeError("voice timing ledger is not initialized")
+            event = audio_pb2.InteractionTimingEvent()
+            event.ParseFromString(timing)
+            await self.timing_ledger.append(event)
+            return
         raw = fields.get(b"event") or fields.get("event")
         if isinstance(raw, bytes):
             raw = raw.decode()

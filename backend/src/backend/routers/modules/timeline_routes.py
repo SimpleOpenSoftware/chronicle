@@ -14,6 +14,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 
+import backend.models.session_memory as session_memory_module
+import backend.services.inference_artifacts as inference_artifacts
+import backend.services.privacy as privacy
+import backend.services.timeline.memory_sources as memory_sources
 from backend.auth import current_active_user
 from backend.models.audio_chunk import AudioChunkDocument
 from backend.models.conversation import Conversation
@@ -37,6 +41,7 @@ from backend.redis_keys import timeline_publication_lock
 from backend.services.audio_claims import resolve_audio_ranges
 from backend.services.job_progress import read_job_progress
 from backend.services.redis_lock import distributed_lock
+from backend.services.timeline import sessions as session_memory
 from backend.services.timeline.activity_policy import (
     episode_is_recording_only,
     episode_requires_activity_review,
@@ -184,7 +189,12 @@ def _episode_payload(episode: TimelineEpisode) -> dict:
     }
 
 
-def _proposal_payload(proposal: MemoryReviewProposal | None, *, full: bool = False):
+def _proposal_payload(
+    proposal: MemoryReviewProposal | None,
+    *,
+    full: bool = False,
+    exchanges: bool = False,
+):
     if proposal is None:
         return None
     payload = {
@@ -209,9 +219,79 @@ def _proposal_payload(proposal: MemoryReviewProposal | None, *, full: bool = Fal
         "resolved_at": _utc(proposal.resolved_at),
     }
     if full:
+        payload["revision_feedback"] = proposal.revision_feedback
+        payload["account"] = proposal.account
         payload["changes"] = [
             change.model_dump(mode="json") for change in proposal.changes
         ]
+    if exchanges:
+        payload["accepted_context"] = proposal.accepted_context
+        payload["source_digest"] = proposal.source_digest
+        payload["source_scope"] = proposal.source_scope
+        payload["inference_runs"] = proposal.inference_runs
+        payload["writer_inference_artifacts"] = proposal.writer_inference_artifacts
+    payload.update(
+        session_key=proposal.session_key,
+        stage=proposal.stage,
+        questions=proposal.questions,
+        completed_sources=proposal.completed_sources,
+        total_sources=proposal.total_sources,
+        investigation_activity=proposal.investigation_activity,
+        failure_kind=proposal.failure_kind,
+    )
+    return payload
+
+
+@router.get("/review/proposals/{proposal_id}/exchanges")
+async def get_memory_model_exchanges(
+    proposal_id: str, user: User = Depends(current_active_user)
+):
+    proposal = await MemoryReviewProposal.find_one(
+        {"proposal_id": proposal_id, "user_id": str(user.id)}
+    )
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Memory proposal not found")
+
+    policy = await privacy.guard_payload(str(user.id), proposal)
+    payload = _proposal_payload(proposal, full=True, exchanges=True)
+
+    payload["inference_runs"] = []
+    refs = list(proposal.inference_runs)
+    assessment = proposal.refresh_assessment or {}
+    if (
+        assessment.get("operation")
+        and assessment.get("artifact_hash")
+        and not any(ref["artifact_hash"] == assessment["artifact_hash"] for ref in refs)
+    ):
+        refs.append({key: assessment[key] for key in ("operation", "artifact_hash")})
+    for ref in refs:
+        artifact = await asyncio.to_thread(
+            inference_artifacts.read_inference_artifact,
+            ref["operation"],
+            ref["artifact_hash"],
+        )
+        payload["inference_runs"].append(
+            {
+                **ref,
+                "request": artifact["request"],
+                "exchanges": artifact.get("metadata", {}).get("exchanges", []),
+                "model_input": artifact.get("metadata", {}).get("model_input"),
+                "tool_calls": artifact.get("metadata", {}).get("tool_calls", []),
+                "context": artifact.get("metadata", {}).get("context"),
+                "output": artifact["stdout"],
+                "result": artifact["result"],
+            }
+        )
+    payload["writer_exchanges"] = [
+        await asyncio.to_thread(
+            inference_artifacts.read_inference_artifact,
+            ref["operation"],
+            ref["artifact_hash"],
+        )
+        for ref in proposal.writer_inference_artifacts
+    ]
+    await privacy.guard_payload(str(user.id), payload, snapshot=policy)
+    await privacy.assert_current(str(user.id), policy)
     return payload
 
 
@@ -321,25 +401,31 @@ async def get_timeline_day(
     timezone: str = Query(),
     user: User = Depends(current_active_user),
 ):
+
     timezone = _validate_timezone(timezone)
     owner = str(user.id)
+    policy = await privacy.load_snapshot(owner)
     day = await TimelineDay.find_one(
         TimelineDay.user_id == owner,
         TimelineDay.local_date == local_date,
         TimelineDay.timezone == timezone,
     )
     episodes: list[TimelineEpisode] = []
+    snapshot_unavailable = False
     if day and day.current_snapshot is not None:
         try:
             episodes = await snapshot_episodes(day)
-        except ConsolidationResolutionError:
+        except (ConsolidationResolutionError, privacy.PrivacyHeld):
             episodes = []
+            snapshot_unavailable = True
     else:
         episodes = await active_day_episodes(owner, local_date, timezone)
     episodes = [
         episode for episode in episodes if not episode_is_recording_only(episode)
     ]
     zone = ZoneInfo(timezone)
+
+    episodes = await privacy.filter_records(episodes, owner)
     day_start = datetime.combine(
         local_date, datetime.min.time(), tzinfo=zone
     ).astimezone(UTC)
@@ -376,7 +462,23 @@ async def get_timeline_day(
         .first_or_none()
     )
     proposal = await _day_proposal(day)
-    semantic_groups = active_semantic_groups(day) if day else []
+    semantic_groups = []
+    if day and not snapshot_unavailable:
+        active_groups = active_semantic_groups(day)
+        if active_groups:
+            # Resolve every exact member, including members on another day.
+            # A saved group summary cannot be separated when a member is absent
+            # or private, even if the displayed day's own episodes are allowed.
+            resolved = await session_memory.resolved_sessions(day, episodes)
+            exact_groups = {
+                (group.group_key, group.revision)
+                for resolved_owner, group, _members in resolved
+                if resolved_owner.local_date == day.local_date
+            }
+            semantic_groups = await privacy.filter_payloads(
+                [g for g in active_groups if (g.group_key, g.revision) in exact_groups],
+                owner,
+            )
     reconciliation = await _reconciliation_payload(owner, local_date, timezone)
     latest_request = (
         await TimelineReconciliationRequest.find(
@@ -393,7 +495,7 @@ async def get_timeline_day(
         request_payload["progress"] = await asyncio.to_thread(
             read_job_progress, latest_request.job_id
         )
-    return {
+    payload = {
         "date": local_date,
         "timezone": timezone,
         "current_snapshot_id": day.current_snapshot_id if day else None,
@@ -403,16 +505,25 @@ async def get_timeline_day(
         "coverage": {
             **(day.coverage if day else {}),
             "recording_intervals": recording_intervals,
+            "privacy_intervals": await privacy.list_intervals(
+                owner, day_start, min(day_end, datetime.now(UTC))
+            ),
         },
-        "analysis": _run_payload(latest),
-        "review": _review_payload(day, proposal),
-        "consolidation": (_consolidation_payload(day, episodes) if day else None),
+        "analysis": _run_payload(latest) if not snapshot_unavailable else None,
+        "review": _review_payload(day, proposal) if not snapshot_unavailable else None,
+        "consolidation": (
+            _consolidation_payload(day, episodes)
+            if day and not snapshot_unavailable
+            else None
+        ),
         "semantic_groups": [
             _semantic_group_payload(group) for group in semantic_groups
         ],
         "review_decision_count": len(day.review_decisions) if day else 0,
-        "reconciliation": reconciliation,
-        "latest_reconciliation": request_payload,
+        "reconciliation": (
+            reconciliation if not snapshot_unavailable else {"ranges": []}
+        ),
+        "latest_reconciliation": request_payload if not snapshot_unavailable else None,
         "review_projection": build_day_review_projection(
             episodes,
             semantic_group_revisions=semantic_groups,
@@ -421,6 +532,11 @@ async def get_timeline_day(
         ),
         "episodes": [_episode_payload(episode) for episode in episodes],
     }
+    if episodes or semantic_groups:
+        await privacy.guard_payload(
+            owner, [*episodes, *semantic_groups], snapshot=policy
+        )
+    return payload
 
 
 class ReconciliationDayRequest(BaseModel):
@@ -486,6 +602,10 @@ class ResolveConsolidationRequest(ReviewDayRequest):
 
 class CreateSemanticGroupRequest(ReviewDayRequest):
     episode_ids: list[str] = Field(min_length=2)
+
+
+class RegenerateMemoryReviewRequest(BaseModel):
+    feedback: str | None = Field(default=None, min_length=1, max_length=4000)
 
 
 class ResolveMemoryReviewRequest(BaseModel):
@@ -654,12 +774,13 @@ async def get_timeline_review_decisions(
         .sort("created_at")
         .to_list()
     )
+
+    proposals = await privacy.filter_payloads(proposals, owner)
+    decisions = await privacy.filter_payloads(day.review_decisions, owner)
     return {
         "date": local_date,
         "timezone": timezone_name,
-        "timeline_decisions": [
-            item.model_dump(mode="json") for item in day.review_decisions
-        ],
+        "timeline_decisions": [item.model_dump(mode="json") for item in decisions],
         "memory_proposals": [
             _proposal_payload(proposal, full=True) for proposal in proposals
         ],
@@ -731,6 +852,193 @@ async def timeline_memory_review_queue(
     return {"items": items}
 
 
+class SessionMemoryRequest(BaseModel):
+    timezone: str
+    session_key: str
+    revision: int = Field(ge=1)
+    excluded_source_keys: list[str] = Field(default_factory=list)
+
+
+class SessionDispositionRequest(SessionMemoryRequest):
+    action: Literal["exclude", "defer", "resume", "include", "attribute", "clarify"]
+    clarification: str | None = Field(default=None, max_length=2000)
+    role: Literal["user_statement", "third_party", "media_content"] | None = None
+    source_keys: list[str] = Field(min_length=1)
+    scope_hash: str
+
+
+@router.get("/sessions/{local_date}")
+async def get_timeline_sessions(
+    local_date: date, timezone: str, user: User = Depends(current_active_user)
+):
+    try:
+        day = await session_memory.get_day(
+            str(user.id), local_date, _validate_timezone(timezone)
+        )
+        episodes = await snapshot_episodes(day)
+
+        preparation = await session_memory_module.SessionPreparation.find_one(
+            {
+                "user_id": str(user.id),
+                "local_date": local_date,
+                "timezone": timezone,
+                "$or": [
+                    {"snapshot_id": day.current_snapshot_id},
+                    {"result_snapshot_id": day.current_snapshot_id},
+                ],
+            },
+            sort=[("updated_at", -1)],
+        )
+        sessions = await session_memory.project_sessions(
+            day, episodes, include_sources=False
+        )
+        if preparation:
+            for session in sessions:
+                reason = preparation.waiting_sessions.get(session["session_key"])
+                if reason and session["state"] == "available":
+                    session.update(state="waiting", waiting_reason=reason)
+        return {
+            "sessions": sessions,
+            "preparation": (
+                {
+                    "state": preparation.state,
+                    "attempts": preparation.attempts,
+                    "job_id": preparation.job_id,
+                    "error": preparation.error,
+                    "waiting_sessions": preparation.waiting_sessions,
+                    "completed_queries": len(preparation.inference_artifacts),
+                }
+                if preparation
+                else None
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{local_date}/prepare", status_code=202)
+async def prepare_timeline_sessions(
+    local_date: date, body: ReviewDayRequest, user: User = Depends(current_active_user)
+):
+    try:
+        day = await session_memory.get_day(
+            str(user.id), local_date, _validate_timezone(body.timezone)
+        )
+        if day.current_snapshot_id != body.snapshot_id:
+            raise ValueError("Timeline changed; refresh before preparing sessions")
+        item = await session_memory.request_preparation(day, priority=100, force=True)
+        return {"state": item.state, "job_id": item.job_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{local_date}/organization-exchanges")
+async def get_session_organization_exchanges(
+    local_date: date, timezone: str, user: User = Depends(current_active_user)
+):
+
+    timezone = _validate_timezone(timezone)
+    item = await session_memory_module.SessionPreparation.find_one(
+        {"user_id": str(user.id), "local_date": local_date, "timezone": timezone},
+        sort=[("updated_at", -1)],
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=404, detail="No session organization run exists for this date"
+        )
+
+    policy = await privacy.load_snapshot(str(user.id))
+    payload = {
+        "runs": [
+            await asyncio.to_thread(
+                inference_artifacts.read_inference_artifact,
+                "session-organization-v1",
+                key,
+            )
+            for key in item.inference_artifacts
+        ]
+    }
+    await privacy.guard_payload(str(user.id), payload, snapshot=policy)
+    await privacy.assert_current(str(user.id), policy)
+    return payload
+
+
+@router.get("/sessions/{local_date}/{session_key}/sources")
+async def get_session_sources(
+    local_date: date,
+    session_key: str,
+    timezone: str,
+    revision: int,
+    user: User = Depends(current_active_user),
+):
+    try:
+        _, _, members = await session_memory.choose_session(
+            str(user.id),
+            local_date,
+            _validate_timezone(timezone),
+            session_key,
+            revision,
+        )
+
+        sources = memory_sources.evidence_sources(members)
+        sources = memory_sources.apply_dispositions(
+            sources, await memory_sources.source_decisions(str(user.id), sources)
+        )
+        return {"sources": sources, "scope_hash": memory_sources.scope_hash(sources)}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{local_date}/memory", status_code=202)
+async def generate_timeline_session_memory(
+    local_date: date,
+    body: SessionMemoryRequest,
+    user: User = Depends(current_active_user),
+):
+    try:
+        rows = await session_memory.request_session_memory(
+            str(user.id),
+            local_date,
+            _validate_timezone(body.timezone),
+            body.session_key,
+            body.revision,
+            excluded_keys=body.excluded_source_keys,
+            priority=100,
+        )
+        return {"proposals": [_proposal_payload(p, full=True) for p in rows]}
+    except (ValueError, MemoryReviewError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{local_date}/disposition")
+async def decide_timeline_session_memory(
+    local_date: date,
+    body: SessionDispositionRequest,
+    user: User = Depends(current_active_user),
+):
+    try:
+        return await session_memory.decide_session(
+            str(user.id),
+            local_date,
+            _validate_timezone(body.timezone),
+            body.session_key,
+            body.revision,
+            body.action,
+            body.source_keys,
+            body.scope_hash,
+            body.role,
+            body.clarification,
+        )
+    except session_memory.LockUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Timeline is updating. Your decision has not been saved yet; please try again shortly.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 class CreateMemorySelectionRequest(ReviewDayRequest):
     episodes: list[EpisodeRevisionRef] = Field(min_length=1, max_length=200)
 
@@ -767,6 +1075,8 @@ async def list_timeline_memory_selections(
         .sort("created_at")
         .to_list()
     )
+
+    rows = await privacy.filter_payloads(rows, str(user.id))
     return {
         "proposals": [_proposal_payload(p, full=True) for p in rows],
         "outcomes": episode_review_outcomes(rows),
@@ -1079,6 +1389,7 @@ async def regenerate_timeline_memory_review(
     proposal_id: str,
     background_tasks: BackgroundTasks,
     user: User = Depends(current_active_user),
+    body: RegenerateMemoryReviewRequest | None = None,
 ):
     """Discard a stale diff and derive it again from the current accepted vault."""
 
@@ -1089,14 +1400,12 @@ async def regenerate_timeline_memory_review(
     if proposal is None:
         raise HTTPException(status_code=404, detail="Memory proposal not found")
     try:
-        async with distributed_lock(
-            f"memory:review-work:{proposal.user_id}", timeout=120, blocking_timeout=5
-        ):
-            proposal = await MemoryReviewProposal.get(proposal.id)
-            replacement = await queue_memory_review_regeneration(proposal)
+        replacement = await queue_memory_review_regeneration(
+            proposal, feedback=body.feedback if body else None
+        )
     except MemoryReviewError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    background_tasks.add_task(generate_memory_review, replacement)
+    await session_memory.enqueue_memory(replacement)
     return {
         "outcome": "regenerating",
         "proposal": _proposal_payload(replacement, full=True),
@@ -1177,6 +1486,11 @@ async def _owned_episode(episode_id: str, user: User) -> TimelineEpisode:
     )
     if episode is None:
         raise HTTPException(status_code=404, detail="Episode not found")
+
+    try:
+        await privacy.require_record(episode)
+    except privacy.PrivacyHeld as exc:
+        raise HTTPException(423, str(exc)) from exc
     return episode
 
 
@@ -1300,6 +1614,10 @@ def _lineage_payload(episode: TimelineEpisode) -> dict:
 
 async def _readable(episode: TimelineEpisode) -> bool:
     """Whether the exact revision belongs to a current canonical snapshot."""
+
+    policy = await privacy.load_snapshot(episode.user_id)
+    if not policy.permits_record(episode):
+        return False
 
     day = await TimelineDay.find_one(
         TimelineDay.user_id == episode.user_id,
@@ -1808,10 +2126,12 @@ async def get_episode_thumbnail(
     )
     if episode is None or not episode.representative_image:
         raise HTTPException(status_code=404, detail="Episode thumbnail not found")
+    if not await _readable(episode):
+        raise HTTPException(status_code=404, detail="Episode thumbnail unavailable")
     return Response(
         content=episode.representative_image,
         media_type=episode.representative_image_type or "image/jpeg",
-        headers={"Cache-Control": "private, max-age=3600"},
+        headers={"Cache-Control": "private, no-store"},
     )
 
 

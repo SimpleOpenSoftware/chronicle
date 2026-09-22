@@ -53,6 +53,7 @@ class MemoryCause(str, Enum):
     AUTO_EXTRACTION = "auto_extraction"  # automatic post-conversation pipeline
     DAY_EPISODES = "day_episodes"  # settled-day timeline episodes (capture evidence)
     MEMORY_REPLAY = "memory_replay"  # manual re-extract, same inputs
+    CHAT_REVIEW = "chat_review"  # explicitly approved whole-chat note changes
     MEMORY_REBUILD = "memory_rebuild"  # clean vault replay from durable transcripts
     TRANSCRIPT_REPROCESS = "transcript_reprocess"  # re-ran ASR
     SPEAKER_REPROCESS = "speaker_reprocess"  # re-ran diarization
@@ -75,6 +76,7 @@ _CAUSE_KIND = {
     MemoryCause.AUTO_EXTRACTION: "extraction",
     MemoryCause.DAY_EPISODES: "extraction",
     MemoryCause.MEMORY_REPLAY: "reprocess",
+    MemoryCause.CHAT_REVIEW: "extraction",
     MemoryCause.MEMORY_REBUILD: "reprocess",
     MemoryCause.TRANSCRIPT_REPROCESS: "reprocess",
     MemoryCause.SPEAKER_REPROCESS: "reprocess",
@@ -88,6 +90,7 @@ _CAUSE_LABEL = {
     MemoryCause.AUTO_EXTRACTION: "AI extraction",
     MemoryCause.DAY_EPISODES: "Day episodes",
     MemoryCause.MEMORY_REPLAY: "Memory replay",
+    MemoryCause.CHAT_REVIEW: "Reviewed chat",
     MemoryCause.MEMORY_REBUILD: "Memory rebuild",
     MemoryCause.TRANSCRIPT_REPROCESS: "Transcript reprocess",
     MemoryCause.SPEAKER_REPROCESS: "Speaker reprocess",
@@ -336,6 +339,20 @@ async def record_vault_change(
                 or existing.note_path != entry.note_path
             ):
                 raise RuntimeError("Idempotent audit identity collision")
+        try:
+            # Defer this dependency to break the import cycle through
+            # backend.services.timeline.accepted_context -> backend.services.memory ->
+            # backend.services.memory.service_factory -> backend.services.memory.providers.chronicle
+            # -> backend.services.memory.audit.
+            from backend.services.timeline.accepted_context import (
+                queue_context_assessment,
+            )
+
+            await queue_context_assessment(str(user_id), memory_space_id)
+        except Exception:
+            logger.warning(
+                "Context assessment enqueue deferred to recovery", exc_info=True
+            )
     except Exception as e:  # noqa: BLE001 — ordinary writes retain best-effort audit
         if strict:
             raise

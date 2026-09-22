@@ -23,12 +23,16 @@ def episode(index: int, start: int, end: int, **changes):
         "summary": "Summary",
         "confidence": 0.9,
         "activity_mode": "foreground",
-        "evidence_refs": [SimpleNamespace(evidence_id=f"evidence-{index}")],
+        "evidence_refs": [
+            SimpleNamespace(evidence_id=f"evidence-{index}", kind="observation")
+        ],
         "conversational": False,
         "audio_ranges": [],
         "entities": [],
         "salience": "routine",
         "confirmed_at": None,
+        "confirmed_fields": [],
+        "memory_policy": "auto",
     }
     values.update(changes)
     return SimpleNamespace(**values)

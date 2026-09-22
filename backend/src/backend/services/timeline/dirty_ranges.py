@@ -417,6 +417,7 @@ async def _mark_evidence_dirty_locked(
         return row
 
     survivor, *duplicates = neighbours
+    previous_revision = survivor.evidence_revision
     survivor.started_at = min(
         [started_at] + [_as_utc(row.started_at) for row in neighbours]
     )
@@ -446,7 +447,43 @@ async def _mark_evidence_dirty_locked(
     survivor.lease_owner = None
     survivor.lease_expires_at = None
     survivor.updated_at = now
-    await survivor.save()
+    if duplicates or not source_kind or any(char in source_kind for char in ".$\x00"):
+        # Combining distinct rows requires the complete union. Arbitrary producer
+        # keys must also remain literal BSON keys rather than update paths.
+        await survivor.save()
+    else:
+        # The common single-row case must not rewrite its accumulated revision
+        # history on every capture. Keep that history intact and append only the
+        # new reference, under the same publication lock and revision fence.
+        update = {
+            "$set": {
+                field: getattr(survivor, field)
+                for field in (
+                    "started_at",
+                    "ended_at",
+                    "evidence_revision",
+                    "trigger_reasons",
+                    "not_before",
+                    "force_after",
+                    "state",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "updated_at",
+                )
+            }
+        }
+        if source_revision:
+            update["$addToSet"] = {f"source_revisions.{source_kind}": source_revision}
+        changed = await DirtyEvidenceRange.get_pymongo_collection().update_one(
+            {
+                "_id": survivor.id,
+                "state": {"$in": list(_COALESCABLE_STATES)},
+                "evidence_revision": previous_revision,
+            },
+            update,
+        )
+        if changed.matched_count != 1:
+            raise RuntimeError("Dirty evidence range changed during coalescing")
 
     for row in duplicates:
         await row.delete()

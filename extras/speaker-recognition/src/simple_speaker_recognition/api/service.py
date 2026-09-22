@@ -17,6 +17,8 @@ from omegaconf import OmegaConf
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+import simple_speaker_recognition.database as database
+import simple_speaker_recognition.database.models as models
 from simple_speaker_recognition.api.core.utils import get_data_directory
 from simple_speaker_recognition.constants import DEFAULT_SIMILARITY_THRESHOLD
 from simple_speaker_recognition.core.audio_backend import AudioBackend
@@ -279,7 +281,7 @@ async def _cuda_watchdog() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan event handler for startup and shutdown."""
-    global audio_backend, speaker_db
+    global audio_backend, speaker_db, _catalog_fingerprint
 
     # Startup: Initialize database and load models
     log.info("=== Speaker Recognition Service Starting ===")
@@ -306,6 +308,8 @@ async def lifespan(app: FastAPI):
         base_dir=auth.data_dir,
         similarity_thr=auth.similarity_threshold,
     )
+    if _CATALOG_READ_ONLY:
+        _catalog_fingerprint = await asyncio.to_thread(_snapshot_identity, speaker_db)
     log.info("Models ready ✔ – device=%s", device)
 
     # Ensure enrollment audio directory exists
@@ -335,6 +339,61 @@ app = FastAPI(
 react_ui_host = (
     os.getenv("REACT_UI_HOST", "localhost") + ":" + os.getenv("REACT_UI_PORT", "5173")
 )
+# HA replicas serve immutable catalog snapshots. Freeze the identity published
+# at startup and deny enrollment changes on every mutation entry point.
+from .catalog_contract import ReadOnlyCatalog, fingerprint
+
+_CATALOG_READ_ONLY = os.getenv("SPEAKER_CATALOG_READ_ONLY", "false").lower() == "true"
+_catalog_fingerprint = None
+app.add_middleware(ReadOnlyCatalog, enabled=_CATALOG_READ_ONLY)
+from .gallery_fence import GalleryRevisionFence
+
+app.add_middleware(GalleryRevisionFence)
+
+from simple_speaker_recognition.core.gallery_privacy import GalleryHeld
+
+from .privacy import gallery_privacy_hold
+
+app.add_exception_handler(GalleryHeld, gallery_privacy_hold)
+
+
+def _catalog_identity(db):
+    # Writable single instances must not advertise a frozen catalog generation.
+    if not _CATALOG_READ_ONLY:
+        return {"catalog_fingerprint": None, "read_only": False}
+    return {"catalog_fingerprint": _catalog_fingerprint, "read_only": True}
+
+
+def _snapshot_identity(db):
+
+    session = database.get_db_session()
+    try:
+        rows = [
+            {
+                "id": row.id,
+                "user_id": row.user_id,
+                "name": row.name,
+                "embedding_data": row.embedding_data,
+                "segments": [
+                    {
+                        column.name: getattr(segment, column.name)
+                        for column in models.SpeakerAudioSegment.__table__.columns
+                    }
+                    for segment in session.query(models.SpeakerAudioSegment)
+                    .filter(models.SpeakerAudioSegment.speaker_id == row.id)
+                    .order_by(models.SpeakerAudioSegment.id)
+                ],
+            }
+            for row in session.query(models.Speaker).all()
+        ]
+        return fingerprint(
+            rows,
+            {"dimension": db.emb_dim, "embedder": audio_backend.EMBEDDING_MODEL_ID},
+        )
+    finally:
+        session.close()
+
+
 # Add CORS middleware for direct WebSocket connections from HTTPS frontend
 app.add_middleware(
     CORSMiddleware,
@@ -348,6 +407,7 @@ app.add_middleware(
 from .routers import (
     deepgram_router,
     enrollment_audit_router,
+    enrollment_operations_router,
     enrollment_router,
     identification_router,
     speakers_router,
@@ -360,6 +420,7 @@ app.include_router(users_router, tags=["users"])
 app.include_router(speakers_router, tags=["speakers"])
 app.include_router(enrollment_router, tags=["enrollment"])
 app.include_router(enrollment_audit_router, tags=["enrollment-audit"])
+app.include_router(enrollment_operations_router, tags=["enrollment-operations"])
 app.include_router(identification_router, tags=["identification"])
 app.include_router(deepgram_router, tags=["deepgram"])
 app.include_router(websocket_router, tags=["websocket"])
@@ -383,6 +444,7 @@ async def health(db: UnifiedSpeakerDB = Depends(get_db)):
         "device": str(device),
         "speakers": db.get_speaker_count(),
         "architecture": "modular-routers",
+        **_catalog_identity(db),
     }
 
 
@@ -400,6 +462,7 @@ async def readiness(db: UnifiedSpeakerDB = Depends(get_db)):
         "device": str(device),
         "speakers": db.get_speaker_count(),
         "architecture": "modular-routers",
+        **_catalog_identity(db),
     }
     if cuda_error is not None:
         body["cuda_error"] = cuda_error

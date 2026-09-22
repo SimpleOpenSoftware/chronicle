@@ -115,7 +115,7 @@ def _interval(
 @pytest.fixture
 def registry():
     value = InteractionRegistry()
-    value.register("swiggy_instamart", _ModePlugin.INTERACTION_MODES[0])
+    value.register("fixture_shopping", _ModePlugin.INTERACTION_MODES[0])
     return value
 
 
@@ -150,7 +150,7 @@ def test_router_only_registers_configured_modes_and_exposes_asr_hint():
     router = PluginRouter()
     plugin = _ModePlugin()
 
-    router.register_plugin("swiggy_instamart", plugin)
+    router.register_plugin("fixture_shopping", plugin)
 
     assert "swiggy_order" in router.interaction_registry.modes
     assert "order swiggy" in router.get_asr_keywords()
@@ -161,7 +161,7 @@ def test_router_rejects_unknown_configured_mode():
     plugin.config["modes"] = ["typo_mode"]
 
     with pytest.raises(ValueError, match="undeclared interaction mode"):
-        PluginRouter().register_plugin("swiggy_instamart", plugin)
+        PluginRouter().register_plugin("fixture_shopping", plugin)
 
 
 async def test_ingress_activates_claims_interval_and_exclusively_consumes(registry):
@@ -231,7 +231,7 @@ async def test_ingress_allows_a_repeated_turn_from_the_same_source(registry):
 async def test_streaming_fragments_do_not_enter_interaction_modes():
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", _ModePlugin())
+    router.register_plugin("fixture_shopping", _ModePlugin())
     normal_dispatch = AsyncMock()
     router.dispatch_event = normal_dispatch
     consumer = StreamingTranscriptionConsumer.__new__(StreamingTranscriptionConsumer)
@@ -288,7 +288,7 @@ async def test_streaming_fragment_is_inert_for_bound_voice_session():
 async def test_acoustic_wake_does_not_bypass_committed_turn_router(monkeypatch):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", _ModePlugin())
+    router.register_plugin("fixture_shopping", _ModePlugin())
     dispatcher = WakeWordDispatcher(redis_client, router)
     dispatcher._check_speaker_gate = AsyncMock(
         return_value={"allowed": True, "reason": "gate_off", "identified": None}
@@ -596,7 +596,7 @@ async def test_processor_applies_full_state_and_ends_session(registry):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     plugin = _ModePlugin()
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", plugin)
+    router.register_plugin("fixture_shopping", plugin)
     ingress = InteractionIngress(redis_client, router.interaction_registry)
     processor = InteractionProcessor(redis_client, router)
 
@@ -637,7 +637,7 @@ async def test_processor_applies_full_state_and_ends_session(registry):
 async def test_processor_emits_privacy_safe_langfuse_trace(monkeypatch, registry):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", _ModePlugin())
+    router.register_plugin("fixture_shopping", _ModePlugin())
     ingress = InteractionIngress(redis_client, router.interaction_registry)
     spans = []
     span_io = []
@@ -681,7 +681,7 @@ async def test_processor_emits_privacy_safe_langfuse_trace(monkeypatch, registry
                 "attributes": {
                     "chronicle.interaction.id": started.interaction_id,
                     "chronicle.interaction.mode_id": "swiggy_order",
-                    "chronicle.interaction.plugin_id": "swiggy_instamart",
+                    "chronicle.interaction.plugin_id": "fixture_shopping",
                     "chronicle.interaction.input_kind": "start",
                     "chronicle.interaction.source": "streaming",
                     "chronicle.client_id": "device-1",
@@ -724,7 +724,7 @@ async def test_processor_expires_idle_session_and_notifies_plugin(registry):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     plugin = _ModePlugin()
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", plugin)
+    router.register_plugin("fixture_shopping", plugin)
     now = time.time()
     session = await _activate_at(redis_client, router, now)
     processor = InteractionProcessor(redis_client, router)
@@ -742,7 +742,7 @@ async def test_first_turn_after_idle_deadline_runs_complete_expiry_transition():
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     plugin = _ModePlugin()
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", plugin)
+    router.register_plugin("fixture_shopping", plugin)
     session = await _activate_at(redis_client, router, time.time() - 601)
     ingress = InteractionIngress(redis_client, router.interaction_registry)
 
@@ -767,7 +767,7 @@ async def test_worker_recovers_an_input_stranded_in_another_consumer(monkeypatch
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     plugin = _ModePlugin()
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", plugin)
+    router.register_plugin("fixture_shopping", plugin)
     await redis_client.xgroup_create(
         INPUT_STREAM,
         interaction_mode_worker.GROUP_NAME,
@@ -802,7 +802,7 @@ async def test_worker_recovers_an_input_stranded_in_another_consumer(monkeypatch
 async def test_worker_delivers_reply_with_committed_generation_binding(monkeypatch):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", _ModePlugin())
+    router.register_plugin("fixture_shopping", _ModePlugin())
     ingress = InteractionIngress(redis_client, router.interaction_registry)
     await ingress.submit(
         user_id="user-1",
@@ -933,7 +933,7 @@ async def test_effect_fence_finishes_mutation_but_suppresses_stale_speech():
 
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", _FencedPlugin())
+    router.register_plugin("fixture_shopping", _FencedPlugin())
     await InteractionIngress(redis_client, router.interaction_registry).submit(
         user_id="user-1",
         client_id="device-1",
@@ -967,7 +967,8 @@ async def test_worker_main_initializes_otel_before_plugins(monkeypatch):
             events.append("redis_closed")
 
     class _Worker:
-        def __init__(self, redis_client, router):
+        def __init__(self, redis_client, router, *, journal_projector):
+            assert journal_projector is not None
             events.append("worker_created")
 
         async def run(self):

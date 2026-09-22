@@ -12,6 +12,7 @@ from fastapi import BackgroundTasks, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from backend.models.memory_audit import MemoryAuditEntry
+from backend.models.session_memory import MemorySourceDecision, SessionPreparation
 from backend.models.timeline import (
     DirtyEvidenceRange,
     EpisodeRevisionRef,
@@ -23,13 +24,17 @@ from backend.models.timeline import (
     TimelinePublicationJournal,
 )
 from backend.routers.modules import timeline_routes
+from backend.services.memory import note_review
 from backend.services.memory.agent import review_agent
 from backend.services.memory.agent.memory_agent import build_write_task
 from backend.services.memory.base import DayWriteOutcome
+from backend.services.memory.session_write import SessionDraftResult
 from backend.services.memory.vault_manager import ConvDocVaultManager
-from backend.services.timeline import review
+from backend.services.timeline import review, sessions
 from backend.services.timeline.review_storage import assert_memory_review_storage_ready
 from backend.services.timeline.vault_day_index import ensure_day_episode_index
+
+_enqueue_session_job = sessions._enqueue
 
 
 @asynccontextmanager
@@ -53,10 +58,23 @@ async def selection_db(monkeypatch):
             TimelineDay,
             TimelinePublicationJournal,
             MemoryAuditEntry,
+            MemorySourceDecision,
+            SessionPreparation,
         ],
     )
+    monkeypatch.setattr(
+        sessions, "_enqueue", lambda *args, **kwargs: "isolated-session-job"
+    )
+
+    async def run_decision(p):
+        from backend.workers.session_jobs import apply_session_memory_job
+
+        return await apply_session_memory_job.__wrapped__(p.proposal_id)
+
+    monkeypatch.setattr(sessions, "enqueue_decision", run_decision)
     monkeypatch.setattr(review, "distributed_lock", unlocked)
     monkeypatch.setattr(review, "vault_run_lock", lambda _: nullcontext())
+    monkeypatch.setattr(note_review, "vault_run_lock", lambda _: nullcontext())
     yield database
     await client.drop_database(database.name)
     client.close()
@@ -84,14 +102,9 @@ async def vault(selection_db, tmp_path, monkeypatch):
 
         def __init__(self, config=None):
             self.vault = ConvDocVaultManager(tmp_path)
-            self.last_day_source_episode_keys_by_path = {}
 
-        async def add_day_memory(
-            self, digest, day, user, *, day_index_digest, **kwargs
-        ):
-            root = self.vault.user_root(user)
-            ensure_day_episode_index(root / f"Daily/{day}.md", day, day_index_digest)
-            return DayWriteOutcome.COMPLETE, [f"Daily/{day}.md"]
+        async def draft_session_memory(self, source, user):
+            return SessionDraftResult(outcome="complete")
 
     service = Service()
     monkeypatch.setattr(review, "ChronicleMemoryService", Service)
@@ -267,6 +280,188 @@ def episode(key, day=5):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [False, True])
+async def test_selection_uses_committed_midnight_evidence_but_waits_for_requested_reconciliation(
+    vault, monkeypatch, authorized
+):
+    a = episode("cross-midnight")
+    a.started_at = datetime(2026, 9, 5, 18, 25, tzinfo=timezone.utc)
+    a.ended_at = datetime(2026, 9, 5, 18, 35, tzinfo=timezone.utc)
+    await a.insert()
+    refs = [EpisodeRevisionRef(episode_key=a.episode_key, revision=1)]
+    snapshot = TimelineDaySnapshot(
+        snapshot_id="a" * 64, episode_revisions=refs, evidence_state_hash="c" * 64
+    )
+    day = TimelineDay(
+        user_id="user-one",
+        local_date=date(2026, 9, 5),
+        timezone="Asia/Kolkata",
+        current_snapshot=snapshot,
+        current_snapshot_id=snapshot.snapshot_id,
+        snapshot_state="ready",
+    )
+    await day.insert()
+    start = datetime(2026, 9, 5, 18, 30, tzinfo=timezone.utc)
+    end = datetime(2026, 9, 5, 18, 45, tzinfo=timezone.utc)
+    await DirtyEvidenceRange(
+        user_id="user-one",
+        started_at=start,
+        ended_at=end,
+        evidence_revision=1,
+        not_before=start,
+        force_after=end,
+        state="authorized_pending" if authorized else "pending",
+        **(
+            {
+                "dispatch_authorized_at": start,
+                "reconciliation_request_id": "requested",
+                "authorized_started_at": start,
+                "authorized_ended_at": end,
+            }
+            if authorized
+            else {}
+        ),
+    ).insert()
+    published = AsyncMock(return_value=True)
+    monkeypatch.setattr(review, "episode_revision_is_published", published)
+
+    async def select():
+        return await timeline_routes.create_timeline_memory_selection(
+            day.local_date,
+            timeline_routes.CreateMemorySelectionRequest(
+                timezone=day.timezone,
+                snapshot_id=day.current_snapshot_id,
+                episodes=refs,
+            ),
+            BackgroundTasks(),
+            SimpleNamespace(id="user-one"),
+        )
+
+    if authorized:
+        with pytest.raises(HTTPException) as error:
+            await select()
+        assert error.value.status_code == 409
+        assert await MemoryReviewProposal.find_all().count() == 0
+    else:
+        result = await select()
+        row = await MemoryReviewProposal.find_one(
+            {"proposal_id": result["proposals"][0]["proposal_id"]}
+        )
+        assert row.state == "queued"
+        published.return_value = False
+        with pytest.raises(review.SelectionChanged, match="committed"):
+            await review.validate_selection(row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_present", [False, True])
+async def test_registered_session_recovery_checks_worker_ownership(
+    selection_db, monkeypatch, worker_present
+):
+    from fakeredis import FakeStrictRedis
+    from rq import Queue, Worker
+
+    from backend.controllers import queue_controller
+    from backend.services import source_search
+    from backend.workers.session_jobs import generate_session_memory_job
+
+    redis = FakeStrictRedis()
+    queue = Queue("memory", connection=redis)
+    job = queue.enqueue(generate_session_memory_job, "recover-proposal")
+    worker = Worker([queue], connection=redis, name="previous-worker")
+    worker.register_birth()
+    worker.prepare_job_execution(job)
+    if not worker_present:
+        redis.delete(worker.key)
+    monkeypatch.setattr(queue_controller, "redis_conn", redis)
+    monkeypatch.setattr(source_search, "db", lambda: selection_db)
+    p = proposal(
+        proposal_id="recover-proposal",
+        state="generating",
+        session_key="session",
+        job_id=job.id,
+        attempts=1,
+        completed_sources=1,
+        total_sources=3,
+    )
+    await p.insert()
+    enqueue = AsyncMock()
+    monkeypatch.setattr(sessions, "enqueue_memory", enqueue)
+    await sessions.prepare_recent_sessions()
+    current = await MemoryReviewProposal.get(p.id)
+    assert current.state == ("generating" if worker_present else "queued")
+    assert current.completed_sources == 1
+    assert enqueue.await_count == (0 if worker_present else 1)
+
+
+@pytest.mark.asyncio
+async def test_session_continuation_does_not_overtake_waiting_work(
+    selection_db, monkeypatch
+):
+    from fakeredis import FakeStrictRedis
+    from rq import Queue
+
+    from backend.controllers import queue_controller
+
+    redis = FakeStrictRedis()
+    queue = Queue("memory", connection=redis)
+    monkeypatch.setattr(queue_controller, "redis_conn", redis)
+    monkeypatch.setattr(queue_controller, "memory_queue", queue)
+    monkeypatch.setattr(sessions, "_enqueue", _enqueue_session_job)
+    waiting = await proposal(
+        proposal_id="waiting", request_id="waiting", priority=100, state="queued"
+    ).insert()
+    continuing = await proposal(
+        proposal_id="continuing",
+        request_id="continuing",
+        selected_tokens=["ep-two:1"],
+        priority=100,
+        state="queued",
+        stage="combining",
+        completed_sources=2,
+        total_sources=2,
+    ).insert()
+    await sessions.enqueue_memory(waiting)
+    await sessions.enqueue_memory(continuing)
+    assert queue.job_ids == [waiting.job_id, continuing.job_id]
+    await sessions.enqueue_memory(continuing)
+    assert queue.count == 2
+    requested = await proposal(
+        proposal_id="new-request",
+        request_id="new-request",
+        selected_tokens=["ep-three:1"],
+        priority=100,
+        state="queued",
+    ).insert()
+    await sessions.enqueue_memory(requested)
+    assert queue.job_ids == [requested.job_id, waiting.job_id, continuing.job_id]
+
+
+@pytest.mark.asyncio
+async def test_paused_generation_retry_uses_durable_queue(selection_db, monkeypatch):
+    p = await proposal(
+        state="paused",
+        failure_kind="budget_exhausted",
+        error="Saved investigation limit",
+    ).insert()
+    monkeypatch.setattr(timeline_routes, "distributed_lock", unlocked)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(sessions, "enqueue_memory", enqueue)
+    tasks = BackgroundTasks()
+    response = await timeline_routes.regenerate_timeline_memory_review(
+        p.proposal_id, tasks, SimpleNamespace(id=p.user_id)
+    )
+    replacement = enqueue.call_args.args[0]
+    assert replacement.proposal_id != p.proposal_id
+    assert replacement.generation == p.generation + 1
+    assert replacement.state == "queued"
+    assert not tasks.tasks
+    old = await MemoryReviewProposal.get(p.id)
+    assert old.failure_kind == "budget_exhausted" and old.error == p.error
+    assert response["proposal"]["proposal_id"] == replacement.proposal_id
+
+
+@pytest.mark.asyncio
 async def test_creation_duplicates_and_partial_selection_leave_siblings(
     vault, monkeypatch
 ):
@@ -324,13 +519,13 @@ async def test_generation_fifo_not_source_date_and_pending_does_not_block(
         await p.save()
         return "pending"
 
-    monkeypatch.setattr(review, "generate_memory_review", generate)
-    assert (await review.process_memory_review_queue())["pending"] == 2
+    monkeypatch.setattr(sessions, "enqueue_memory", generate)
+    assert (await review.process_memory_review_queue())["queued"] == 2
     assert calls == ["sept", "jan"]
 
 
 @pytest.mark.asyncio
-async def test_real_generation_stages_only_selected_daily_entries(vault, monkeypatch):
+async def test_reference_generation_does_not_require_daily_entries(vault, monkeypatch):
     e = episode("ep-one")
     p = proposal(selection_hash=review.selection_hash([e], []))
     await p.insert()
@@ -339,13 +534,11 @@ async def test_real_generation_stages_only_selected_daily_entries(vault, monkeyp
     (vault / "Daily/2026-09-05.md").write_text(
         "# 2026-09-05\n\n## Episodes\n\n- 08:00–09:00 · work · routine — Earlier <!-- episode_key:earlier -->\n"
     )
-    assert await review.generate_memory_review(p) == "pending"
+    assert await review.generate_memory_review(p) == "no_changes"
     generated = await MemoryReviewProposal.get(p.id)
-    assert len(generated.changes) == 1
-    assert "episode_key:earlier" in generated.changes[0].after_text
-    assert "episode_key:ep-one" in generated.changes[0].after_text
+    assert generated.changes == [] and not generated.active
+    assert "episode_key:earlier" in (vault / "Daily/2026-09-05.md").read_text()
     assert "episode_key:ep-one" not in (vault / "Daily/2026-09-05.md").read_text()
-    assert generated.vault_base_hash
 
 
 def test_cumulative_daily_keeps_accepted_and_ignores_unselected():
@@ -392,10 +585,10 @@ async def test_every_note_boundary_recovers_from_persisted_intent(
                 raise RuntimeError("interrupted note write")
         write(target, content)
 
-    monkeypatch.setattr(review, "_atomic_write", fail)
+    monkeypatch.setattr(note_review, "_atomic_write", fail)
     await review.resolve_memory_review(p, [c.change_id for c in p.changes])
     assert await review.process_memory_review_decision(p) == "applying"
-    monkeypatch.setattr(review, "_atomic_write", write)
+    monkeypatch.setattr(note_review, "_atomic_write", write)
     assert (await review.process_memory_review_queue())["applied"] == 1
     assert (vault / "Topics/Second.md").read_text() == "Second fact"
     assert await MemoryAuditEntry.find_all().count() == 2
@@ -411,7 +604,20 @@ async def test_old_source_changes_require_correction_but_sibling_snapshot_does_n
     monkeypatch.setattr(review, "_selection", selection)
     await review.refresh_memory_selection_states()
     assert (await MemoryReviewProposal.get(p.id)).state == "pending"
-    e.summary = "Corrected evidence"
+    from backend.models.timeline import TimelineEvidenceRef
+
+    e.evidence_refs = [
+        TimelineEvidenceRef(
+            evidence_id="corrected-source",
+            locator={"capture_source_id": "phone", "modality": "screen"},
+            kind="observation",
+            role="user_statement",
+            started_at=e.started_at,
+            ended_at=e.ended_at,
+            excerpt="Corrected source evidence",
+            content_hash="changed-content",
+        )
+    ]
     await review.refresh_memory_selection_states()
     assert (await MemoryReviewProposal.get(p.id)).state == "stale"
     p = await MemoryReviewProposal.get(p.id)
@@ -456,7 +662,7 @@ async def test_same_key_home_date_correction_preserves_other_daily_entries(
     changes = {c.note_path: c for c in generated.changes}
     assert "episode_key:ep-one" not in changes[f"Daily/{old_day}.md"].after_text
     assert "episode_key:unrelated" in changes[f"Daily/{old_day}.md"].after_text
-    assert "episode_key:ep-one" in changes["Daily/2026-09-05.md"].after_text
+    assert "Daily/2026-09-05.md" not in changes
     assert (vault / f"Daily/{old_day}.md").read_text() == old_note
 
 
@@ -562,7 +768,9 @@ async def test_selection_routes_authorize_exact_revisions_and_generation(
     row = await MemoryReviewProposal.find_one(
         MemoryReviewProposal.proposal_id == result["proposals"][0]["proposal_id"]
     )
-    assert row.state == "pending"
+    assert row.state == "queued" and row.job_id == "isolated-session-job"
+    row.state = "pending"
+    await row.save()
     with pytest.raises(HTTPException) as wrong_owner:
         await timeline_routes.resolve_timeline_memory_review(
             row.proposal_id,
@@ -613,13 +821,10 @@ async def test_registered_queue_recovers_interrupted_generation(vault, monkeypat
     await p.insert()
     await review.process_memory_review_queue()
     old = await MemoryReviewProposal.get(p.id)
-    assert old.state == "stale"
-    successor = await MemoryReviewProposal.find_one(
-        MemoryReviewProposal.proposal_id == old.replacement_proposal_id
-    )
-    assert successor.request_id == old.request_id
-    assert successor.generation == 2
-    assert successor.state == "queued"
+    assert old.state == "queued"
+    assert old.replacement_proposal_id is None
+    assert old.job_id == "isolated-session-job"
+    assert old.attempts == 0
 
 
 @pytest.mark.asyncio
@@ -642,10 +847,10 @@ async def test_partial_apply_rechecks_external_edits_and_preserves_completed_wri
             raise RuntimeError("crash after first note")
         write(target, content)
 
-    monkeypatch.setattr(review, "_atomic_write", interrupt)
+    monkeypatch.setattr(note_review, "_atomic_write", interrupt)
     await review.resolve_memory_review(p, [c.change_id for c in p.changes])
     assert await review.process_memory_review_decision(p) == "applying"
-    monkeypatch.setattr(review, "_atomic_write", write)
+    monkeypatch.setattr(note_review, "_atomic_write", write)
     (vault / "Topics/External.md").write_text("External accepted change")
     checker = AsyncMock(
         return_value=MemoryFreshnessResult(
@@ -662,7 +867,7 @@ async def test_partial_apply_rechecks_external_edits_and_preserves_completed_wri
         assert (vault / "Topics/Second.md").read_text() == "Second fact"
         assert await MemoryAuditEntry.find_all().count() == 2
     else:
-        assert result["regenerating"] == 1
+        assert result["stale"] == 1
         assert not (vault / "Topics/Second.md").exists()
         assert await MemoryAuditEntry.find_all().count() == 1
         old = await MemoryReviewProposal.get(p.id)
@@ -707,3 +912,344 @@ async def test_correction_resolves_predecessor_only_after_full_acceptance(
     assert old.state == ("correction_required" if partial else "corrected")
     if not partial:
         assert old.corrected_by_proposal_id == p.proposal_id
+
+
+@pytest.mark.asyncio
+async def test_preparation_worker_publishes_automatic_singleton_without_human_confirmation(
+    selection_db, monkeypatch
+):
+    from backend.models.timeline import EvidenceLocator, TimelineEvidenceRef
+    from backend.services.timeline import publication, session_organization
+    from backend.services.timeline.snapshots import build_day_snapshot
+    from backend.workers import session_jobs
+
+    ep = episode("automatic-session")
+    ep.status = "provisional"
+    ep.evidence_refs = [
+        TimelineEvidenceRef(
+            evidence_id="automatic-call",
+            kind="transcript",
+            locator=EvidenceLocator(
+                capture_source_id="phone", modality="transcript", track_id="input"
+            ),
+            started_at=ep.started_at,
+            ended_at=ep.ended_at,
+            role="user_statement",
+            excerpt="We agreed to ship the fix tomorrow.",
+            content_hash="call-hash",
+        )
+    ]
+    await ep.insert()
+    snapshot = build_day_snapshot(
+        user_id="user-one",
+        local_date=ep.local_date,
+        timezone_name=ep.timezone,
+        evidence_state_hash="c" * 64,
+        episode_revisions=[
+            EpisodeRevisionRef(episode_key=ep.episode_key, revision=ep.revision)
+        ],
+    )
+    day = TimelineDay(
+        user_id=ep.user_id,
+        local_date=ep.local_date,
+        timezone=ep.timezone,
+        current_snapshot=snapshot,
+        current_snapshot_id=snapshot.snapshot_id,
+        snapshot_state="ready",
+    )
+    await day.insert()
+    item = SessionPreparation(
+        user_id=ep.user_id,
+        local_date=ep.local_date,
+        timezone=ep.timezone,
+        snapshot_id=snapshot.snapshot_id,
+    )
+    await item.insert()
+    monkeypatch.setattr(session_jobs, "distributed_lock", unlocked)
+    monkeypatch.setattr(publication, "distributed_lock", unlocked)
+    await session_jobs.prepare_sessions_job.__wrapped__(str(item.id))
+    stored = await TimelineDay.get(day.id)
+    assert len(stored.semantic_group_history) == 1
+    assert stored.semantic_group_history[0].origin == "automatic"
+    assert stored.semantic_group_history[0].episode_ids == [ep.episode_id]
+    assert stored.review_decisions[-1].action == "session_organized"
+    assert not (await TimelineEpisode.get(ep.id)).confirmed_fields
+    assert (await SessionPreparation.get(item.id)).state == "complete"
+
+    # The real preparation entry point must recover a stale draft, without
+    # reviving its old proposal or manufacturing a structural confirmation.
+    prior = await MemoryReviewProposal.find_one(
+        {"session_key": stored.semantic_group_history[0].group_key}
+    )
+    assert prior is not None
+    prior.state, prior.active = "stale", False
+    await prior.save()
+    recovery = await sessions.request_preparation(stored)
+    await session_jobs.prepare_sessions_job.__wrapped__(str(recovery.id))
+    current = (
+        await MemoryReviewProposal.find({"session_key": prior.session_key})
+        .sort("created_at")
+        .to_list()
+    )
+    assert len(current) == 2
+    assert current[-1].state == "queued"
+    assert current[-1].proposal_id != prior.proposal_id
+    assert (await MemoryReviewProposal.get(prior.id)).state == "stale"
+    assert not (await TimelineEpisode.get(ep.id)).confirmed_fields
+
+
+@pytest.mark.asyncio
+async def test_cancelled_worker_cannot_revive_an_older_generation(selection_db):
+    old = proposal(state="generating")
+    await old.insert()
+    stored = await MemoryReviewProposal.get(old.id)
+    stored.state = "stale"
+    stored.active = False
+    await stored.save()
+    replacement = proposal(
+        request_id="new-scope", source_scope=[{"key": "new-evidence"}]
+    )
+    await replacement.insert()
+    old.account = {"summary": "Late model result"}
+    with pytest.raises(review.SelectionChanged, match="cancelled or superseded"):
+        await review.persist_generation(old)
+    assert (await MemoryReviewProposal.get(old.id)).state == "stale"
+    assert (await MemoryReviewProposal.get(replacement.id)).active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_offset", [0, 1])
+async def test_session_spanning_dates_has_one_owner_and_one_memory_job(
+    selection_db, monkeypatch, owner_offset
+):
+    from backend.models.timeline import GroupRevisionRef, TimelineSemanticGroupRevision
+
+    monkeypatch.setattr(
+        review, "episode_revision_is_published", AsyncMock(return_value=True)
+    )
+    first, second = episode("before-midnight", 4), episode("after-midnight", 5)
+    for ep in (first, second):
+        await ep.insert()
+    owner_date = (first, second)[owner_offset].local_date
+    refs = [
+        EpisodeRevisionRef(episode_key=ep.episode_key, revision=ep.revision)
+        for ep in (first, second)
+    ]
+    group = TimelineSemanticGroupRevision(
+        group_key="one-continued-session",
+        member_revisions=refs,
+        episode_ids=[first.episode_id, second.episode_id],
+        title="Continued investigation",
+        summary="Same specific investigation continued.",
+        source_snapshot_id="a" * 64,
+        started_at=first.started_at,
+        ended_at=second.ended_at,
+        origin="automatic",
+    )
+    days = []
+    for ep, char in ((first, "a"), (second, "b")):
+        snapshot = TimelineDaySnapshot(
+            snapshot_id=char * 64,
+            evidence_state_hash="c" * 64,
+            episode_revisions=[
+                EpisodeRevisionRef(episode_key=ep.episode_key, revision=1)
+            ],
+            semantic_group_revisions=[
+                GroupRevisionRef(
+                    owner_local_date=owner_date,
+                    group_key=group.group_key,
+                    revision=1,
+                )
+            ],
+        )
+        day = TimelineDay(
+            user_id=ep.user_id,
+            local_date=ep.local_date,
+            timezone=ep.timezone,
+            current_snapshot=snapshot,
+            current_snapshot_id=snapshot.snapshot_id,
+            semantic_group_history=[group] if ep.local_date == owner_date else [],
+        )
+        await day.insert()
+        days.append(day)
+    left = await sessions.project_sessions(days[0], [first])
+    right = await sessions.project_sessions(days[1], [second])
+    assert left[0]["session_key"] == right[0]["session_key"]
+    assert len(right[0]["episodes"]) == 2
+    made = await sessions.request_session_memory(
+        first.user_id, second.local_date, first.timezone, group.group_key, 1
+    )
+    again = await sessions.request_session_memory(
+        first.user_id, first.local_date, first.timezone, group.group_key, 1
+    )
+    assert made[0].proposal_id == again[0].proposal_id
+    assert made[0].local_date == owner_date
+    await review.validate_selection(made[0])
+
+
+@pytest.mark.asyncio
+async def test_correction_arriving_during_preparation_survives_worker_save(
+    selection_db, monkeypatch
+):
+    from backend.workers import session_jobs
+
+    item = SessionPreparation(
+        user_id="user-one",
+        local_date=date(2026, 9, 5),
+        timezone="Asia/Kolkata",
+        snapshot_id="a" * 64,
+    )
+    await item.insert()
+    monkeypatch.setattr(session_jobs, "distributed_lock", unlocked)
+
+    async def prepare(stale_worker_item):
+        day = SimpleNamespace(
+            user_id=item.user_id,
+            local_date=item.local_date,
+            timezone=item.timezone,
+            current_snapshot_id=item.snapshot_id,
+        )
+        await sessions.request_preparation(day, force=True, priority=100)
+        stale_worker_item.state = "complete"
+        await sessions.persist_preparation(stale_worker_item)
+
+    monkeypatch.setattr(sessions, "prepare_sessions", prepare)
+    await session_jobs.prepare_sessions_job.__wrapped__(str(item.id))
+    stored = await SessionPreparation.get(item.id)
+    assert stored.requested_revision == 1
+    assert stored.completed_revision == 0
+    assert stored.priority == 100
+    assert stored.state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_published_open_activity_can_draft_without_fabricating_confirmation(
+    selection_db, monkeypatch
+):
+    ep = episode("ongoing-checkpoint")
+    ep.status = "open"
+    await ep.insert()
+    ref = EpisodeRevisionRef(episode_key=ep.episode_key, revision=ep.revision)
+    snapshot = TimelineDaySnapshot(
+        snapshot_id="a" * 64, evidence_state_hash="c" * 64, episode_revisions=[ref]
+    )
+    day = TimelineDay(
+        user_id=ep.user_id,
+        local_date=ep.local_date,
+        timezone=ep.timezone,
+        current_snapshot=snapshot,
+        current_snapshot_id=snapshot.snapshot_id,
+    )
+    await day.insert()
+    monkeypatch.setattr(
+        review, "episode_revision_is_published", AsyncMock(return_value=True)
+    )
+    rows = await review.create_memory_selection(
+        ep.user_id, day.local_date, day.timezone, snapshot.snapshot_id, [ref]
+    )
+    assert rows[0].state == "queued"
+    stored = await TimelineEpisode.get(ep.id)
+    assert stored.status == "open"
+    assert not stored.confirmed_fields
+
+
+def test_derived_episode_summary_cannot_invalidate_source_based_session_memory():
+    ep = episode("source-based")
+    before = review.selection_hash([ep], [])
+    ep.detailed_summary = (
+        "A newly generated long account of the same retained evidence."
+    )
+    ep.summary = "New display summary"
+    assert review.selection_hash([ep], []) == before
+    ep.memory_policy = "reference"
+    assert review.selection_hash([ep], []) != before
+
+
+@pytest.mark.asyncio
+async def test_regeneration_is_single_flight_without_waiting_for_other_session_work(
+    selection_db, monkeypatch
+):
+    import asyncio
+
+    from backend.services.redis_lock import distributed_lock
+
+    p = await proposal(state="paused").insert()
+    monkeypatch.setattr(review, "distributed_lock", distributed_lock)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(sessions, "enqueue_memory", enqueue)
+    async with distributed_lock(f"memory:review-work:{p.user_id}", timeout=30):
+        responses = await asyncio.wait_for(
+            asyncio.gather(
+                *[
+                    timeline_routes.regenerate_timeline_memory_review(
+                        p.proposal_id, BackgroundTasks(), SimpleNamespace(id=p.user_id)
+                    )
+                    for _ in range(2)
+                ]
+            ),
+            timeout=3,
+        )
+    ids = {r["proposal"]["proposal_id"] for r in responses}
+    assert len(ids) == 1
+    assert (
+        await MemoryReviewProposal.find(
+            {"supersedes_proposal_id": p.proposal_id}
+        ).count()
+        == 1
+    )
+    assert (await MemoryReviewProposal.get(p.id)).active is False
+
+
+@pytest.mark.asyncio
+async def test_public_regeneration_cannot_replace_an_approval_in_progress(selection_db):
+    p = await proposal(state="checking").insert()
+    with pytest.raises(HTTPException) as exc:
+        await timeline_routes.regenerate_timeline_memory_review(
+            p.proposal_id, BackgroundTasks(), SimpleNamespace(id=p.user_id)
+        )
+    assert exc.value.status_code == 409
+    assert (await MemoryReviewProposal.get(p.id)).state == "checking"
+    assert (
+        await MemoryReviewProposal.find(
+            {"supersedes_proposal_id": p.proposal_id}
+        ).count()
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_regeneration_feedback_survives_crash_before_successor_insert(
+    selection_db, monkeypatch
+):
+    p = await proposal(state="pending").insert()
+    original_insert = MemoryReviewProposal.insert
+    monkeypatch.setattr(
+        MemoryReviewProposal,
+        "insert",
+        AsyncMock(side_effect=RuntimeError("interrupted insert")),
+    )
+    with pytest.raises(RuntimeError, match="interrupted"):
+        await timeline_routes.regenerate_timeline_memory_review(
+            p.proposal_id,
+            BackgroundTasks(),
+            SimpleNamespace(id=p.user_id),
+            timeline_routes.RegenerateMemoryReviewRequest(
+                feedback="Remove unsupported details"
+            ),
+        )
+    old = await MemoryReviewProposal.get(p.id)
+    assert old.replacement_feedback == "Remove unsupported details"
+    assert old.state == "regenerating"
+    monkeypatch.setattr(MemoryReviewProposal, "insert", original_insert)
+    replacement = await review.queue_memory_review_regeneration(
+        old, decision_owned=True
+    )
+    assert replacement.revision_feedback == old.replacement_feedback
+    again = await review.queue_memory_review_regeneration(
+        await MemoryReviewProposal.get(p.id)
+    )
+    assert again.proposal_id == replacement.proposal_id
+    with pytest.raises(review.MemoryReviewError, match="current draft"):
+        await review.queue_memory_review_regeneration(
+            await MemoryReviewProposal.get(p.id), feedback="Different correction"
+        )

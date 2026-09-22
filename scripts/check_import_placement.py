@@ -23,6 +23,9 @@ dependency" without a comment:
     except ImportError:
         return
 
+Tests may import within a test or fixture to keep individual test runs isolated
+from unrelated dependencies. Test modules and conftest.py are exempt.
+
 Usage: check_import_placement.py [FILE ...]   (no args = every tracked .py file)
 """
 
@@ -159,6 +162,13 @@ def _describe(node: ast.stmt) -> str:
 
 
 def check_file(path: Path) -> list[Violation]:
+    if (
+        "tests" in path.parts
+        or path.name.startswith("test_")
+        or path.name.endswith("_test.py")
+        or path.name == "conftest.py"
+    ):
+        return []
     try:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):

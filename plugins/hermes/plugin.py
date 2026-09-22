@@ -21,12 +21,14 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+import backend.services.dialogue.capture as capture
 from backend.plugins.base import (
     BasePlugin,
     PluginConnectivityError,
     PluginContext,
     PluginResult,
 )
+from backend.services.voice_latency import timing_span
 
 logger = logging.getLogger(__name__)
 
@@ -256,11 +258,12 @@ class HermesPlugin(BasePlugin):
 
         try:
             logger.info(f"Forwarding command to Hermes: '{command}'")
-            resp = await self._client.post(
-                f"{self.api_url}/v1/chat/completions",
-                json=payload,
-                headers=self._headers(session_id=conversation_id),
-            )
+            async with timing_span("agent", detail="hermes_full_reply"):
+                resp = await self._client.post(
+                    f"{self.api_url}/v1/chat/completions",
+                    json=payload,
+                    headers=self._headers(session_id=conversation_id),
+                )
             resp.raise_for_status()
             data = resp.json()
 
@@ -272,7 +275,8 @@ class HermesPlugin(BasePlugin):
             # the channel has context. Each line is prefixed for multi-line input.
             quoted = "\n".join(f"> {line}" for line in command.splitlines())
             discord_text = f"{quoted}\n\n{reply}" if quoted else reply
-            await self._push_to_discord(discord_text)
+            async with timing_span("notification", detail="discord"):
+                await self._push_to_discord(discord_text)
 
             return PluginResult(
                 success=True,
@@ -332,17 +336,9 @@ class HermesPlugin(BasePlugin):
             )
 
     async def on_transcript(self, context: PluginContext) -> Optional[PluginResult]:
-        """
-        Forward a keyword-triggered command to Hermes and return its reply.
-
-        The router has already detected the "hermes" keyword and stripped it,
-        placing the remaining text in ``context.data["command"]``.
-        """
-        return await self._dispatch_command(
-            command=context.data.get("command"),
-            conversation_id=context.data.get("conversation_id"),
-            empty_message="I heard the Hermes keyword but no command followed it.",
-        )
+        # Committed, explicitly engaged audio is routed by the wake/voice owner.
+        # Passive transcription is evidence, not authorization for an action.
+        return None
 
     async def on_wake_word_detected(
         self, context: PluginContext
@@ -376,11 +372,8 @@ class HermesPlugin(BasePlugin):
                 },
                 should_continue=True,
             )
-        return await self._dispatch_command(
-            command=context.data.get("command"),
-            conversation_id=context.data.get("conversation_id"),
-            empty_message="I heard the Hermes wake word but couldn't make out the command.",
-        )
+
+        return await capture.from_plugin(context, "hermes")
 
     async def on_plugin_action(self, context: PluginContext) -> Optional[PluginResult]:
         """Deliver a targeted notification without invoking the Hermes agent.

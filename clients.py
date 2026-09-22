@@ -8,7 +8,7 @@ services on Linux, launchd agents on macOS), not containers, so services.py's
 compose machinery never touches them. This module is the single place that
 knows how to install/inspect/restart them, shared by:
 
-  - ``services.py client ...``            (CLI install/status/uninstall)
+  - ``./services client ...``            (CLI install/status/uninstall)
   - ``updates.py``                        (restart installed clients after a code update)
   - ``edge/service_manager.py``           (expose + control them from the hub WebUI)
   - the components' own CLIs              (e.g. ``chronicle-tray install``)

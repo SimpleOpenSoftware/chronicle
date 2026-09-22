@@ -34,6 +34,8 @@ from backend.controllers import data_audit_controller
 from backend.controllers.queue_controller import JOB_RESULT_TTL, default_queue
 from backend.models.annotation import Annotation, AnnotationType
 from backend.models.conversation import Conversation
+from backend.services import privacy
+from backend.services.speaker_enrollment import capture_evidence
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.users import User
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
@@ -52,6 +54,34 @@ MAX_PER_CONVERSATION = 2
 SCORE_CONCURRENCY = 4
 
 W_NOVELTY, W_UNCERTAINTY, W_DURATION = 0.40, 0.35, 0.25
+
+
+async def _require_recordings(rows, visibility=None):
+    """Keep the original evidence owners' policies across asynchronous work."""
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    if any(not row.get("conversation_id") for row in rows):
+        raise privacy.PrivacyHeld()
+    if len(await visibility.filter(rows)) != len(rows):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
+    return visibility
+
+
+async def _require_cluster(cluster, visibility=None):
+    """A cluster depends on the corpus used to form it, including other groups."""
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    identifiers = cluster.get("evidence_conversation_ids")
+    members = cluster.get("members")
+    if (
+        not identifiers
+        or not members
+        or not {member.get("conversation_id") for member in members} <= set(identifiers)
+    ):
+        raise privacy.PrivacyHeld()
+    await visibility.require_receipt(cluster.get("privacy_revisions"))
+    return await _require_recordings(
+        [{"conversation_id": identifier} for identifier in identifiers], visibility
+    )
 
 
 def _reviews_collection():
@@ -107,7 +137,25 @@ async def list_unknown_clusters(user: User, limit: int = 50):
         .sort("segment_count", -1)
         .limit(limit)
     )
-    return {"clusters": await cursor.to_list(length=limit)}
+    rows = await cursor.to_list(length=limit)
+    visible, checks = [], []
+    for row in rows:
+        visibility = privacy.ConversationPrivacyFilter()
+        checks.append(visibility)
+        try:
+            await _require_cluster(row, visibility)
+        except privacy.PrivacyHeld:
+            continue
+        visible.append(
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"privacy_revisions", "evidence_conversation_ids"}
+            }
+        )
+    for visibility in checks:
+        await visibility.assert_current()
+    return {"clusters": visible}
 
 
 async def decide_unknown_cluster(
@@ -137,6 +185,7 @@ async def decide_unknown_cluster(
             {"$set": {"status": "dismissed", "decided_at": datetime.now(timezone.utc)}},
         )
         return {"status": "dismissed"}
+    visibility = await _require_cluster(cluster)
     if not speaker_name or is_non_enrollable_speaker(speaker_name):
         return JSONResponse(
             status_code=422, content={"error": "A real speaker name is required"}
@@ -188,18 +237,19 @@ async def decide_unknown_cluster(
             validated_segments.append((member, ref, index, segments[index]))
 
     annotations = 0
-    for member, ref, index, segment in validated_segments:
-        await Annotation(
-            annotation_type=AnnotationType.DIARIZATION,
-            user_id=str(user.user_id),
-            conversation_id=member["conversation_id"],
-            segment_index=index,
-            original_speaker=segment.get("speaker") or "",
-            corrected_speaker=speaker_name,
-            segment_start_time=ref["start"],
-            processed=False,
-        ).insert()
-        annotations += 1
+    async with visibility.publication():
+        for member, ref, index, segment in validated_segments:
+            await Annotation(
+                annotation_type=AnnotationType.DIARIZATION,
+                user_id=str(user.user_id),
+                conversation_id=member["conversation_id"],
+                segment_index=index,
+                original_speaker=segment.get("speaker") or "",
+                corrected_speaker=speaker_name,
+                segment_start_time=ref["start"],
+                processed=False,
+            ).insert()
+            annotations += 1
 
     client = SpeakerRecognitionClient()
     existing_speaker = await client.get_speaker_by_name(
@@ -220,37 +270,56 @@ async def decide_unknown_cluster(
         )
         if not ref or ref["duration"] < MIN_CLIP_SECONDS:
             continue
+        await visibility.assert_current()
+        evidence_records = await capture_evidence(
+            visibility, [member["conversation_id"]]
+        )
         wav = await reconstruct_audio_segment(
             member["conversation_id"], ref["start"], ref["end"]
         )
+        await visibility.assert_current()
         if existing_speaker:
             result = await client.append_to_speaker(
-                existing_speaker["id"], wav, user_id=str(user.user_id)
+                existing_speaker["id"],
+                wav,
+                user_id=str(user.user_id),
+                speaker_name=speaker_name,
+                conversation_ids=[member["conversation_id"]],
+                visibility=visibility,
+                evidence_records=evidence_records,
             )
             if not result.get("error"):
                 appended += 1
         else:
             result = await client.enroll_new_speaker(
-                speaker_name, wav, user_id=str(user.user_id)
+                speaker_name,
+                wav,
+                user_id=str(user.user_id),
+                conversation_ids=[member["conversation_id"]],
+                visibility=visibility,
+                evidence_records=evidence_records,
             )
             if not result.get("error"):
                 enrolled += 1
                 existing_speaker = await client.get_speaker_by_name(
                     speaker_name, user_id=str(user.user_id)
                 )
+        await visibility.assert_current()
 
-    await collection.update_one(
-        {"_id": cluster["_id"]},
-        {
-            "$set": {
-                "status": "confirmed",
-                "speaker_name": speaker_name,
-                "accepted_identity_keys": list(accepted),
-                "decided_at": datetime.now(timezone.utc),
-            }
-        },
-    )
+    async with visibility.publication():
+        await collection.update_one(
+            {"_id": cluster["_id"]},
+            {
+                "$set": {
+                    "status": "confirmed",
+                    "speaker_name": speaker_name,
+                    "accepted_identity_keys": list(accepted),
+                    "decided_at": datetime.now(timezone.utc),
+                }
+            },
+        )
     apply_result = await data_audit_controller.apply_triage(user)
+    await visibility.assert_current()
     return {
         "status": "confirmed",
         "annotations_created": annotations,
@@ -361,8 +430,11 @@ async def _gallery_health(
     }
 
 
-async def _candidate_pool(user: User, speaker_name: str, reviewed: set) -> list:
+async def _candidate_pool(
+    user: User, speaker_name: str, reviewed: set, *, visibility=None
+) -> list:
     """All unreviewed candidate clips for a speaker, with cheap priors only."""
+    visibility = visibility or privacy.ConversationPrivacyFilter()
     query = {
         "deleted": {"$ne": True},
         "audio_archived": {"$ne": True},
@@ -391,6 +463,8 @@ async def _candidate_pool(user: User, speaker_name: str, reviewed: set) -> list:
             "transcript_versions.segments.segment_type": 1,
         },
     ):
+        if not await visibility.filter([doc]):
+            continue
         segments = _active_segments(doc)
         speaker_present = any(_effective_label(s) == speaker_name for s in segments)
         if not speaker_present:
@@ -433,6 +507,7 @@ async def _candidate_pool(user: User, speaker_name: str, reviewed: set) -> list:
                     "stored_confidence": seg.get("confidence"),
                 }
             )
+    await visibility.assert_current()
     return pool
 
 
@@ -467,22 +542,23 @@ async def _score_clip(
     sem: asyncio.Semaphore,
     clip: dict,
     speaker_id: str,
+    *,
+    visibility=None,
 ) -> Optional[dict]:
     async with sem:
+        visibility = await _require_recordings([clip], visibility)
         try:
             wav = await reconstruct_audio_segment(
                 clip["conversation_id"], clip["start"], clip["end"]
             )
-        except Exception as e:
-            logger.warning(
-                "Guided enrollment: reconstruction failed for %s [%s-%s]: %s",
-                clip["conversation_id"],
-                clip["start"],
-                clip["end"],
-                e,
-            )
+        except privacy.PrivacyHeld:
+            raise
+        except Exception:
+            logger.warning("Guided enrollment: audio reconstruction failed")
             return None
+        await visibility.assert_current()
         scores = await speaker_client.score_enrollment_candidate(wav, speaker_id)
+        await visibility.assert_current()
     if scores.get("error") or scores.get("sim_centroid") is None:
         return None
     return {**clip, "scores": scores}
@@ -550,6 +626,7 @@ async def suggest_clips(
     """
     batch_size = max(1, min(batch_size, 8))
     max_scan = max(batch_size, min(max_scan, 48))
+    visibility = privacy.ConversationPrivacyFilter()
 
     speaker_client = SpeakerRecognitionClient()
     if not speaker_client.enabled:
@@ -562,25 +639,38 @@ async def suggest_clips(
             status_code=404,
             content={"error": f"No enrolled speaker named '{speaker_name}'"},
         )
-    reviewed = {
-        _clip_key(r["conversation_id"], r["segment_start"])
-        async for r in _reviews_collection().find(
+    review_rows = (
+        await _reviews_collection()
+        .find(
             {"speaker_name": speaker_name},
             {"conversation_id": 1, "segment_start": 1},
         )
+        .to_list()
+    )
+    reviewed = {
+        _clip_key(r["conversation_id"], r["segment_start"])
+        for r in await visibility.filter(review_rows)
     }
 
     threshold = get_diarization_settings().get("similarity_threshold", 0.5)
-    pool = await _candidate_pool(user, speaker_name, reviewed)
+    pool = await _candidate_pool(user, speaker_name, reviewed, visibility=visibility)
     shortlist = _shortlist(pool, threshold, max_scan)
 
     sem = asyncio.Semaphore(SCORE_CONCURRENCY)
     scored = await asyncio.gather(
         *(
-            _score_clip(speaker_client, sem, clip, gallery["speaker_id"])
+            _score_clip(
+                speaker_client, sem, clip, gallery["speaker_id"], visibility=visibility
+            )
             for clip in shortlist
-        )
+        ),
+        return_exceptions=True,
     )
+    # Drain siblings before propagating a hold; no scoring may outlive the request.
+    for result in scored:
+        if isinstance(result, BaseException):
+            raise result
+    await visibility.assert_current()
     ranked = sorted(
         filter(
             None,
@@ -602,6 +692,7 @@ async def suggest_clips(
     discovery_rows = (
         await _discovery_collection().find(discovery_query, {"_id": 0}).to_list()
     )
+    discovery_rows = await visibility.filter(discovery_rows)
     discovery_count = len(discovery_rows)
     combined = {
         _clip_key(candidate["conversation_id"], candidate["start"]): candidate
@@ -631,6 +722,7 @@ async def suggest_clips(
         per_conv[cid] = per_conv.get(cid, 0) + 1
         batch.append(clip)
 
+    await visibility.assert_current()
     return {
         "speaker": gallery,
         "threshold": threshold,
@@ -789,6 +881,7 @@ async def enqueue_local_mining(user: User, speaker_name: str, paths: List[str]):
 
 
 async def corpus_discovery_state(user: User, speaker_name: str):
+    visibility = privacy.ConversationPrivacyFilter()
     client = SpeakerRecognitionClient()
     gallery = await _gallery_stats(client, speaker_name, str(user.user_id))
     if not gallery:
@@ -802,16 +895,22 @@ async def corpus_discovery_state(user: User, speaker_name: str):
     }
     run = await _discovery_runs_collection().find_one(key, {"_id": 0})
     job_id = run.get("job_id") if run else None
+    candidates = (
+        await _discovery_collection().find(key, {"conversation_id": 1}).to_list()
+    )
+    candidates = await visibility.filter(candidates)
+    await visibility.assert_current()
     return {
         "speaker_name": gallery["speaker_name"],
         "job_id": job_id,
         "status": _job_status(job_id),
-        "matched_segments": await _discovery_collection().count_documents(key),
+        "matched_segments": len(candidates),
     }
 
 
 async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
     """Record review decisions and enroll clips with a confirmed identity."""
+    visibility = await _require_recordings(decisions)
     speaker_client = SpeakerRecognitionClient()
     if not speaker_client.enabled:
         return JSONResponse(
@@ -838,6 +937,7 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
         [],
     )
     for decision in decisions:
+        await visibility.assert_current()
         conversation_id = decision.get("conversation_id")
         start = decision.get("start")
         end = decision.get("end")
@@ -872,20 +972,32 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
                 )
                 if not target_gallery:
                     raise ValueError(f"No enrolled speaker named '{enrollment_target}'")
+                await visibility.assert_current()
+                evidence_records = await capture_evidence(visibility, [conversation_id])
                 wav = await reconstruct_audio_segment(conversation_id, start, end)
+                await visibility.assert_current()
                 result = await speaker_client.append_to_speaker(
-                    target_gallery["speaker_id"], wav, user_id=str(user.user_id)
+                    target_gallery["speaker_id"],
+                    wav,
+                    user_id=str(user.user_id),
+                    speaker_name=enrollment_target,
+                    conversation_ids=[conversation_id],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                await visibility.assert_current()
                 if result.get("error"):
-                    enroll_error = result["error"]
+                    enroll_error = "Speaker enrollment failed"
                 elif result.get("status") == "already_enrolled":
                     skipped += 1
                 else:
                     enrolled += 1
                     if enrollment_target != speaker_name:
                         reassigned += 1
-            except Exception as e:
-                enroll_error = str(e)
+            except privacy.PrivacyHeld:
+                raise
+            except Exception:
+                enroll_error = "Speaker enrollment failed"
             if enroll_error:
                 errors.append({"clip": decision, "error": enroll_error})
         elif review_decision == "reject":
@@ -897,29 +1009,31 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
         elif review_decision == "bad_clip":
             bad_clips += 1
 
-        await reviews.update_one(
-            {
-                "speaker_name": speaker_name,
-                "conversation_id": conversation_id,
-                "segment_start": round(float(original_start), 3),
-            },
-            {
-                "$set": {
-                    "speaker_id": gallery["speaker_id"],
-                    "segment_end": round(float(original_end), 3),
-                    "selected_start": round(float(start), 3),
-                    "selected_end": round(float(end), 3),
-                    "decision": review_decision,
-                    "actual_speaker": enrollment_target,
-                    "enrolled": enrollment_target is not None and enroll_error is None,
-                    "enroll_error": enroll_error,
-                    "scores": decision.get("scores"),
-                    "reviewed_by": str(user.user_id),
-                    "reviewed_at": datetime.now(timezone.utc),
-                }
-            },
-            upsert=True,
-        )
+        async with visibility.publication():
+            await reviews.update_one(
+                {
+                    "speaker_name": speaker_name,
+                    "conversation_id": conversation_id,
+                    "segment_start": round(float(original_start), 3),
+                },
+                {
+                    "$set": {
+                        "speaker_id": gallery["speaker_id"],
+                        "segment_end": round(float(original_end), 3),
+                        "selected_start": round(float(start), 3),
+                        "selected_end": round(float(end), 3),
+                        "decision": review_decision,
+                        "actual_speaker": enrollment_target,
+                        "enrolled": enrollment_target is not None
+                        and enroll_error is None,
+                        "enroll_error": enroll_error,
+                        "scores": decision.get("scores"),
+                        "reviewed_by": str(user.user_id),
+                        "reviewed_at": datetime.now(timezone.utc),
+                    }
+                },
+                upsert=True,
+            )
 
     speaker_after = await _gallery_stats(
         speaker_client, speaker_name, str(user.user_id)
@@ -941,6 +1055,8 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
         )
     }
     snapshot = {
+        "evidence_conversation_ids": sorted({d["conversation_id"] for d in decisions}),
+        "privacy_revisions": visibility.revision_receipt(),
         "speaker_id": gallery["speaker_id"],
         "speaker_name": speaker_name,
         "reviewed_by": str(user.user_id),
@@ -957,10 +1073,12 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
             "bad_clips": bad_clips,
         },
     }
-    await _batches_collection().insert_one(snapshot)
+    async with visibility.publication():
+        await _batches_collection().insert_one(snapshot)
     benchmark_job_id = None
     discovery_job_id = None
     if enrolled > 0:
+        await visibility.assert_current()
         benchmark_job = default_queue.enqueue(
             run_speaker_benchmark_job,
             user_id=str(user.user_id),
@@ -973,6 +1091,7 @@ async def decide_clips(user: User, speaker_name: str, decisions: List[dict]):
         if isinstance(discovery_response, dict):
             discovery_job_id = discovery_response.get("job_id")
 
+    await visibility.assert_current()
     return {
         "speaker": speaker_after,
         "health_before": health_before,
@@ -1173,11 +1292,35 @@ async def enrollment_history(user: User, speaker_name: str, limit: int = 50):
         .sort("created_at", -1)
         .limit(max(1, min(limit, 200)))
     ):
+        visibility = privacy.ConversationPrivacyFilter()
+        identifiers = row.get("evidence_conversation_ids")
+        if not identifiers:
+            continue
+        try:
+            await visibility.require_receipt(row.get("privacy_revisions"))
+            await _require_recordings(
+                [{"conversation_id": identifier} for identifier in identifiers],
+                visibility,
+            )
+        except privacy.PrivacyHeld:
+            continue
         created_at = row.get("created_at")
         if isinstance(created_at, datetime):
             row["created_at"] = created_at.isoformat()
-        rows.append(row)
-    return {"speaker_name": speaker_name, "sessions": rows}
+        rows.append((row, visibility))
+    for _, visibility in rows:
+        await visibility.assert_current()
+    return {
+        "speaker_name": speaker_name,
+        "sessions": [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"evidence_conversation_ids", "privacy_revisions"}
+            }
+            for row, _ in rows
+        ],
+    }
 
 
 async def enqueue_benchmark(user: User):
@@ -1197,6 +1340,17 @@ async def latest_benchmark(user: User):
         .database["speaker_benchmark_runs"]
         .find_one({"user_id": str(user.user_id)}, {"_id": 0}, sort=[("created_at", -1)])
     )
+    if row:
+        visibility = privacy.ConversationPrivacyFilter()
+        await visibility.require_receipt(row.get("privacy_revisions"))
+        identifiers = row.get("evidence_conversation_ids")
+        if not isinstance(identifiers, list):
+            raise privacy.PrivacyHeld()
+        await _require_recordings(
+            [{"conversation_id": identifier} for identifier in identifiers], visibility
+        )
+        row.pop("evidence_conversation_ids")
+        row.pop("privacy_revisions")
     if row and isinstance(row.get("created_at"), datetime):
         row["created_at"] = row["created_at"].isoformat()
     return {"report": row}

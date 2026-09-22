@@ -22,6 +22,7 @@ from backend.config_loader import get_backend_config
 from backend.model_registry import get_models_registry
 from backend.models.conversation import Conversation
 from backend.prompt_registry import get_prompt_registry
+from backend.services import privacy
 from backend.services.plugin_service import get_plugin_router
 
 from .base import (
@@ -264,6 +265,7 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         sample_rate: int,
         *,
         diarize: bool,
+        context_info: Optional[str] = None,
     ) -> tuple[Any | None, dict | None, dict | None]:
         """Return ``(collection, key, result)`` for the paid-response cache."""
         if self.model.model_provider == "mock":
@@ -281,6 +283,9 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
                     "config": config,
                     "diarize": diarize,
                     "sample_rate": sample_rate,
+                    "context_sha256": hashlib.sha256(
+                        (context_info or "").encode()
+                    ).hexdigest(),
                 },
                 sort_keys=True,
                 default=str,
@@ -305,12 +310,14 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         sample_rate: int,
         *,
         diarize: bool = False,
+        context_info: Optional[str] = None,
     ) -> dict | None:
         """Look up a response without ever calling the transcription provider."""
         _cache, _cache_key, result = await self._lookup_cached_transcription(
             audio_data,
             sample_rate,
             diarize=diarize,
+            context_info=context_info,
         )
         if result is not None:
             logger.info(
@@ -328,6 +335,7 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         context_info: Optional[str] = None,
         progress_callback=None,
         priority: bool = False,
+        privacy_checks: list | None = None,
         **kwargs,
     ) -> dict:
         """Transcribe with a persistent response cache.
@@ -337,15 +345,20 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         speaker mining over backup files) must not bill twice. The normalized
         result is stored in Mongo keyed by the audio content hash plus the
         provider configuration (minus the API key, so key rotation keeps the
-        cache). Hot-word/context hints are deliberately NOT part of the key —
-        a hint tweak isn't worth re-billing the whole corpus. Cache failures
-        never block transcription.
+        cache). Context is an exact model input: changing or withholding private
+        vocabulary must not reuse a response influenced by that vocabulary.
+        Cache failures never block transcription.
         """
+        for owner, snapshot in privacy_checks or []:
+            await privacy.assert_current(owner, snapshot)
         cache, cache_key, cached_result = await self._lookup_cached_transcription(
             audio_data,
             sample_rate,
             diarize=diarize,
+            context_info=context_info,
         )
+        for owner, snapshot in privacy_checks or []:
+            await privacy.assert_current(owner, snapshot)
         if cached_result is not None:
             logger.info(
                 f"♻️ Transcription cache hit for '{self._name}' "
@@ -362,9 +375,14 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
                 context_info=context_info,
                 progress_callback=progress_callback,
                 priority=priority,
+                privacy_checks=privacy_checks,
                 **kwargs,
             )
+        except privacy.PrivacyHeld:
+            raise
         except Exception:
+            for owner, snapshot in privacy_checks or []:
+                await privacy.assert_current(owner, snapshot)
             registry = get_models_registry()
             fallback_name = (
                 registry.defaults.get("fallback_stt")
@@ -386,8 +404,12 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
                 context_info=context_info,
                 progress_callback=progress_callback,
                 priority=priority,
+                privacy_checks=privacy_checks,
                 **kwargs,
             )
+
+        for owner, snapshot in privacy_checks or []:
+            await privacy.assert_current(owner, snapshot)
 
         # Don't cache an empty transcript: the key doesn't cover the ASR
         # service's gate settings, so a cached "" would outlive a threshold change.
@@ -423,6 +445,7 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         context_info: Optional[str] = None,
         progress_callback=None,
         priority: bool = False,
+        privacy_checks: list | None = None,
         **kwargs,
     ) -> dict:
         # Special handling for mock provider (no HTTP server needed)
@@ -502,7 +525,7 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         if hot_words_str:
             logger.debug(
                 f"ASR hint for {self.model.name}: kind={hint_kind}, "
-                f"text={hot_words_str[:80]!r}"
+                f"characters={len(hot_words_str)}"
             )
 
         # For Deepgram: inject keyword boost as the keyterm query param.
@@ -527,6 +550,8 @@ class RegistryBatchTranscriptionProvider(BatchTranscriptionProvider):
         try:
             timeouts = httpx.Timeout(timeout, read=read_timeout)
             async with httpx.AsyncClient(timeout=timeouts) as client:
+                for owner, snapshot in privacy_checks or []:
+                    await privacy.assert_current(owner, snapshot)
                 if method == "POST":
                     if use_multipart:
                         # Send as multipart file upload (for Parakeet/VibeVoice)
@@ -1011,7 +1036,10 @@ class RegistryStreamingTranscriptionProvider(StreamingTranscriptionProvider):
 
 
 def get_transcription_provider(
-    provider_name: Optional[str] = None, mode: Optional[str] = None
+    provider_name: Optional[str] = None,
+    mode: Optional[str] = None,
+    *,
+    allow_fallback: bool = True,
 ) -> Optional[BaseTranscriptionProvider]:
     """Return a registry-driven transcription provider.
 
@@ -1035,7 +1063,9 @@ def get_transcription_provider(
     # batch mode
     if not registry.get_default("stt"):
         return None
-    return RegistryBatchTranscriptionProvider()
+    return RegistryBatchTranscriptionProvider(
+        model_name=None if allow_fallback else registry.get_default("stt").name
+    )
 
 
 def is_transcription_available(mode: str = "batch") -> bool:

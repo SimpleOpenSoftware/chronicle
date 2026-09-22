@@ -487,7 +487,7 @@ def settings_dict() -> dict[str, Any]:
 
 def build_executor():
     settings = settings_dict()
-    executor = str(settings.get("executor") or "codex")
+    executor = str(settings.get("executor") or "pi")
     if executor == "codex":
         return CodexTimelineExecutor(settings.get("codex") or {})
     if executor == "pi":

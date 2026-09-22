@@ -17,6 +17,26 @@ from backend.services.transcript_integrity import (
     validate_and_normalize_transcript_timing,
 )
 
+_EMPTY_GALLERY = {
+    "catalog_id": "d" * 32,
+    "revision": "a" * 64,
+    "unverified_speaker_ids": [],
+    "held_speaker_ids": [],
+    "active_operation_ids": [],
+}
+
+
+async def checked_gallery_result(result):
+    from backend.services.speaker_gallery_privacy import GalleryRead, GalleryResult
+
+    client = SimpleNamespace(
+        service_url="http://synthetic-speaker.invalid",
+        enrollment_catalog=AsyncMock(return_value=dict(_EMPTY_GALLERY)),
+    )
+    scope = GalleryRead(client, user_id="user")
+    await scope.start()
+    return GalleryResult(result, scope)
+
 
 def wav_bytes(frames=800):
     output = io.BytesIO()
@@ -302,6 +322,8 @@ async def test_speaker_majority_vote_reconstructs_and_identifies_samples_in_one_
     )
     client = module.SpeakerRecognitionClient.__new__(module.SpeakerRecognitionClient)
     client.enabled = True
+    client.service_url = "http://synthetic-speaker.invalid"
+    client.enrollment_catalog = AsyncMock(return_value=dict(_EMPTY_GALLERY))
     client.identify_batch = identify_batch
     segments = [
         {"start": 1.0, "end": 4.0, "text": "one", "speaker": "A"},
@@ -346,7 +368,13 @@ async def test_transcription_job_quarantines_bad_cached_timing(monkeypatch):
         module,
         "gather_transcription_context",
         AsyncMock(
-            return_value=SimpleNamespace(combined="", hot_words="", user_jargon="")
+            return_value=SimpleNamespace(
+                combined="",
+                hot_words="",
+                user_jargon="",
+                privacy_checks=[],
+                reference_receipt=[],
+            )
         ),
     )
     transcribe = AsyncMock(
@@ -505,7 +533,10 @@ async def test_streaming_provider_error_body_survives_context_close(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_registered_speaker_job_runs_batch_provider_identification(monkeypatch):
+@pytest.mark.parametrize("late_gallery_change", [False, True])
+async def test_registered_speaker_job_runs_batch_provider_identification(
+    monkeypatch, late_gallery_change
+):
     # Imported here so monkeypatch targets the registered entrypoint module.
     from backend.workers import speaker_jobs as module
 
@@ -549,6 +580,9 @@ async def test_registered_speaker_job_runs_batch_provider_identification(monkeyp
                 }
             ]
         }
+    )
+    identify_provider_segments.return_value = await checked_gallery_result(
+        identify_provider_segments.return_value
     )
     fake_client = SimpleNamespace(
         enabled=True,
@@ -596,12 +630,40 @@ async def test_registered_speaker_job_runs_batch_provider_identification(monkeyp
         resolve_transcript_artifacts,
     )
 
+    if late_gallery_change:
+        from backend.services import privacy
+
+        scope = identify_provider_segments.return_value.gallery_scope
+
+        async def changed_labels(*args, **kwargs):
+            scope.client.enrollment_catalog.return_value = {
+                **_EMPTY_GALLERY,
+                "revision": "b" * 64,
+            }
+            return []
+
+        monkeypatch.setattr(module, "_human_speaker_annotations", changed_labels)
+        with pytest.raises(privacy.PrivacyHeld):
+            await module.recognise_speakers_job.__wrapped__("conversation", "source")
+        persist_diarization.assert_not_awaited()
+        persist_revision.assert_not_awaited()
+        conversation.save.assert_not_awaited()
+        return
+
     result = await module.recognise_speakers_job.__wrapped__(
         "conversation",
         "source",
     )
 
     assert result["success"] is True
+    receipt = identify_provider_segments.return_value.gallery_scope.receipt()
+    assert version.metadata["speaker_recognition"]["privacy_gallery_receipt"] == receipt
+    assert (
+        persist_diarization.await_args.kwargs["configuration"][
+            "privacy_gallery_receipt"
+        ]
+        == receipt
+    )
     assert result["identified_speakers"] == ["Aryan"]
     identify_provider_segments.assert_awaited_once_with(
         conversation_id="conversation",
@@ -847,16 +909,18 @@ async def test_registered_speaker_job_persists_word_clock_before_empty_pyannote_
         return derived
 
     async def identify_word_spans(**kwargs):
-        return {
-            "segments": [
-                {
-                    **segment,
-                    "identified_as": None,
-                    "confidence": 0.0,
-                }
-                for segment in kwargs["segments"]
-            ]
-        }
+        return await checked_gallery_result(
+            {
+                "segments": [
+                    {
+                        **segment,
+                        "identified_as": None,
+                        "confidence": 0.0,
+                    }
+                    for segment in kwargs["segments"]
+                ]
+            }
+        )
 
     client = SimpleNamespace(
         enabled=True,

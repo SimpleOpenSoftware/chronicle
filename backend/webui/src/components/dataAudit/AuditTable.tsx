@@ -246,7 +246,7 @@ export default function AuditTable({
                   )}
                   <div className="min-w-0">
                     <Link
-                      to={`/recordings/${r.conversation_id}`}
+                      to={`/data-audit/recordings/${r.conversation_id}`}
                       state={{ from: '/data-audit' }}
                       className="block truncate text-blue-600 dark:text-blue-400 hover:underline"
                     >

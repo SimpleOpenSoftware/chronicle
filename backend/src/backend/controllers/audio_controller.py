@@ -15,6 +15,7 @@ from typing import Literal
 
 from fastapi import UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from pymongo.errors import DuplicateKeyError
 from rq import Retry
 from rq.exceptions import NoSuchJobError
@@ -26,7 +27,11 @@ from backend.controllers.queue_controller import (
     start_post_conversation_jobs,
     transcription_queue,
 )
-from backend.models.audio_capture import AudioRangeRef
+from backend.models.audio_capture import (
+    AudioRangeRef,
+    ConversationTranscriptRevision,
+    TranscriptArtifact,
+)
 from backend.models.conversation import Conversation, create_conversation
 from backend.models.user import User
 from backend.services.audio_claims import apply_audio_ranges
@@ -55,6 +60,56 @@ def _same_audio_claim(left: AudioRangeRef, right: AudioRangeRef) -> bool:
         "capture_session_ids",
     )
     return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+async def _is_original_claim_after_silence_trim(
+    conversation: Conversation, audio_range: AudioRangeRef
+) -> bool:
+    """Recognize a replay using immutable evidence, without restoring trimmed audio.
+
+    Silence trimming changes the semantic claim after transcription. The active
+    projection must still describe that claim, and its original provider input
+    must exactly identify this retry; containment alone cannot establish identity.
+    """
+    if not conversation.active_transcript_revision_id:
+        return False
+    revision = await ConversationTranscriptRevision.find_one(
+        {
+            "revision_id": conversation.active_transcript_revision_id,
+            "conversation_id": conversation.conversation_id,
+        }
+    )
+    if revision is None or len(revision.transcript_artifact_ids) != 1:
+        return False
+    projection = revision.metadata.get("audio_projection")
+    if (
+        not isinstance(projection, dict)
+        or projection.get("operation") != "silence_trim"
+    ):
+        return False
+    try:
+        projected = [
+            AudioRangeRef.model_validate(value) for value in projection["audio_ranges"]
+        ]
+    except (KeyError, TypeError, ValidationError):
+        return False
+    if len(projected) != len(conversation.audio_ranges) or not all(
+        _same_audio_claim(left, right)
+        for left, right in zip(projected, conversation.audio_ranges)
+    ):
+        return False
+    artifact = await TranscriptArtifact.find_one(
+        {
+            "artifact_id": revision.transcript_artifact_ids[0],
+            "user_id": conversation.user_id,
+            "status": "complete",
+        }
+    )
+    return (
+        artifact is not None
+        and len(artifact.audio_ranges) == 1
+        and _same_audio_claim(artifact.audio_ranges[0], audio_range)
+    )
 
 
 def _batch_transcription_job(
@@ -154,9 +209,10 @@ async def materialize_and_process_audio_claim(
     elif len(conversation.audio_ranges) != 1 or not _same_audio_claim(
         conversation.audio_ranges[0], audio_range
     ):
-        raise ValueError(
-            f"segmentation key {segmentation_key} was reused for a different audio claim"
-        )
+        if not await _is_original_claim_after_silence_trim(conversation, audio_range):
+            raise ValueError(
+                f"segmentation key {segmentation_key} was reused for a different audio claim"
+            )
 
     if conversation.processing_enqueued_at is None:
         version_id = str(
@@ -220,6 +276,12 @@ async def upload_and_process_audio_files(
         source: Source of the upload (e.g., 'upload', 'gdrive')
         annotation_only: Create editable transcription records without memory extraction
     """
+    # Dataset purpose cannot be overridden by a personal memory preference.
+    if annotation_only or data_purpose == "annotation":
+        annotation_only = True
+        data_purpose = "annotation"
+        memory_excluded = True
+
     try:
         if not files:
             return JSONResponse(status_code=400, content={"error": "No files provided"})

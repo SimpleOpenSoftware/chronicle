@@ -1,3 +1,5 @@
+import { sourceDate } from '../../utils/sourceTime'
+
 export function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0) return '0s'
   const h = Math.floor(seconds / 3600)
@@ -18,7 +20,7 @@ export function formatClock(seconds: number): string {
 
 export function formatDate(iso: string | null): string {
   if (!iso) return '—'
-  return new Date(iso).toLocaleString()
+  return sourceDate(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
 }
 
 // Processing-status chip for a Data Audit row. Returns null for the normal

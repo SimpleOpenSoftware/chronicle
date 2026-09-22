@@ -11,6 +11,7 @@ from typing import List
 
 import yaml
 
+import backend.services.interaction_modes.voice.settings as settings
 from backend.config_loader import get_plugins_yml_path
 from backend.model_registry import get_models_registry
 
@@ -81,6 +82,12 @@ def has_windowed_batch_configured() -> bool:
     return False
 
 
+def has_conversational_voice_enabled() -> bool:
+    """Conversation and acoustic activation do not depend on optional plugins."""
+
+    return settings.VoiceSettings.load().enabled
+
+
 def has_wakeword_dispatch_enabled() -> bool:
     """
     Check if the wake-word dispatch worker should run.
@@ -95,6 +102,8 @@ def has_wakeword_dispatch_enabled() -> bool:
         True if an enabled plugin subscribes to ``wake_word.detected`` or owns an
         enabled interaction mode. Acoustic Hermes activation uses this worker too.
     """
+    if has_conversational_voice_enabled():
+        return True
     try:
         plugins_yml = get_plugins_yml_path()
         if not plugins_yml.exists():
@@ -120,6 +129,8 @@ def has_wakeword_dispatch_enabled() -> bool:
 
 def has_interaction_modes_enabled() -> bool:
     """Return True when an enabled plugin declares at least one mode."""
+    if has_conversational_voice_enabled():
+        return True
     try:
         plugins_yml = get_plugins_yml_path()
         if not plugins_yml.exists():

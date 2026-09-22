@@ -60,6 +60,10 @@ def recorder_argv(
         "disabled",
         "--use-all-monitors",
         "true",
+        # Leave scheduling headroom below privacy screening's 30-second gap
+        # limit. Pin the cadence across recorder power-profile transitions.
+        "--idle-capture-interval-ms",
+        "20000",
         "--use-pii-removal",
         "true",
         "--disable-keyboard-capture",

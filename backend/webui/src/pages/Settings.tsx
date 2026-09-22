@@ -209,8 +209,7 @@ export default function Settings() {
             Identity
           </h3>
           <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-            Names used to label who is speaking when extracting memories from chat.
-            Leave blank to fall back to the generic "User" and "Assistant".
+            Names used in chat memories. Blank names appear as “User” and “Assistant”.
           </p>
           <div className="space-y-3">
             <div>
@@ -820,12 +819,12 @@ function LLMOperationsCard({ data, onSaved }: { data: LLMOpsData; onSaved: () =>
       </h3>
 
       {data.runtime_routes?.length > 0 && (
-        <div className="mb-6 overflow-x-auto rounded-md border border-gray-200 dark:border-gray-700">
-          <div className="border-b border-gray-200 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-700 dark:border-gray-700 dark:bg-gray-900/30 dark:text-gray-300">
-            Selected runtime routes
-          </div>
+        <details className="mb-6 overflow-x-auto rounded-md border border-gray-200 dark:border-gray-700">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-gray-700 dark:text-gray-300">
+            Runtime route details
+          </summary>
           <table className="w-full text-xs">
-            <thead>
+            <thead className="text-gray-700 dark:text-gray-300">
               <tr className="border-b border-gray-200 dark:border-gray-700">
                 <th className="px-3 py-2 text-left">Workload</th>
                 <th className="px-3 py-2 text-left">Adapter</th>
@@ -855,7 +854,7 @@ function LLMOperationsCard({ data, onSaved }: { data: LLMOpsData; onSaved: () =>
               ))}
             </tbody>
           </table>
-        </div>
+        </details>
       )}
 
       <div className="overflow-x-auto">
@@ -995,6 +994,7 @@ function LLMOperationsCard({ data, onSaved }: { data: LLMOpsData; onSaved: () =>
 function SpeakerConfiguration({ user }: { user: any }) {
   const [speakerServiceStatus, setSpeakerServiceStatus] = useState<any>(null)
   const [enrolledSpeakers, setEnrolledSpeakers] = useState<any[]>([])
+  const [speakersUnavailable, setSpeakersUnavailable] = useState(false)
   const [primarySpeakers, setPrimarySpeakers] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -1022,6 +1022,10 @@ function SpeakerConfiguration({ user }: { user: any }) {
       if (configResponse.status === 'fulfilled') {
         setPrimarySpeakers(configResponse.value.data.primary_speakers || [])
       }
+
+      setSpeakersUnavailable(speakersResponse.status === 'rejected'
+        || speakersResponse.value.data.service_available === false
+        || (statusResponse.status === 'fulfilled' && statusResponse.value.data?.healthy === false))
 
       if (speakersResponse.status === 'fulfilled') {
         setEnrolledSpeakers(speakersResponse.value.data.speakers || [])
@@ -1109,7 +1113,7 @@ function SpeakerConfiguration({ user }: { user: any }) {
 
   // ↓ SpeakerConfiguration body continues below; new model-config cards live at file end.
   // Don't show the section if speaker service is explicitly disabled or unavailable
-  const shouldShowSection = speakerServiceStatus !== null || enrolledSpeakers.length > 0 || loading
+  const shouldShowSection = speakerServiceStatus !== null || enrolledSpeakers.length > 0 || loading || speakersUnavailable
 
   if (!shouldShowSection) {
     return null
@@ -1144,7 +1148,7 @@ function SpeakerConfiguration({ user }: { user: any }) {
             <div>
               <h4 className="text-sm font-medium text-yellow-800 dark:text-yellow-300">Speaker Service Unavailable</h4>
               <p className="text-sm text-yellow-700 dark:text-yellow-400 mt-1">
-                {speakerServiceStatus.message}. Speaker filtering will be disabled until service is available.
+                {speakerServiceStatus.message}. Enrolled speakers cannot be verified.
               </p>
             </div>
           </div>
@@ -1176,8 +1180,10 @@ function SpeakerConfiguration({ user }: { user: any }) {
         </div>
       )}
 
+      {!loading && speakersUnavailable && !speakerServiceStatus && <Alert tone="warning" className="mb-4">Enrolled speakers could not be loaded.</Alert>}
+
       {/* No Speakers Available */}
-      {!loading && enrolledSpeakers.length === 0 && (
+      {!loading && !speakersUnavailable && enrolledSpeakers.length === 0 && (
         <div className="text-center py-8">
           <Users className="h-12 w-12 text-gray-400 mx-auto mb-4" />
           <p className="text-gray-500 dark:text-gray-400">
@@ -1401,9 +1407,7 @@ function ActiveModelsCard({ isAdmin }: { isAdmin: boolean }) {
         Active Models
       </h3>
       <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-        The model each role uses. Cloud and local models both appear here. Switching STT
-        repoints the default only — to start/stop the local ASR container use ASR / TTS
-        Providers below.
+        Default model for each role. Saving changes routing; it does not start or stop provider services.
       </p>
       <div className="space-y-3">
         {ACTIVE_MODEL_ROLES.map(r => {
@@ -1469,6 +1473,8 @@ interface ModelForm {
   api_family: string
   model_name: string
   model_url: string
+  deployment: string
+  deployment_endpoint: string
   api_key: string
   description: string
   capabilities: string
@@ -1479,7 +1485,7 @@ interface ModelForm {
 function emptyModelForm(): ModelForm {
   return {
     name: '', model_type: 'llm', model_provider: 'openai', api_family: 'openai',
-    model_name: '', model_url: '', api_key: '', description: '',
+    model_name: '', model_url: '', deployment: '', deployment_endpoint: '', api_key: '', description: '',
     capabilities: '', embedding_dimensions: '', model_params: '',
   }
 }
@@ -1492,6 +1498,8 @@ function modelToForm(m: ModelView): ModelForm {
     api_family: m.api_family || 'openai',
     model_name: m.model_name,
     model_url: m.model_url,
+    deployment: m.deployment || '',
+    deployment_endpoint: m.deployment_endpoint || '',
     api_key: m.api_key || '',
     description: m.description || '',
     capabilities: (m.capabilities || []).join(', '),
@@ -1546,7 +1554,9 @@ function ModelRegistryCard({ isAdmin }: { isAdmin: boolean }) {
       model_provider: form.model_provider.trim() || 'unknown',
       api_family: form.api_family.trim() || 'openai',
       model_name: form.model_name.trim(),
-      model_url: form.model_url.trim(),
+      model_url: form.deployment ? '' : form.model_url.trim(),
+      deployment: form.deployment.trim() || null,
+      deployment_endpoint: form.deployment_endpoint.trim() || null,
       description: form.description.trim() || null,
     }
     // api_key: '' clears it; the mask sentinel is preserved by the backend.
@@ -1752,9 +1762,17 @@ function ModelEditModal({
             <label className={label}>Embedding dims</label>
             <Input value={form.embedding_dimensions} onChange={e => set('embedding_dimensions', e.target.value)} placeholder="e.g. 1536" />
           </div>
+          <div>
+            <label className={label}>Managed deployment (optional)</label>
+            <Input value={form.deployment} onChange={e => set('deployment', e.target.value)} placeholder="e.g. llm-services" />
+          </div>
+          <div>
+            <label className={label}>Deployment endpoint</label>
+            <Input value={form.deployment_endpoint} onChange={e => set('deployment_endpoint', e.target.value)} placeholder="e.g. chat or embeddings" disabled={!form.deployment} />
+          </div>
           <div className="col-span-2">
             <label className={label}>Base URL</label>
-            <Input value={form.model_url} onChange={e => set('model_url', e.target.value)} placeholder="https://api.openai.com/v1 (blank = Tailnet discovery)" />
+            <Input disabled={!!form.deployment} value={form.model_url} onChange={e => set('model_url', e.target.value)} placeholder="https://api.openai.com/v1 (blank = Tailnet discovery)" />
           </div>
           <div className="col-span-2">
             <label className={label}>API key</label>

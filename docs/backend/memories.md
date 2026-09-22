@@ -93,15 +93,52 @@ the service is ready; it does not make an unauthenticated Codex primary ready. R
 `codex login` in the host `CODEX_HOME` before starting that configuration.
 
 Pi is installed in the backend image and runs non-interactively with isolated runtime
-configuration. Chronicle resolves `memory.backends.pi.model` through its model
-registry, including the upstream model ID, URL, and API key. No host-side Pi login,
+configuration. Chronicle resolves each memory operation through its model
+registry (`llm_operations` and defaults), including the upstream model ID, URL, and API key. No host-side Pi login,
 `~/.pi` directory, auth volume, or hand-written `models.json` is required. The shipped
-default is Pi 0.83.0 on Node 22.19.0.
+default is Pi 0.85.1 on Node 22.19.0.
 
 The Pi process is not given Pi's built-in shell or filesystem tools. Chronicle disables
 them and loads a generated extension containing only the canonical vault tool schemas;
 calls cross a short-lived, bearer-authenticated loopback gateway into `VaultTools`.
 The search extension receives only the read-only search schemas.
+
+Inside that boundary, Pi runs reuse the public `createReadTool` and `createEditTool`
+factories from the pinned package. A run-owned Node helper computes against an
+in-memory note buffer; it receives no real vault path or model credentials. Python
+owns path/symlink confinement and the complete Redis-locked read → compute → validate
+→ save operation, including source attribution and review publication. Independent
+remote read/write callbacks would not preserve that transaction. This factory/custom
+operations pattern is supported by [Pi's extension API](https://pi.dev/docs/latest/extensions).
+
+`edit_note` requires each old fragment to occur exactly once before native editing.
+There is no fuzzy retry: reread and copy a unique exact anchor. This prevents native
+fuzzy matching from normalizing neighboring punctuation on the same line. The native
+engine still checks overlap, ambiguity and no-op batches. `edit_section`, person merges,
+category operations and validation remain Chronicle domain operations. Direct execution
+retains its Python edit engine and reader; it does not require Node or Pi.
+
+`read_note` uses zero-based line offsets (translated to Pi's one-based offsets), defaults
+to 200 lines and caps at 2000 lines/8000 source characters. Follow its continuation
+instructions. `read_slice(path, char_offset, max_chars)` handles very long individual
+lines: offsets count Unicode characters from the start of the decoded whole note,
+default size is 2000 and maximum is 8000. Both tools accept `refresh=true` to repeat an
+unchanged window in Pi. This minimal inspection tool is the selected shell equivalent;
+no Bash capability is enabled.
+
+Both retrieval executors collect distinct read/range windows under canonical note
+paths for synthesis and citations, replace repeated windows, and retain up to 64,000
+characters per note with the latest observations first. Final synthesis applies its
+additional total serialized-byte budget. `.base` views remain readable presentation
+references and are excluded from memory evidence. Complete tool observations remain in
+the run trace.
+
+The native helper starts lazily, serializes requests, uses a 10-second call deadline
+and a separate bounded queue wait, and is killed/reaped after transport failure or run
+shutdown (including cancellation). No native computation failure commits a vault edit.
+The bridge caps individual JSON messages at 32 MiB. Local tests need the pinned Pi
+0.85.1 installation on PATH, or `PI_BINARY` pointing to its executable; the helper is
+included in the backend wheel as package data.
 
 Write loops are bounded at 48 model/tool rounds. Pi additionally enforces an atomic
 192-call write cap at the gateway. Search is bounded at 6 tool rounds and 24 calls.
@@ -204,7 +241,7 @@ phone stand, the chai, and the air-fryer fries that `People/alex.md` and
 and judging whether two differently worded sentences carry the same fact, so a second
 agent does it (`agent/review_agent.py`):
 
-- **read-only** — `grep`/`glob`/`read_note` and a `report_findings` tool, so a review
+- **read-only** — `grep`/`glob`/`read_note`/`read_slice` and a `report_findings` tool, so a review
   cannot mutate the vault it judges;
 - **fresh context** — it sees the source and the lines actually added, never the
   writer's reasoning, so it cannot inherit the writer's conviction that the work was
@@ -255,7 +292,8 @@ search backends are read-only and operate over the vault with four tools:
 
 - `grep` — full-text ripgrep across the notes
 - `glob` — find notes by path/name pattern
-- `read_note` — read a specific note's contents
+- `read_note` — inspect a bounded line window of a specific note
+- `read_slice` — inspect a bounded character range, including within a very long line
 - `search_images` — rank saved images by what they *look* like, returning `Manual Memories/`
   note paths for `read_note`. Backed by the optional
   [ColPali service](../manual-memories.md#enrichment-and-recovery); when that is

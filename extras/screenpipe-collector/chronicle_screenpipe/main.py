@@ -9,6 +9,8 @@ import signal
 import sys
 from pathlib import Path
 
+import chronicle_screenpipe.privacy_history as privacy_history
+import chronicle_screenpipe.privacy_inventory as privacy_inventory
 import httpx
 
 from .collector import Collector, Config
@@ -117,6 +119,26 @@ def main() -> None:
         help="detect active calls from the PipeWire graph and tag forwarded audio",
     )
     sub.add_parser("run")
+    history = sub.add_parser(
+        "screen-history", help="hold a historical range and queue local screening"
+    )
+    history.add_argument(
+        "--start", required=True, help="inclusive ISO timestamp with timezone"
+    )
+    history.add_argument(
+        "--end", required=True, help="exclusive ISO timestamp with timezone"
+    )
+    inventory = sub.add_parser(
+        "refine-screen-inventory", help="queue original historical display inventories"
+    )
+    inventory.add_argument("--start", required=True)
+    inventory.add_argument("--end", required=True)
+    inventory.add_argument("--original-policy-version", required=True)
+    recheck = sub.add_parser(
+        "recheck-screen-gaps", help="recheck earlier sampling-gap holds locally"
+    )
+    recheck.add_argument("--start", required=True)
+    recheck.add_argument("--end", required=True)
     sub.add_parser("install-service")
     args = parser.parse_args()
     if args.command == "pair":
@@ -124,6 +146,37 @@ def main() -> None:
     elif args.command == "run":
         signal.signal(signal.SIGTERM, _shutdown_signal)
         Collector(load_config(), state_dir()).run()
+    elif args.command == "screen-history":
+
+        print(
+            json.dumps(
+                privacy_history.queue_history(
+                    load_config(), state_dir(), args.start, args.end
+                )
+            )
+        )
+    elif args.command == "recheck-screen-gaps":
+
+        print(
+            json.dumps(
+                privacy_history.queue_gap_rechecks(
+                    load_config(), state_dir(), args.start, args.end
+                )
+            )
+        )
+    elif args.command == "refine-screen-inventory":
+
+        print(
+            json.dumps(
+                privacy_inventory.queue_inventory(
+                    load_config(),
+                    state_dir(),
+                    args.start,
+                    args.end,
+                    args.original_policy_version,
+                )
+            )
+        )
     else:
         install_service()
 

@@ -33,10 +33,10 @@ export default function Layout() {
   // Single SSE connection for real-time updates across all pages
   const sseStatus = useSSE()
 
-  // Live unacknowledged-error count for the nav badge (admin only; refreshed by
+  // Live unacknowledged-event count for the nav badge (admin only; refreshed by
   // the SSE 'system.error' invalidation in useSSE).
   const { data: sysSummary } = useSystemEventsSummary(24, isAdmin)
-  const unackedErrors = sysSummary?.unacked ?? 0
+  const unackedEvents = sysSummary?.unacked ?? 0
 
   // Keep service outages visible from every page. The health endpoint includes
   // optional configured services (wake-word, speaker recognition, etc.), not
@@ -52,40 +52,48 @@ export default function Layout() {
     ? 'Health check unavailable'
     : unhealthyServices.join(', ')
 
-  const navigationItems = [
-    { path: '/live-record', label: 'Live Record', icon: Radio },
-    { path: '/chat', label: 'Chat', icon: MessageCircle },
-    { path: '/recordings', label: 'Recordings', icon: MessageSquare },
-    { path: '/timeline', label: 'Timeline', icon: CalendarDays },
-    { path: '/memory-ledger', label: 'Memory Ledger', icon: ScrollText },
-    { path: '/spaces', label: 'Memory Spaces', icon: BookOpen },
-    { path: '/users', label: 'User Management', icon: Users },
-
-    ...(isAdmin ? [
-      { path: '/upload', label: 'Upload Audio', icon: Upload },
-      // Wake-Word Lab is not its own row — it's a Data Audit sub-view, entered
-      // from that page's task hub (and kept highlighted under it while open).
-      { path: '/data-audit', label: 'Data Audit', icon: Sparkles },
-      { path: '/queue', label: 'Queue & Events', icon: Layers },
-      { path: '/plugins', label: 'Plugins', icon: Puzzle },
-      { path: '/finetuning', label: 'Training', icon: Zap },
-      { path: '/network', label: 'Network', icon: Network },
+  const navigationGroups = [
+    { label: 'Workspace', items: [
+      { path: '/live-record', label: 'Live Record', icon: Radio },
+      { path: '/chat', label: 'Chat', icon: MessageCircle },
+      { path: '/recordings', label: 'Recordings', icon: MessageSquare },
+      { path: '/timeline', label: 'Timeline', icon: CalendarDays },
+      ...(isAdmin ? [{ path: '/upload', label: 'Upload Audio', icon: Upload }] : []),
+    ] },
+    { label: 'Memory', items: [
+      { path: '/memory-ledger', label: 'Memory Ledger', icon: ScrollText },
+      { path: '/spaces', label: 'Memory Spaces', icon: BookOpen },
+    ] },
+    { label: 'Administration', items: [
+      { path: '/users', label: 'User Management', icon: Users },
+      ...(isAdmin ? [
+        { path: '/data-audit', label: 'Data Audit', icon: Sparkles },
+        { path: '/queue', label: 'Queue & Events', icon: Layers },
+        { path: '/plugins', label: 'Plugins', icon: Puzzle },
+        { path: '/finetuning', label: 'Training', icon: Zap },
+        { path: '/network', label: 'Network', icon: Network },
+      ] : []),
+    ] },
+    ...(isAdmin ? [{ label: 'System', items: [
       { path: '/system', label: 'System Status', icon: Activity },
-      { path: '/system-errors', label: 'System Errors', icon: AlertTriangle },
+      { path: '/system-errors', label: 'System Events', icon: AlertTriangle },
       { path: '/settings', label: 'Settings', icon: Settings },
-    ] : []),
+    ] }] : []),
   ]
+  const isCurrent = (path: string) => location.pathname === path || location.pathname.startsWith(path + '/') || (path === '/data-audit' && location.pathname === '/wakeword-lab')
 
   // Shared nav <li> items rendered in both the desktop sidebar and the mobile drawer
-  const navLinks = navigationItems.map(({ path, label, icon: Icon }) => (
+  const navLinks = navigationGroups.map(group => (
+    <li key={group.label} className="pt-3 first:pt-0">
+      <p className="px-3 pb-2 text-xs font-semibold tracking-wide text-[var(--tape-activity)]">{group.label}</p>
+      <ul className="space-y-1">{group.items.map(({ path, label, icon: Icon }) => (
     <li key={path}>
       <Link
         to={path}
-        className={`flex items-center space-x-3 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-          location.pathname === path ||
-          (path === '/spaces' && location.pathname.startsWith('/spaces/')) ||
-          (path === '/data-audit' && location.pathname === '/wakeword-lab')
-            ? 'bg-blue-100 text-blue-900 dark:bg-blue-900 dark:text-blue-100'
+        aria-current={isCurrent(path) ? 'page' : undefined}
+        className={`flex min-h-11 items-center space-x-3 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+          isCurrent(path)
+            ? 'bg-[var(--tape-selected)] text-[var(--tape-focus)] font-semibold'
             : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
         }`}
       >
@@ -106,12 +114,14 @@ export default function Layout() {
             </span>
           </span>
         )}
-        {path === '/system-errors' && unackedErrors > 0 && (
-          <span className="ml-auto inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-red-600 px-1.5 py-0.5 text-xs font-semibold text-white" title="Unacknowledged events">
-            {unackedErrors > 99 ? '99+' : unackedErrors}
+        {path === '/system-errors' && unackedEvents > 0 && (
+          <span className="ml-auto inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-[var(--tape-chip)] px-1.5 py-0.5 text-xs font-semibold text-[var(--tape-ink)]" title="Unacknowledged events; see System Status for current outages">
+            {unackedEvents > 99 ? '99+' : unackedEvents}
           </span>
         )}
       </Link>
+    </li>
+      ))}</ul>
     </li>
   ))
 
@@ -119,7 +129,7 @@ export default function Layout() {
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
       {/* Header */}
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16 gap-2">
             <div className="flex items-center space-x-2 sm:space-x-4 min-w-0">
               {/* Mobile drawer control */}
@@ -212,13 +222,13 @@ export default function Layout() {
       )}
 
       <div className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-4 lg:py-8">
-        <div className="flex flex-col lg:flex-row gap-8">
+        <div className="flex flex-col lg:flex-row gap-5">
           {/* Sidebar Navigation — desktop only; mobile uses the drawer above */}
           <nav
             aria-label="Primary navigation"
-            className={`${desktopSidebarOpen ? 'hidden lg:block' : 'hidden'} lg:w-64 flex-shrink-0`}
+            className={`${desktopSidebarOpen ? 'hidden lg:block' : 'hidden'} lg:w-60 flex-shrink-0`}
           >
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 p-4">
+            <div className="bg-[var(--chronicle-navigation)] rounded-lg border border-[var(--chronicle-border-subtle)] p-3">
               <ul className="space-y-2">
                 {navLinks}
               </ul>
@@ -227,7 +237,7 @@ export default function Layout() {
 
           {/* Main Content */}
           <main className="flex-1 min-w-0">
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 p-4 sm:p-6">
+            <div className="bg-[var(--tape-paper)] rounded-lg border border-[var(--chronicle-border-subtle)] p-4 sm:p-6">
               <Outlet />
             </div>
           </main>
@@ -236,7 +246,7 @@ export default function Layout() {
 
       {/* Footer */}
       <footer className="bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 mt-auto">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="text-center text-sm text-gray-500 dark:text-gray-400">
             Chronicle — understand everything, everywhere, all at once.
           </div>
@@ -250,7 +260,7 @@ export default function Layout() {
 }
 
 const sseStatusConfig: Record<SSEStatus, { color: string; label: string }> = {
-  connected:    { color: 'bg-green-500', label: 'Live' },
+  connected:    { color: 'bg-green-500', label: 'Connected' },
   connecting:   { color: 'bg-gray-400',  label: 'Connecting' },
   reconnecting: { color: 'bg-gray-400',  label: 'Reconnecting' },
   error:        { color: 'bg-red-500',   label: 'Disconnected' },

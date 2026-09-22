@@ -10,6 +10,7 @@ from rq import get_current_job
 
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
 
@@ -32,8 +33,14 @@ def _active_segments(doc: dict) -> list:
 
 
 async def _speech_clips(
-    user_id: str, include_all_users: bool, include_deleted: bool = False
+    user_id: str,
+    include_all_users: bool,
+    include_deleted: bool = False,
+    *,
+    visibility=None,
+    stats=None,
 ) -> list[dict]:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
     query: dict[str, Any] = {
         "audio_archived": {"$ne": True},
         "audio_chunks_count": {"$gt": 0},
@@ -50,6 +57,8 @@ async def _speech_clips(
         review_query,
         {"conversation_id": 1, "segment_start": 1, "actual_speaker": 1, "enrolled": 1},
     ):
+        if not await visibility.filter([review]):
+            continue
         if review.get("enrolled") and review.get("actual_speaker"):
             key = f'{review["conversation_id"]}:{round(float(review["segment_start"]), 2)}'
             human_labels[key] = review["actual_speaker"]
@@ -65,6 +74,8 @@ async def _speech_clips(
         annotation_query,
         {"conversation_id": 1, "segment_start_time": 1, "corrected_speaker": 1},
     ):
+        if not await visibility.filter([annotation]):
+            continue
         key = (
             f'{annotation["conversation_id"]}:'
             f'{round(float(annotation["segment_start_time"]), 2)}'
@@ -82,6 +93,10 @@ async def _speech_clips(
     }
     clips = []
     async for doc in Conversation.get_pymongo_collection().find(query, projection):
+        if not await visibility.filter([doc]):
+            if stats is not None:
+                stats["privacy_held_recordings"] += 1
+            continue
         audio_duration = float(doc.get("audio_total_duration") or 0)
         for index, segment in enumerate(_active_segments(doc)):
             if segment.get("segment_type") not in (None, "speech"):
@@ -112,6 +127,7 @@ async def _speech_clips(
                     "stored_confidence": segment.get("confidence"),
                 }
             )
+    await visibility.assert_current()
     return clips
 
 
@@ -136,6 +152,8 @@ async def discover_speaker_candidates_job(
     include_all_users: bool = False,
     include_deleted: bool = False,
 ) -> dict:
+    visibility = privacy.ConversationPrivacyFilter()
+    stats = {"privacy_held_recordings": 0}
     started_at = time.perf_counter()
     timings: dict[str, float] = {}
     db = Conversation.get_pymongo_collection().database
@@ -149,10 +167,16 @@ async def discover_speaker_candidates_job(
     info = await client.get_embedding_info()
     model = info.get("embedding_model")
     if not model:
-        raise RuntimeError(f"Could not resolve speaker embedding model: {info}")
+        raise RuntimeError("Could not resolve speaker embedding model")
 
     phase_started = time.perf_counter()
-    clips = await _speech_clips(requested_by, include_all_users, include_deleted)
+    clips = await _speech_clips(
+        requested_by,
+        include_all_users,
+        include_deleted,
+        visibility=visibility,
+        stats=stats,
+    )
     timings["enumerate_corpus_s"] = time.perf_counter() - phase_started
     clip_keys = [clip["clip_key"] for clip in clips]
     phase_started = time.perf_counter()
@@ -164,6 +188,7 @@ async def discover_speaker_candidates_job(
         )
         if row.get("embedding")
     }
+    await visibility.assert_current()
     timings["load_cache_s"] = time.perf_counter() - phase_started
     sem = asyncio.Semaphore(EMBED_CONCURRENCY)
     embedded: list[tuple[dict, list[float]]] = [
@@ -186,24 +211,30 @@ async def discover_speaker_candidates_job(
         nonlocal completed, failures
         async with sem:
             try:
+                await visibility.assert_current()
                 wav = await reconstruct_audio_segment(
                     clip["conversation_id"], clip["start"], clip["end"]
                 )
+                await visibility.assert_current()
                 result = await client.extract_speaker_embedding(wav)
+                await visibility.assert_current()
                 if result.get("error") or not result.get("embedding"):
-                    raise RuntimeError(str(result))
-                await cache.update_one(
-                    {"clip_key": clip["clip_key"], "embedding_model": model},
-                    {
-                        "$set": {
-                            **clip,
-                            **result,
-                            "indexed_at": datetime.now(timezone.utc),
-                        }
-                    },
-                    upsert=True,
-                )
+                    raise RuntimeError("Speaker embedding failed")
+                async with visibility.publication():
+                    await cache.update_one(
+                        {"clip_key": clip["clip_key"], "embedding_model": model},
+                        {
+                            "$set": {
+                                **clip,
+                                **result,
+                                "indexed_at": datetime.now(timezone.utc),
+                            }
+                        },
+                        upsert=True,
+                    )
                 embedded.append((clip, result["embedding"]))
+            except privacy.PrivacyHeld:
+                raise
             except Exception:
                 failures += 1
             finally:
@@ -217,21 +248,32 @@ async def discover_speaker_candidates_job(
                         )
 
     phase_started = time.perf_counter()
-    await asyncio.gather(*(embed(clip) for clip in missing))
+    results = await asyncio.gather(
+        *(embed(clip) for clip in missing), return_exceptions=True
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    await visibility.assert_current()
     timings["embed_missing_s"] = time.perf_counter() - phase_started
     embedded.sort(key=lambda item: item[0]["clip_key"])
 
     phase_started = time.perf_counter()
-    await matches.delete_many({"requested_by": requested_by, "speaker_id": speaker_id})
+    async with visibility.publication():
+        await matches.delete_many(
+            {"requested_by": requested_by, "speaker_id": speaker_id}
+        )
     scored_count = 0
     for offset in range(0, len(embedded), SCORE_BATCH_SIZE):
         batch = embedded[offset : offset + SCORE_BATCH_SIZE]
+        await visibility.assert_current()
         response = await client.score_cached_embeddings(
             speaker_id, [embedding for _clip, embedding in batch]
         )
+        await visibility.assert_current()
         scores = response.get("scores")
         if not isinstance(scores, list) or len(scores) != len(batch):
-            raise RuntimeError(f"Speaker-service batch scoring failed: {response}")
+            raise RuntimeError("Speaker-service batch scoring failed")
         now = datetime.now(timezone.utc)
         documents = []
         for (clip, _embedding), score in zip(batch, scores):
@@ -249,25 +291,27 @@ async def discover_speaker_candidates_job(
                 }
             )
         if documents:
-            await matches.insert_many(documents, ordered=False)
+            async with visibility.publication():
+                await matches.insert_many(documents, ordered=False)
             scored_count += len(documents)
         _progress(
             min(offset + len(batch), len(embedded)),
             len(embedded),
-            f"Comparing {speaker_name} with indexed speech",
+            "Comparing the selected speaker with indexed speech",
         )
     timings["score_and_store_s"] = time.perf_counter() - phase_started
     timings["total_s"] = time.perf_counter() - started_at
     timings = {name: round(seconds, 3) for name, seconds in timings.items()}
     logger.info(
-        "Speaker corpus discovery timings for %s (%d vectors, %d cached): %s",
-        speaker_name,
+        "Speaker corpus discovery timings (%d vectors, %d cached): %s",
         len(clips),
         len(cached_embeddings),
         timings,
     )
 
+    await visibility.assert_current()
     return {
+        **stats,
         "speaker_name": speaker_name,
         "speech_clips": len(clips),
         "embedded": len(embedded),

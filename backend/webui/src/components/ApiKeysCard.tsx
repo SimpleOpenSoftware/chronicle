@@ -17,10 +17,7 @@ export default function ApiKeysCard() {
       </h3>
 
       <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-        Long-lived credentials for clients that can't log in again — dictation apps, relays,
-        sync daemons. Send as <code className="text-xs">Authorization: Bearer &lt;key&gt;</code>,
-        the same header a JWT uses, so anywhere that asks for an "API key" works. Unlike a login
-        token these don't expire after 24 hours.
+        Long-lived credentials for connected apps and devices. Revoking a key removes its access.
       </p>
 
       <ApiKeysPanel />

@@ -1,14 +1,17 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
-import { MessageSquare, RefreshCw, Calendar, User, Play, Pause, MoreVertical, RotateCcw, Zap, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Save, X, AlertTriangle, Pencil, Search, Brain, Star, ArrowUpDown, Clock, UserX, Mic, Regex, ListFilter, Check } from 'lucide-react'
+import { Link, useSearchParams } from 'react-router-dom'
+import SourceSearch from '../components/SourceSearch'
+import { useAuth } from '../contexts/AuthContext'
+import { sourceDate } from '../utils/sourceTime'
+import { MessageSquare, RefreshCw, Calendar, User, Play, Pause, MoreVertical, RotateCcw, Zap, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Save, X, AlertTriangle, Pencil, Star, Clock, Mic } from 'lucide-react'
 import { conversationsApi, annotationsApi, speakerApi } from '../services/api'
 import { useConversations, useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSpeakers, useReprocessOrphan, useToggleStar } from '../hooks/useConversations'
 import ConversationVersionHeader from '../components/ConversationVersionHeader'
 import { PlayheadTimeLabel } from '../components/audio/PlayheadWaveform'
 import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
 import TranscriptEditor from '../components/transcript/TranscriptEditor'
-import { Button, Checkbox } from '../components/ui'
+import { Button, Checkbox, IconButton } from '../components/ui'
 import { TITLE_NOT_GENERATED } from '../lib/constants'
 
 interface Conversation {
@@ -51,11 +54,10 @@ interface Conversation {
 const isUnknownLabel = (name?: string): boolean => {
   if (!name || !name.trim()) return true
   const n = name.trim().toLowerCase()
-  return ['noise', 'background speech'].includes(n) || /^unknown(?:[ _]speaker)?(?:[ _]*\d+)?$/.test(n)
+  return ['noise', 'background speech'].includes(n) || /^(?:unknown(?:[ _]speaker)?|speaker)(?:[ _]*\d+)?$/.test(n)
 }
 
 const PAGE_SIZE = 20
-const SEARCH_DEBOUNCE_MS = 800
 
 const SORT_OPTIONS = [
   { label: 'Date (newest)', sortBy: 'created_at', sortOrder: 'desc' },
@@ -66,7 +68,7 @@ const SORT_OPTIONS = [
 
 export default function Recordings() {
   const queryClient = useQueryClient()
-  const navigate = useNavigate()
+  const { isAdmin } = useAuth()
   const [debugMode, setDebugMode] = useState(false)
   const [starredOnly, setStarredOnly] = useState(false)
   const [hideUnknownSpeakers, setHideUnknownSpeakers] = useState(false)
@@ -130,16 +132,8 @@ export default function Recordings() {
   const [savingTitle, setSavingTitle] = useState<boolean>(false)
   const [titleEditError, setTitleEditError] = useState<string | null>(null)
 
-  // Search state (regex-only; semantic search was removed for performance reasons)
-  const [searchQuery, setSearchQuery] = useState('')
-  type SearchField = 'id' | 'title' | 'summary' | 'speakers'
-  const allSearchFields: SearchField[] = ['id', 'title', 'summary', 'speakers']
-  const [searchFields, setSearchFields] = useState<SearchField[]>(allSearchFields)
-  const [searchResults, setSearchResults] = useState<Conversation[] | null>(null)
-  const [isSearching, setIsSearching] = useState(false)
-  const [searchTotal, setSearchTotal] = useState(0)
-  const [searchError, setSearchError] = useState<string | null>(null)
-  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [searchParams] = useSearchParams()
+  const searchActive = !!searchParams.get('q')?.trim()
 
   const loadEnrolledSpeakers = async () => {
     try {
@@ -163,86 +157,18 @@ export default function Recordings() {
   // Close dropdown when clicking outside
   useEffect(() => {
     const handleClickOutside = () => setOpenDropdown(null)
+    const handleKey = (event: KeyboardEvent) => { if (event.key === 'Escape') { setOpenDropdown(null); (document.activeElement?.closest('.relative')?.querySelector('button') as HTMLElement | null)?.focus() } }
+    document.addEventListener('keydown', handleKey)
     document.addEventListener('click', handleClickOutside)
-    return () => document.removeEventListener('click', handleClickOutside)
+    return () => { document.removeEventListener('click', handleClickOutside); document.removeEventListener('keydown', handleKey) }
   }, [])
 
-  const allFieldsSelected = searchFields.length === allSearchFields.length
-
-  const toggleSearchField = (field: SearchField) => {
-    setSearchFields((current) =>
-      current.includes(field)
-        ? current.filter((selected) => selected !== field)
-        : [...current, field]
-    )
-  }
-
-  const runSearch = async (query: string, fields: SearchField[]) => {
-    setIsSearching(true)
-    try {
-      const response = await conversationsApi.search(query, 50, 0, fields)
-      setSearchResults(response.data.conversations ?? [])
-      setSearchTotal(response.data.total ?? 0)
-      setSearchError(response.data.error ?? null)
-    } catch (err: any) {
-      console.error('Search failed:', err)
-      setSearchResults([])
-      setSearchTotal(0)
-      setSearchError(err?.response?.data?.error || 'Search failed')
-    } finally {
-      setIsSearching(false)
-    }
-  }
-
-  // Regex search runs live, debounced.
-  useEffect(() => {
-    if (searchTimeoutRef.current) {
-      clearTimeout(searchTimeoutRef.current)
-    }
-
-    const trimmed = searchQuery.trim()
-    if (!trimmed) {
-      setSearchResults(null)
-      setSearchTotal(0)
-      setSearchError(null)
-      setIsSearching(false)
-      return
-    }
-
-    if (searchFields.length === 0) {
-      setSearchResults([])
-      setSearchTotal(0)
-      setSearchError(null)
-      setIsSearching(false)
-      return
-    }
-
-    setIsSearching(true)
-    searchTimeoutRef.current = setTimeout(
-      () => runSearch(trimmed, searchFields),
-      SEARCH_DEBOUNCE_MS,
-    )
-
-    return () => {
-      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current)
-    }
-  }, [searchQuery, searchFields])
-
   const formatDate = (timestamp: number | string) => {
-    // Handle both Unix timestamp (number) and ISO string
-    if (typeof timestamp === 'string') {
-      // If the string doesn't include timezone info, append 'Z' to treat as UTC
-      const isoString = timestamp.endsWith('Z') || timestamp.includes('+') || timestamp.includes('T') && timestamp.split('T')[1].includes('-')
-        ? timestamp
-        : timestamp + 'Z'
-      return new Date(isoString).toLocaleString()
-    }
-    // If timestamp is 0, return placeholder
-    if (timestamp === 0) {
-      return 'Unknown date'
-    }
-    return new Date(timestamp * 1000).toLocaleString()
+    if (!timestamp) return 'Date unknown'
+    return sourceDate(typeof timestamp === 'number' ? new Date(timestamp * 1000).toISOString() : timestamp)
+      .toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) + ' IST'
   }
+
 
 
   const reprocessTranscriptMutation = useReprocessTranscript()
@@ -455,7 +381,7 @@ export default function Recordings() {
     }
 
     // Find the conversation by conversation_id
-    const conversation = (searchResults ?? conversations).find(
+    const conversation = conversations.find(
       c => c.conversation_id === conversationId,
     )
     if (!conversation || !conversation.conversation_id) {
@@ -555,11 +481,6 @@ export default function Recordings() {
             ),
           }
         })
-        setSearchResults(prev => prev?.map(c =>
-          c.conversation_id === conversationId
-            ? { ...c, ...response.data.conversation }
-            : c
-        ) ?? null)
         // Expand the transcript (the editor loads its own annotations)
         setExpandedTranscripts(prev => new Set(prev).add(conversationId))
       }
@@ -601,204 +522,53 @@ export default function Recordings() {
     <div>
       {/* Header with Search */}
       <div className="flex flex-col gap-4 mb-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center space-x-2">
             <MessageSquare className="h-6 w-6 text-blue-600 flex-shrink-0" />
             <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
               Recordings
             </h1>
           </div>
-          <div className="flex flex-wrap items-center gap-2 sm:gap-4">
-            <button
-              onClick={() => { setStarredOnly(!starredOnly); setPage(0) }}
-              className={`flex items-center space-x-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                starredOnly
-                  ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border border-yellow-300 dark:border-yellow-700'
-                  : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
-              }`}
-              title={starredOnly ? 'Show all conversations' : 'Show only starred'}
-            >
-              <Star className={`h-4 w-4 ${starredOnly ? 'fill-yellow-500 text-yellow-500' : ''}`} />
-              <span>Starred</span>
-            </button>
-            <button
-              onClick={() => setHideUnknownSpeakers(!hideUnknownSpeakers)}
-              className={`flex items-center space-x-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                hideUnknownSpeakers
-                  ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-300 dark:border-blue-700'
-                  : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
-              }`}
-              title={hideUnknownSpeakers ? 'Show unknown speakers and noise' : 'Hide unknown speakers and noise'}
-            >
-              <UserX className="h-4 w-4" />
-              <span>{hideUnknownSpeakers ? 'Unknown speakers hidden' : 'Hide unknown speakers'}</span>
-            </button>
-            <Checkbox
-              checked={debugMode}
-              onChange={(e) => { setDebugMode(e.target.checked); setPage(0) }}
-              label="Debug Mode"
-            />
-            <Button
-              variant="primary"
-              size="md"
-              onClick={() => refetch()}
-              icon={<RefreshCw className="h-4 w-4" />}
-            >
-              Refresh
-            </Button>
-          </div>
+          {isAdmin && !searchActive && <details className="relative text-sm text-[var(--tape-activity)]">
+            <summary className="min-h-11 cursor-pointer rounded-md px-3 py-3">Diagnostics{debugMode ? ' · On' : ''}</summary>
+            <div className="absolute right-0 z-20 w-64 rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper-raised)] p-4">
+              <Checkbox checked={debugMode} onChange={e => { setDebugMode(e.target.checked); setPage(0) }} label="Show unprocessed audio and details" />
+            </div>
+          </details>}
         </div>
 
-        {/* Search Bar */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative flex-1 min-w-[180px]">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search recordings, IDs, or people..."
-              className="w-full pl-9 pr-9 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            )}
-          </div>
-          {/* Match mode: compact icons keep the search row scannable. */}
-          <div className="inline-flex rounded-lg border border-gray-300 dark:border-gray-600 overflow-hidden">
-            <button
-              type="button"
-              aria-label="Regex search"
-              title="Regex search — case-insensitive text matching"
-              className="flex h-9 w-9 items-center justify-center bg-blue-600 text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-inset"
-            >
-              <Regex className="h-4 w-4" />
-            </button>
-            <button
-              type="button"
-              disabled
-              aria-label="Semantic search unavailable"
-              title="Semantic search — unavailable because of performance issues"
-              className="flex h-9 w-9 items-center justify-center border-l border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-400 dark:text-gray-500 cursor-not-allowed"
-            >
-              <Brain className="h-4 w-4" />
-            </button>
-          </div>
-          {/* Search fields: Everything mirrors the individual checkboxes. */}
-          <div className="relative">
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation()
-                setOpenDropdown(openDropdown === 'search-fields' ? null : 'search-fields')
-              }}
-              aria-haspopup="menu"
-              aria-expanded={openDropdown === 'search-fields'}
-              className="flex h-9 items-center gap-1.5 rounded-lg border border-gray-300 bg-white pl-2.5 pr-2 text-sm text-gray-700 hover:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
-            >
-              <ListFilter className="h-4 w-4 text-gray-400" />
-              <span>{allFieldsSelected ? 'Everything' : searchFields.length === 0 ? 'No fields' : `${searchFields.length} fields`}</span>
-              <ChevronDown className={`h-3.5 w-3.5 text-gray-400 transition-transform ${openDropdown === 'search-fields' ? 'rotate-180' : ''}`} />
-            </button>
-            {openDropdown === 'search-fields' && (
-              <div
-                role="menu"
-                onClick={(event) => event.stopPropagation()}
-                className="absolute left-0 z-30 mt-1 w-52 rounded-lg border border-gray-200 bg-white p-1.5 shadow-lg dark:border-gray-600 dark:bg-gray-800"
-              >
-                {[
-                  { key: 'all', label: 'Everything', selected: allFieldsSelected },
-                  { key: 'id', label: 'Conversation IDs', selected: searchFields.includes('id') },
-                  { key: 'title', label: 'Titles', selected: searchFields.includes('title') },
-                  { key: 'summary', label: 'Summaries', selected: searchFields.includes('summary') },
-                  { key: 'speakers', label: 'Speakers', selected: searchFields.includes('speakers') },
-                ].map((option, index) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    role="menuitemcheckbox"
-                    aria-checked={option.selected}
-                    onClick={() => option.key === 'all'
-                      ? setSearchFields(allFieldsSelected ? [] : allSearchFields)
-                      : toggleSearchField(option.key as SearchField)}
-                    className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:hover:bg-gray-700 ${index === 0 ? 'mb-1 border-b border-gray-100 pb-2 dark:border-gray-700' : ''}`}
-                  >
-                    <span className={`flex h-4 w-4 items-center justify-center rounded border ${option.selected ? 'border-blue-500 bg-blue-600 text-white' : 'border-gray-300 dark:border-gray-600'}`}>
-                      {option.selected && <Check className="h-3 w-3" />}
-                    </span>
-                    <span>{option.label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          {/* Sort Dropdown */}
-          <div className="relative">
-            <select
-              value={sortIdx}
-              onChange={(e) => { setSortIdx(Number(e.target.value)); setPage(0) }}
-              className="appearance-none pl-8 pr-8 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent cursor-pointer"
-            >
-              {SORT_OPTIONS.map((opt, i) => (
-                <option key={i} value={i}>{opt.label}</option>
-              ))}
-            </select>
-            <ArrowUpDown className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400 pointer-events-none" />
-          </div>
-        </div>
+        <SourceSearch
+          activeFilterCount={!searchActive && starredOnly ? 1 : 0}
+          browseActions={!searchActive && <>
+            <select aria-label="Sort recordings" value={sortIdx} onChange={e => { setSortIdx(Number(e.target.value)); setPage(0) }} className="h-11 max-w-full rounded-md border border-[var(--tape-line)] bg-[var(--tape-paper-raised)] px-3 text-sm text-[var(--tape-ink)]">{SORT_OPTIONS.map((option, i) => <option key={option.label} value={i}>{option.label}</option>)}</select>
+            <IconButton label="Refresh recordings" onClick={() => refetch()}><RefreshCw className="h-4 w-4" /></IconButton>
+          </>}
+          browseFilters={!searchActive && <div className="mt-3 border-t border-[var(--tape-line)] pt-3">
+            <Checkbox checked={starredOnly} onChange={e => { setStarredOnly(e.target.checked); setPage(0) }} label="Starred recordings only" />
+          </div>}
+        />
+        {!searchActive && starredOnly && <button className="self-start flex min-h-11 items-center gap-2 rounded-full bg-[var(--tape-chip)] px-3 text-sm text-[var(--tape-ink)]" onClick={() => { setStarredOnly(false); setPage(0) }}>Starred recordings <X className="h-4 w-4" /><span className="sr-only">Clear filter</span></button>}
+        {searchActive && starredOnly && <p className="text-sm text-[var(--tape-activity)]">The starred filter is paused during search.</p>}
 
-        {/* Search status */}
-        {searchQuery.trim() && (
-          <div className="text-sm text-gray-500 dark:text-gray-400 space-y-1">
-            {isSearching ? (
-              <span className="flex items-center gap-1">
-                <RefreshCw className="h-3 w-3 animate-spin" />
-                Searching...
-              </span>
-            ) : searchError ? (
-              <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
-                <AlertTriangle className="h-3.5 w-3.5" />
-                {searchError}
-              </span>
-            ) : searchFields.length === 0 ? (
-              <span>Select at least one field to search.</span>
-            ) : searchResults !== null ? (
-              <span>
-                {searchTotal} result{searchTotal !== 1 ? 's' : ''}
-                {` for “${searchQuery.trim()}”`}
-              </span>
-            ) : null}
-          </div>
-        )}
       </div>
 
       {/* Conversations List */}
-      <div className="space-y-6">
+      <div className={searchActive ? 'hidden' : 'space-y-3'}>
         {(() => {
-          const displayConversations = searchResults ?? conversations
+          const displayConversations = conversations
           return displayConversations.length === 0 ? (
           <div className="text-center text-gray-500 dark:text-gray-400 py-12">
             <MessageSquare className="h-12 w-12 mx-auto mb-4 opacity-50" />
-            <p>{searchResults !== null ? 'No matching recordings' : 'No recordings found'}</p>
+            <p>No recordings found</p>
           </div>
         ) : (
           displayConversations.map((conversation) => (
             <div
               key={conversation.conversation_id}
-              onClick={(event) => {
-                const target = event.target as HTMLElement
-                if (target.closest('button, a, input, textarea, select, [role="button"]')) return
-                navigate(`/recordings/${conversation.conversation_id}`)
-              }}
-              className={`rounded-lg p-6 border cursor-pointer ${
+              className={`rounded-lg p-4 border recording-card ${
                 conversation.is_orphan
                   ? 'bg-amber-50 dark:bg-amber-900/10 border-amber-300 dark:border-amber-700'
-                  : 'bg-gray-50 dark:bg-gray-700 border-gray-200 dark:border-gray-600 hover:border-gray-300 dark:hover:border-gray-500'
+                  : 'bg-[var(--tape-paper-raised)] border-[var(--tape-line)]'
               }`}
             >
               {/* Orphan Audio Session Banner */}
@@ -836,17 +606,17 @@ export default function Recordings() {
               )}
 
               {/* Conversation Header */}
-              <div className="flex justify-between items-start mb-4 gap-2">
-                <div className="flex flex-col space-y-2 min-w-0">
+              <div className="flex justify-between items-start mb-2 gap-2">
+                <div className="flex flex-col gap-1 min-w-0">
                   {/* Conversation Title - Editable */}
                   {editingTitle === conversation.conversation_id ? (
-                    <div className="flex items-center space-x-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <input
                         type="text"
                         value={editedTitle}
                         onChange={(e) => setEditedTitle(e.target.value)}
                         onKeyDown={(e) => handleTitleKeyDown(e, conversation.conversation_id, conversation.title || TITLE_NOT_GENERATED)}
-                        className="text-xl font-semibold px-2 py-1 border-2 border-blue-500 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 min-w-[200px]"
+                        aria-label="Recording title" className="w-full min-w-0 text-lg font-semibold px-2 py-1 border border-blue-500 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                         autoFocus
                         disabled={savingTitle}
                       />
@@ -871,29 +641,32 @@ export default function Recordings() {
                       )}
                     </div>
                   ) : (
-                    <h2
-                      className="text-xl font-semibold text-gray-900 dark:text-gray-100 group cursor-pointer hover:bg-yellow-100 dark:hover:bg-yellow-900/30 px-1 rounded transition-colors inline-flex items-center gap-2"
-                      onClick={() => handleStartTitleEdit(conversation.conversation_id, conversation.title || TITLE_NOT_GENERATED)}
-                      title="Click to edit title"
-                    >
-                      {conversation.title || TITLE_NOT_GENERATED}
-                      <Pencil className="w-3.5 h-3.5 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <h2 className="text-lg font-semibold leading-snug text-[var(--tape-ink)] break-words">
+                      <Link className="rounded hover:underline underline-offset-4" to={`/recordings/${conversation.conversation_id}`} state={{ from: '/recordings' + (searchParams.size ? '?' + searchParams.toString() : '') }}>
+                        {conversation.title || TITLE_NOT_GENERATED}
+                      </Link>
                     </h2>
                   )}
 
+                  {(conversation.processing_status === 'failed' || conversation.processing_status === 'active') && <div className="flex flex-wrap gap-2 text-xs text-[var(--tape-activity)]">
+                    {conversation.processing_status === 'failed' ? <span className="rounded bg-red-100 px-2 py-1 text-red-800 dark:bg-red-900/30 dark:text-red-300">{conversation.failure_stage === 'summarization' ? 'Summary failed' : 'Processing failed'}</span>
+                      : conversation.processing_status === 'active' ? <span className="rounded bg-[var(--tape-chip)] px-2 py-1">Processing</span>
+                      : null}
+                  </div>}
                   {/* Short Summary - Always visible */}
-                  {conversation.summary && (
-                    <p className="text-sm text-gray-600 dark:text-gray-400 italic">
+                  {conversation.summary && !/^Transcribing detected speech\.{0,3}$/.test(conversation.summary) && (
+                    <p className="text-sm leading-relaxed text-[var(--tape-activity)] line-clamp-2">
                       {conversation.summary}
                     </p>
                   )}
 
                   {/* Detailed Summary Expand Button */}
-                  {conversation.conversation_id && (
-                    <div className="mt-2">
+                  {conversation.conversation_id && conversation.detailed_summary && (
+                    <div>
                       <button
+                        aria-expanded={expandedDetailedSummaries.has(conversation.conversation_id)}
                         onClick={() => toggleDetailedSummary(conversation.conversation_id!)}
-                        className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline flex items-center space-x-1"
+                        className="min-h-11 text-sm text-[var(--tape-activity)] hover:underline flex items-center gap-2"
                       >
                         <span>
                           {expandedDetailedSummaries.has(conversation.conversation_id) ? '▼' : '▶'} Detailed Summary
@@ -913,7 +686,7 @@ export default function Recordings() {
 
                   {/* Metadata */}
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                    <ConversationVersionHeader
+                    {debugMode && <ConversationVersionHeader
                       conversationId={conversation.conversation_id}
                       versionInfo={{
                         transcript_count: conversation.transcript_version_count || 0,
@@ -941,14 +714,14 @@ export default function Recordings() {
                           refetch()
                         }
                       }}
-                    />
+                    />}
                     <div className="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400">
                       <Calendar className="h-4 w-4 flex-shrink-0" />
                       <span>{formatDate(conversation.created_at || '')}</span>
                     </div>
                     <div className="flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-400 min-w-0">
                       <User className="h-4 w-4 flex-shrink-0" />
-                      <span className="truncate">{conversation.client_id}</span>
+                      <span className="truncate">{conversation.client_id.replace(/^[^-]+-/, '').replace(/[-_]/g, ' ')}</span>
                     </div>
                     {/* Play pill inline (doubles as the duration readout) when there's audio;
                         otherwise a static duration. */}
@@ -958,12 +731,13 @@ export default function Recordings() {
                           e.stopPropagation()
                           player.togglePlay(conversation.conversation_id!, conversation.audio_total_duration || 0)
                         }}
-                        className="inline-flex items-center gap-1.5 pl-1.5 pr-2.5 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
-                        title={player.isActive(conversation.conversation_id) && player.isPlaying ? 'Pause' : 'Play'}
+                        className="inline-flex min-h-11 items-center gap-2 px-3 rounded-md text-[var(--tape-ink)] bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                        aria-label={player.isActive(conversation.conversation_id) && player.isPlaying ? 'Pause recording' : 'Play recording'}
                       >
                         {player.isActive(conversation.conversation_id) && player.isPlaying
                           ? <Pause className="h-3.5 w-3.5 text-blue-600" />
                           : <Play className="h-3.5 w-3.5 text-blue-600" />}
+                        <span className="text-sm">{player.isActive(conversation.conversation_id) && player.isPlaying ? 'Pause' : 'Play'}</span>
                         {player.isActive(conversation.conversation_id) ? (
                           <PlayheadTimeLabel
                             cid={conversation.conversation_id}
@@ -991,14 +765,14 @@ export default function Recordings() {
 
                   {/* Speakers at a glance (active version) */}
                   {conversation.speakers && conversation.speakers.length > 0 && (
-                    <div className="flex flex-wrap items-center gap-1.5 mt-2.5">
+                    <div className="flex flex-wrap items-center gap-1.5 mt-1">
                       <Mic className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
                       {conversation.speakers.map((sp, i) => (
                         <span
                           key={i}
                           className={`px-2 py-0.5 rounded-full text-xs font-medium ${
                             isUnknownLabel(sp)
-                              ? 'bg-gray-100 dark:bg-gray-700/60 text-gray-400 dark:text-gray-500'
+                              ? 'bg-gray-100 dark:bg-gray-700/60 text-[var(--tape-activity)]'
                               : 'bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-200'
                           }`}
                         >
@@ -1016,10 +790,10 @@ export default function Recordings() {
                       e.stopPropagation()
                       handleToggleStar(conversation.conversation_id)
                     }}
-                    className="p-1 rounded-full hover:bg-yellow-100 dark:hover:bg-yellow-900/30 transition-colors"
-                    title={conversation.starred ? 'Unstar conversation' : 'Star conversation'}
+                    className="min-h-11 min-w-11 inline-flex items-center justify-center rounded-md hover:bg-yellow-100 dark:hover:bg-yellow-900/30 transition-colors"
+                    aria-label={conversation.starred ? 'Unstar recording' : 'Star recording'} aria-pressed={!!conversation.starred}
                   >
-                    <Star className={`h-5 w-5 ${conversation.starred ? 'fill-yellow-400 text-yellow-400' : 'text-gray-400 dark:text-gray-500'}`} />
+                    <Star className={`h-5 w-5 ${conversation.starred ? 'fill-yellow-400 text-yellow-400' : 'text-[var(--tape-activity)]'}`} />
                   </button>
                 <div className="relative">
                   <button
@@ -1027,19 +801,20 @@ export default function Recordings() {
                       e.stopPropagation()
                       setOpenDropdown(openDropdown === conversation.conversation_id ? null : conversation.conversation_id)
                     }}
-                    className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
-                    title="Conversation options"
+                    className="min-h-11 min-w-11 inline-flex items-center justify-center rounded-md hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                    aria-label="Recording options" aria-expanded={openDropdown === conversation.conversation_id}
                   >
                     <MoreVertical className="h-5 w-5 text-gray-500 dark:text-gray-400" />
                   </button>
 
                   {/* Dropdown Menu */}
                   {openDropdown === conversation.conversation_id && (
-                    <div className="absolute right-0 top-8 w-48 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-600 py-2 z-10">
+                    <div className="absolute right-0 top-12 w-56 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-600 py-2 z-10">
+                      <button onClick={() => { handleStartTitleEdit(conversation.conversation_id, conversation.title || TITLE_NOT_GENERATED); setOpenDropdown(null) }} className="min-h-11 w-full flex items-center gap-2 px-4 text-left text-sm text-[var(--tape-ink)] hover:bg-[var(--tape-chip)]"><Pencil className="h-4 w-4" />Rename</button>
                       <button
                         onClick={() => handleReprocessTranscript(conversation)}
                         disabled={!conversation.conversation_id || reprocessingTranscript.has(conversation.conversation_id)}
-                        className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="min-h-11 w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {conversation.conversation_id && reprocessingTranscript.has(conversation.conversation_id) ? (
                           <RefreshCw className="h-4 w-4 animate-spin" />
@@ -1054,7 +829,7 @@ export default function Recordings() {
                       <button
                         onClick={() => handleReprocessMemory(conversation)}
                         disabled={!conversation.conversation_id || reprocessingMemory.has(conversation.conversation_id)}
-                        className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="min-h-11 w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {conversation.conversation_id && reprocessingMemory.has(conversation.conversation_id) ? (
                           <RefreshCw className="h-4 w-4 animate-spin" />
@@ -1069,7 +844,7 @@ export default function Recordings() {
                       <button
                         onClick={() => handleReprocessSpeakers(conversation)}
                         disabled={!conversation.conversation_id || reprocessingSpeakers.has(conversation.conversation_id)}
-                        className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="min-h-11 w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
                         title="Create new transcript version with re-identified speakers (automatically updates memories)"
                       >
                         {conversation.conversation_id && reprocessingSpeakers.has(conversation.conversation_id) ? (
@@ -1086,14 +861,14 @@ export default function Recordings() {
                       <button
                         onClick={() => conversation.conversation_id && handleDeleteConversation(conversation.conversation_id)}
                         disabled={!conversation.conversation_id || (!!conversation.conversation_id && deletingConversation.has(conversation.conversation_id))}
-                        className="w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="min-h-11 w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {conversation.conversation_id && deletingConversation.has(conversation.conversation_id) ? (
                           <RefreshCw className="h-4 w-4 animate-spin" />
                         ) : (
                           <Trash2 className="h-4 w-4" />
                         )}
-                        <span>Delete Conversation</span>
+                        <span>Move to Trash</span>
                         {!conversation.conversation_id && (
                           <span className="text-xs text-red-500 ml-1">(ID missing)</span>
                         )}
@@ -1115,11 +890,11 @@ export default function Recordings() {
                       {/* Transcript Header with Expand/Collapse */}
                       <button
                         type="button"
-                        className="flex w-full items-center justify-between p-2 rounded-lg text-left hover:bg-gray-100 dark:hover:bg-gray-600 transition-colors"
+                        aria-expanded={expandedTranscripts.has(conversation.conversation_id)} aria-controls={`transcript-${conversation.conversation_id}`} className="flex min-h-11 w-full items-center justify-between gap-2 border-t border-[var(--tape-line)] px-2 py-2 rounded-md text-left hover:bg-[var(--tape-chip)] transition-colors"
                         onClick={() => conversation.conversation_id && toggleTranscriptExpansion(conversation.conversation_id)}
                       >
                         <span className="font-medium text-gray-900 dark:text-gray-100">
-                          Transcript {(segments.length > 0 || conversation.segment_count) && (
+                          {expandedTranscripts.has(conversation.conversation_id) ? 'Hide transcript' : 'Show transcript'} {(segments.length > 0 || conversation.segment_count) && (
                             <span className="text-sm text-gray-500 dark:text-gray-400 ml-1">
                               ({segments.length || conversation.segment_count || 0} segments)
                             </span>
@@ -1136,7 +911,8 @@ export default function Recordings() {
 
                       {/* Transcript Content - Conditionally Rendered */}
                       {conversation.conversation_id && expandedTranscripts.has(conversation.conversation_id) && (
-                        <div className="animate-in slide-in-from-top-2 duration-300 ease-out">
+                        <div id={`transcript-${conversation.conversation_id}`}>
+                          <div className="px-2 py-3"><Checkbox checked={hideUnknownSpeakers} onChange={e => setHideUnknownSpeakers(e.target.checked)} label="Hide unknown speakers in transcripts" /></div>
                           <TranscriptEditor
                             conversationId={conversation.conversation_id}
                             segments={segments}
@@ -1157,7 +933,7 @@ export default function Recordings() {
               {/* Debug info */}
               {debugMode && (
                 <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-600">
-                  <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">🔧 Debug Info:</h4>
+                  <h4 className="font-medium text-gray-900 dark:text-gray-100 mb-2">Processing details:</h4>
                   <div className="text-xs text-gray-600 dark:text-gray-400 space-y-1">
                     <div>Conversation ID: {conversation.conversation_id || 'N/A'}</div>
                     <div>Transcript Version Count: {conversation.transcript_version_count || 0}</div>
@@ -1185,7 +961,7 @@ export default function Recordings() {
       </div>
 
       {/* Pagination */}
-      {!searchResults && totalPages > 1 && (
+      {!searchActive && totalPages > 1 && (
         <div className="flex items-center justify-between mt-6 px-2">
           <span className="text-sm text-gray-600 dark:text-gray-400">
             {totalConversations} recording{totalConversations !== 1 ? 's' : ''} total

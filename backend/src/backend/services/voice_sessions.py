@@ -604,8 +604,20 @@ class VoiceSessionCoordinator:
     ) -> bool:
         """Double-check one downlink or acknowledgment against current state."""
 
-        session = await self.get_active(user_id, client_id)
-        if session is None:
+        # Both keys are known from the envelope. Read the active pointer and
+        # bound session together, without following a pointer in another trip.
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.get(self._active_key(user_id, client_id))
+            pipe.hgetall(voice_session(voice_session_id))
+            active_id, raw = await pipe.execute()
+        session = _session_from_hash(raw)
+        if (
+            _decode(active_id) != voice_session_id
+            or session is None
+            or session.state == "ended"
+            or session.user_id != user_id
+            or session.client_id != client_id
+        ):
             return False
         ready_states = {"ready_full", "ready_isolated", "ready_half"}
         return (

@@ -24,6 +24,10 @@ from typing import Optional
 
 import numpy as np
 
+from simple_speaker_recognition.core.gallery_privacy import (
+    allowed_speakers,
+    require_available,
+)
 from simple_speaker_recognition.database.models import (
     EnrollmentAuditDecision,
     Speaker,
@@ -52,6 +56,7 @@ def _load_segments(session, user_id: Optional[str], before: Optional[datetime] =
     q = session.query(SpeakerAudioSegment, Speaker).join(
         Speaker, SpeakerAudioSegment.speaker_id == Speaker.id
     )
+    q = q.filter(allowed_speakers())
     if user_id is not None:
         q = q.filter(Speaker.user_id == user_id)
     if before is not None:
@@ -233,6 +238,7 @@ def recompute_speaker_centroid(session, db, speaker_id: str) -> None:
     next identification uses the cleaned voiceprint. If no segments remain the speaker's
     centroid is cleared (it drops out of the gallery until re-enrolled).
     """
+    require_available(session, speaker_id)
     segs = (
         session.query(SpeakerAudioSegment)
         .filter(SpeakerAudioSegment.speaker_id == speaker_id)

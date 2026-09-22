@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -54,13 +55,14 @@ def _runtime_config(
     api_key="super-secret-key",
     base_url="http://kraken:8083/v1",
     temperature=0.2,
+    sampling=None,
     response_format=None,
     seed=None,
     timeout_seconds=30,
 ):
     return _PiRuntimeConfig(
         reasoning_allowed=True,
-        binary="/opt/pi/bin/pi",
+        binary=os.environ.get("PI_BINARY", "pi"),
         provider="chronicle-llamacpp",
         model="qwen3.6-27b",
         base_url=base_url,
@@ -71,6 +73,7 @@ def _runtime_config(
         timeout_seconds=timeout_seconds,
         reasoning=True,
         temperature=temperature,
+        sampling=sampling or {},
         response_format=response_format,
         seed=seed,
     )
@@ -164,8 +167,8 @@ def _fake_spawn(captured, *, events, tool_call=None, returncode=0, stderr=b""):
                 captured["stdin"] = input_bytes.decode() if input_bytes else ""
                 if tool_call is not None:
                     name, arguments = tool_call
-                    captured["gateway_result"] = _call_gateway(
-                        captured["extension"], name, arguments
+                    captured["gateway_result"] = await asyncio.to_thread(
+                        _call_gateway, captured["extension"], name, arguments
                     )
                 return _jsonl(*events), stderr
 
@@ -315,7 +318,12 @@ def test_config_uses_registry_operation_budget_without_backend_model_override(
         api_family="openai",
         thinking=True,
         reasoning_allowed=True,
-        model_params={"context_window": 16384},
+        model_params={
+            "context_window": 16384,
+            "top_p": 0.8,
+            "top_k": 20,
+            "presence_penalty": 1.5,
+        },
         capabilities=[],
         system_prompt_prefix="You are Qwen.",
     )
@@ -366,6 +374,7 @@ def test_config_uses_registry_operation_budget_without_backend_model_override(
     assert config.context_window == 16384
     assert config.timeout_seconds == 77
     assert config.temperature == 0.37
+    assert config.sampling == {"top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}
     assert config.input_modalities == ["text"]
     assert config.system_prompt_prefix == "You are Qwen."
     assert config.compat == {
@@ -446,7 +455,8 @@ def test_public_config_validator_resolves_requested_operation(monkeypatch):
         "_resolve_pi_config",
         lambda operation, force_fallback=False: calls.append(
             (operation, force_fallback)
-        ),
+        )
+        or _runtime_config(),
     )
 
     assert (
@@ -1301,8 +1311,9 @@ async def test_write_uses_isolated_canonical_gateway_and_reports_audit_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("notes_only", [False, True])
 async def test_search_returns_only_notes_read_through_canonical_tools(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, notes_only
 ):
     root = tmp_path / "user"
     note = root / "People" / "Alice.md"
@@ -1346,7 +1357,9 @@ async def test_search_returns_only_notes_read_through_canonical_tools(
         ),
     )
 
-    result = await search_vault_with_pi("What does Alice prefer?", root)
+    result = await search_vault_with_pi(
+        "What does Alice prefer?", root, notes_only=notes_only
+    )
 
     assert result.answer == "Alice prefers tea (People/Alice.md)."
     assert result.notes == [
@@ -1356,7 +1369,9 @@ async def test_search_returns_only_notes_read_through_canonical_tools(
     assert result.usage["input_tokens"] == 35
     assert result.errors == []
     assert captured["command"][captured["command"].index("--tools") + 1] == (
-        "grep,glob,read_note,search_images"
+        "grep,glob,read_note,read_slice"
+        if notes_only
+        else "grep,glob,read_note,read_slice,search_images"
     )
     assert "Stop when the selected evidence" in captured["system_prompt"]
     assert inference_artifact["operation"] == "pi_memory_search"
@@ -1502,7 +1517,7 @@ async def test_search_preserves_audited_failure_when_final_synthesis_raises(
 
 
 @pytest.mark.asyncio
-async def test_no_tool_pi_invocation_loads_temperature_runtime_extension(
+async def test_no_tool_pi_invocation_loads_sampling_runtime_extension(
     tmp_path, monkeypatch
 ):
     root = tmp_path / "user"
@@ -1556,7 +1571,11 @@ async def test_no_tool_pi_invocation_loads_temperature_runtime_extension(
         prompt="final prompt",
         system_prompt="final system",
         schemas=(),
-        config=_runtime_config(temperature=0.37, seed=42),
+        config=_runtime_config(
+            temperature=0.37,
+            seed=42,
+            sampling={"top_p": 0.8, "presence_penalty": 1.5},
+        ),
         max_tool_rounds=1,
         max_tool_calls=1,
     )
@@ -1569,6 +1588,11 @@ async def test_no_tool_pi_invocation_loads_temperature_runtime_extension(
     assert "--tools" not in captured["command"]
     assert "before_provider_request" in captured["extension"]
     assert "const temperature = 0.37;" in captured["extension"]
+    sampling = re.search(
+        r"^const sampling = (.+);$", captured["extension"], re.MULTILINE
+    )
+    assert sampling is not None
+    assert json.loads(sampling.group(1)) == {"top_p": 0.8, "presence_penalty": 1.5}
     assert "const seed = 42;" in captured["extension"]
     assert "...(seed === null ? {} : { seed })," in captured["extension"]
     assert "pi.registerTool" in captured["extension"]
@@ -1814,6 +1838,142 @@ def test_artifact_stdout_drops_only_cumulative_message_updates():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required by Pi")
+def test_generated_extension_reports_tool_rejection_as_error(tmp_path):
+    extension_path = tmp_path / "tools.mjs"
+    extension_path.write_text(
+        pi_agent._extension_source(
+            vault_tools.VAULT_SEARCH_TOOL_SCHEMAS,
+            gateway_url="http://127.0.0.1:1/tool",
+            token="test-token",
+        )
+    )
+    harness = f"""
+import extension from {json.dumps(extension_path.as_uri())};
+const tools = [];
+extension({{on() {{}}, registerTool(tool) {{ tools.push(tool); }} }});
+let result = "Error: Repeated read limit reached";
+globalThis.fetch = async () => ({{ok: true, text: async () => JSON.stringify({{result}})}});
+let rejected = false;
+try {{ await tools[0].execute("call", {{}}); }}
+catch (error) {{ rejected = error.message === result; }}
+if (!rejected) throw new Error("Tool failure was returned as success");
+result = "Valid source text";
+const success = await tools[0].execute("next", {{}});
+if (success.content[0].text !== result) throw new Error("Success was changed");
+"""
+    run = subprocess.run(
+        ["node", "--input-type=module", "--eval", harness],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required by Pi")
+def test_rejected_full_submission_switches_to_editing_and_survives_restart(tmp_path):
+    from pydantic import BaseModel
+
+    from backend.services.timeline.pi_tasks import InvestigationTools
+
+    class Result(BaseModel):
+        answer: str
+
+    tools = InvestigationTools(tmp_path, {}, {}, Result)
+    extension_path = tmp_path / "tools.mjs"
+    extension_path.write_text(
+        pi_agent._extension_source(
+            tools.schemas,
+            gateway_url="http://127.0.0.1:1/tool",
+            token="test",
+            result_repair_tools=tools.result_repair_tools,
+        )
+    )
+    harness = f"""
+import extension from {json.dumps(extension_path.as_uri())};
+const entries = [];
+let active = [];
+function start() {{
+  const handlers = {{}}, tools = {{}};
+  extension({{
+    on(name, handler) {{handlers[name] = handler;}},
+    registerTool(tool) {{tools[tool.name] = tool;}},
+    appendEntry(customType, data) {{entries.push({{type:'custom', customType, data}});}},
+    setActiveTools(names) {{active=names;}},
+  }});
+  handlers.session_start({{}}, {{sessionManager:{{getBranch:()=>entries}}}});
+  return tools;
+}}
+let result = 'Error: Claim 2 unsupported. Draft saved';
+globalThis.fetch = async () => ({{ok:true,text:async()=>JSON.stringify({{result}})}});
+let tools = start();
+try {{await tools.finish_task.execute('submit', {{result:{{answer:'bad'}}}});}} catch (_) {{}}
+if (active.includes('finish_task') || !active.includes('revise_result') || !active.includes('read_material')) throw Error('Repair tools unavailable');
+active=[];tools=start();
+if (active.includes('finish_task') || !active.includes('revise_result')) throw Error('Restart lost repair mode');
+result='Task result accepted.';
+const success=await tools.revise_result.execute('edit',{{edits:[]}});
+if(success.content[0].text!==result) throw Error('Edited success lost');
+"""
+    run = subprocess.run(
+        ["node", "--input-type=module", "--eval", harness],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required by Pi")
+def test_repeat_recovery_steers_only_after_complete_turn_and_once(tmp_path):
+    extension_path = tmp_path / "tools.mjs"
+    extension_path.write_text(
+        pi_agent._extension_source(
+            vault_tools.VAULT_SEARCH_TOOL_SCHEMAS,
+            gateway_url="http://127.0.0.1:1/tool",
+            token="test-token",
+            recover_repeated_tool_errors=True,
+        )
+    )
+    harness = f"""
+import extension from {json.dumps(extension_path.as_uri())};
+let entries = [], continuations = 0;
+const context = {{sessionManager: {{getBranch: () => entries}}}};
+globalThis.fetch = async () => ({{ok: true, text: async () => JSON.stringify({{result: "Error: Repeated read limit"}})}});
+async function run() {{
+  const handlers = {{}}, tools = [];
+  extension({{
+    on(name, handler) {{handlers[name] = handler;}}, registerTool(tool) {{tools.push(tool);}},
+    appendEntry(customType, data) {{entries.push({{type: "custom", customType, data}});}},
+    sendUserMessage(_text, options) {{
+      if (options.deliverAs !== "steer") throw new Error("Not a steering message");
+      continuations++;
+    }},
+  }});
+  handlers.session_start({{}}, context);
+  const before = continuations;
+  for (let i = 0; i < 2; i++) {{
+    try {{await tools[0].execute("read", {{key: "source"}});}} catch (_) {{}}
+  }}
+  if (continuations !== before) throw new Error("Recovery started inside a tool execution");
+  handlers.turn_end({{}}, context);
+  handlers.turn_end({{}}, context);
+}}
+await run();
+if (continuations !== 1) throw new Error("Did not steer exactly once");
+await run();
+if (continuations !== 1) throw new Error("Restart granted extra recovery");
+"""
+    run = subprocess.run(
+        ["node", "--input-type=module", "--eval", harness],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert run.returncode == 0, run.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required by Pi")
 def test_generated_extension_aborts_on_first_tool_beyond_round_limit(tmp_path):
     extension_path = tmp_path / "chronicle-vault-tools.mjs"
     extension_path.write_text(
@@ -1822,6 +1982,7 @@ def test_generated_extension_aborts_on_first_tool_beyond_round_limit(tmp_path):
             gateway_url="http://127.0.0.1:1/tool",
             token="test-token",
             temperature=0.37,
+            sampling={"top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},
             response_format={"type": "json_object"},
             max_tool_rounds=2,
             max_tool_calls=8,
@@ -1848,6 +2009,9 @@ const providerPayload = await handlers.before_provider_request(
 );
 if (providerPayload.temperature !== 0.37) {{
   throw new Error(`expected temperature 0.37, got ${{providerPayload.temperature}}`);
+}}
+if (providerPayload.top_p !== 0.8 || providerPayload.top_k !== 20 || providerPayload.presence_penalty !== 1.5) {{
+  throw new Error("Configured model sampling was not forwarded");
 }}
 if (providerPayload.response_format?.type !== "json_object") {{
   throw new Error("expected JSON response format on provider payload");
@@ -2115,7 +2279,8 @@ async def test_timeout_preserves_prior_write_and_waits_for_killed_process(
             async def communicate(self, input_bytes=None):
                 if not self.called:
                     self.called = True
-                    _call_gateway(
+                    await asyncio.to_thread(
+                        _call_gateway,
                         extension,
                         "write_note",
                         {
@@ -2160,6 +2325,16 @@ async def test_cancellation_kills_and_waits_for_pi_subprocess(tmp_path, monkeypa
     root.mkdir()
     captured = {}
     started = asyncio.Event()
+    note = root / "People" / "Alice.md"
+    note.parent.mkdir()
+    note.write_text("Alice prefers tea.")
+    original_gateway_init = pi_agent._VaultToolGateway.__init__
+
+    def gateway_init(gateway, *args, **kwargs):
+        original_gateway_init(gateway, *args, **kwargs)
+        captured["gateway"] = gateway
+
+    monkeypatch.setattr(pi_agent._VaultToolGateway, "__init__", gateway_init)
     monkeypatch.setattr(
         pi_agent,
         "_resolve_pi_config",
@@ -2172,6 +2347,8 @@ async def test_cancellation_kills_and_waits_for_pi_subprocess(tmp_path, monkeypa
     monkeypatch.setattr(pi_agent, "_get_prompt", prompt)
 
     async def spawn(*_command, **_kwargs):
+        extension = Path(_command[_command.index("-e") + 1]).read_text()
+
         class Process:
             returncode = None
 
@@ -2181,6 +2358,13 @@ async def test_cancellation_kills_and_waits_for_pi_subprocess(tmp_path, monkeypa
                 self.released = asyncio.Event()
 
             async def communicate(self, input_bytes=None):
+                response = await asyncio.to_thread(
+                    _call_gateway, extension, "read_note", {"path": "People/Alice.md"}
+                )
+                assert response["result"] == "Alice prefers tea."
+                captured["native_process"] = captured[
+                    "gateway"
+                ]._native_text_tools._process
                 started.set()
                 await self.released.wait()
                 return b"", b""
@@ -2202,13 +2386,16 @@ async def test_cancellation_kills_and_waits_for_pi_subprocess(tmp_path, monkeypa
     monkeypatch.setattr(pi_agent.asyncio, "create_subprocess_exec", spawn)
 
     task = asyncio.create_task(PiMemoryAgent(root).run("Speaker: hello", "conv-cancel"))
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     assert captured["process"].killed
     assert captured["process"].waited
+    assert captured["native_process"].poll() is not None
+    assert captured["gateway"]._native_text_tools._closed
+    assert captured["gateway"]._native_text_tools._process is None
 
 
 @pytest.mark.asyncio
@@ -2398,7 +2585,8 @@ async def test_write_tool_call_limit_rejects_extra_mutation_and_terminates_pi(
             async def communicate(self, input_bytes=None):
                 for index in range(3):
                     try:
-                        _call_gateway(
+                        await asyncio.to_thread(
+                            _call_gateway,
                             extension,
                             "write_note",
                             {
@@ -2532,3 +2720,102 @@ async def test_search_tool_round_limit_signal_terminates_pi(tmp_path, monkeypatc
     assert any("tool-round limit exceeded (2)" in error for error in result.errors)
     assert captured["process"].killed
     assert captured["process"].waited
+
+
+def test_gateway_stops_interleaved_unchanged_failures(tmp_path):
+    gateway = pi_agent._VaultToolGateway(
+        tmp_path / "vault",
+        vault_tools.VAULT_SEARCH_TOOL_SCHEMAS,
+        max_tool_calls=96,
+        max_identical_tool_calls=3,
+    )
+    with gateway:
+        extension = pi_agent._extension_source(
+            vault_tools.VAULT_SEARCH_TOOL_SCHEMAS,
+            gateway_url=gateway.url,
+            token=gateway.token,
+        )
+        for _ in range(3):
+            for path in ["People/Missing.md", "Topics/Missing.md"]:
+                result = _call_gateway(extension, "read_note", {"path": path})
+                assert result["result"].startswith("Error:")
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            _call_gateway(extension, "read_note", {"path": "People/Missing.md"})
+        assert failure.value.code == 429
+        assert gateway.limit_kind == "repeated_tool_call"
+        assert gateway.call_count == 7
+
+
+def test_gateway_exposes_current_investigation_tools(tmp_path):
+    from pydantic import BaseModel
+
+    from backend.services.timeline.pi_tasks import InvestigationTools
+
+    class Result(BaseModel):
+        answer: str
+
+    tools = InvestigationTools(tmp_path, {"source": "Evidence"}, {}, Result)
+    tools.max_tool_calls = 3
+    with pi_agent._VaultToolGateway(
+        tmp_path, schemas=tools.schemas, tool_handler=tools
+    ) as gateway:
+        tools.on_call = lambda: gateway.call_count
+        extension = pi_agent._extension_source(
+            tools.schemas, gateway_url=gateway.url, token=gateway.token
+        )
+        response = _call_gateway(
+            extension, "read_material", {"store": "evidence", "key": "source"}
+        )
+        assert set(response["available_tools"]) == {"finish_task"}
+        response = _call_gateway(
+            extension, "finish_task", {"result": {"answer": "Done"}}
+        )
+        assert response["terminate"] is True
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required by Pi")
+@pytest.mark.parametrize("initial", [None, ["finish_task", "revise_result"]])
+def test_extension_retires_unavailable_reads_including_on_resume(tmp_path, initial):
+    from pydantic import BaseModel
+
+    from backend.services.timeline.pi_tasks import InvestigationTools
+
+    class Result(BaseModel):
+        answer: str
+
+    tools = InvestigationTools(tmp_path, {}, {}, Result)
+    extension_path = tmp_path / "tools.mjs"
+    extension_path.write_text(
+        pi_agent._extension_source(
+            tools.schemas,
+            gateway_url="http://127.0.0.1:1/tool",
+            token="test",
+            available_tools=initial,
+            result_repair_tools=tools.result_repair_tools,
+        )
+    )
+    harness = f"""
+import extension from {json.dumps(extension_path.as_uri())};
+const handlers = {{}}, tools = {{}};
+let active = null;
+extension({{
+  on(name, fn) {{handlers[name] = fn;}},
+  registerTool(tool) {{tools[tool.name] = tool;}},
+  setActiveTools(names) {{active = names;}},
+  appendEntry() {{}},
+}});
+handlers.session_start({{}}, {{sessionManager: {{getBranch: () => []}}}});
+if ({json.dumps(initial)} !== null && active.includes('read_material')) throw Error('Resume exposed exhausted reads');
+globalThis.fetch = async () => ({{ok:true, text:async()=>JSON.stringify({{
+  result:'Error: Candidate needs correction', available_tools:['finish_task','revise_result'],
+}})}});
+try {{await tools.finish_task.execute('submit', {{}});}} catch (_) {{}}
+if (active.length !== 1 || active[0] !== 'revise_result') throw Error('Unavailable tool remains active');
+"""
+    run = subprocess.run(
+        ["node", "--input-type=module", "--eval", harness],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert run.returncode == 0, run.stderr

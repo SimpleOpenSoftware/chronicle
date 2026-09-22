@@ -38,7 +38,12 @@ class FakeClock:
         return self.now_ms
 
 
-def _frame(sequence: int, pcm: bytes) -> audio_pb2.CanonicalPcmFrame:
+def _frame(
+    sequence: int,
+    pcm: bytes,
+    *,
+    base_offset_ms: int = 0,
+) -> audio_pb2.CanonicalPcmFrame:
     pcm = pcm + (b"\x00" * max(0, 1280 - len(pcm)))
     return audio_pb2.CanonicalPcmFrame(
         binding=audio_pb2.CaptureBinding(
@@ -47,7 +52,9 @@ def _frame(sequence: int, pcm: bytes) -> audio_pb2.CanonicalPcmFrame:
             capture_epoch=2,
         ),
         sequence=sequence,
-        monotonic_offset_us=sequence * 40_000,
+        monotonic_offset_us=(base_offset_ms + sequence * 40) * 1_000,
+        device_monotonic_timestamp_us=900_000_000
+        + (base_offset_ms + sequence * 40) * 1_000,
         delivery_class=audio_pb2.DELIVERY_CLASS_LIVE,
         pcm_s16le=pcm,
         data_purpose=audio_pb2.DATA_PURPOSE_NORMAL_CAPTURE,
@@ -82,6 +89,40 @@ async def test_active_consumer_publishes_only_committed_turns():
     assert committed[0]["audio_session_id"] == "audio-1"
     assert committed[0]["turn_revision"] == "0"
     assert committed[0]["pcm"].startswith(b"speech")
+    assert float(committed[0]["speech_started_device_ms"]) == 900_000
+    assert float(committed[0]["speech_ended_device_ms"]) == 900_080
+
+
+@pytest.mark.asyncio
+async def test_phone_coordinates_survive_into_a_wake_matchable_committed_turn():
+    redis = FakeRedis()
+    clock = FakeClock()
+    consumer = ActiveTurnConsumer(
+        redis_client=redis,
+        model_factory=FakeModels,
+        monotonic_ms=clock,
+    )
+    for sequence in range(48):
+        await consumer.handle_frame(
+            _frame(
+                sequence,
+                b"speech" if sequence < 45 else b"silence",
+                base_offset_ms=23_000,
+            ),
+            data_purpose="normal_capture",
+        )
+
+    clock.now_ms += 2_000
+    await consumer.flush_due()
+
+    committed = [
+        fields for stream, fields, _ in redis.added if stream == COMMITTED_TURNS_STREAM
+    ]
+    assert len(committed) == 1
+    assert float(committed[0]["started_at_ms"]) == 23_000
+    assert float(committed[0]["ended_at_ms"]) == 24_920
+    assert float(committed[0]["started_at_ms"]) <= 23_048.65
+    assert float(committed[0]["ended_at_ms"]) >= 24_748.65
 
 
 @pytest.mark.asyncio
@@ -99,6 +140,24 @@ async def test_consumer_health_records_fresh_success_and_errors():
     assert health["frames_consumed"] == 1
     assert health["error_count"] == 1
     assert health["last_success_at"] is not None
+
+
+def test_active_consumer_health_flags_alive_but_lagging_stream():
+    consumer = ActiveTurnConsumer(redis_client=FakeRedis(), model_factory=FakeModels)
+    consumer.running = True
+    stream = "audio:v2:realtime:audio-1"
+    consumer._tasks[stream] = SimpleNamespace(done=lambda: False)
+
+    consumer._record_stream_progress(
+        stream,
+        "95000-0",
+        processed_at_ms=100_000.0,
+    )
+
+    health = consumer.health()
+    assert health["healthy"] is False
+    assert health["lagging_streams"] == 1
+    assert health["delivery_lag_max_ms"] == 5_000.0
 
 
 @pytest.mark.asyncio

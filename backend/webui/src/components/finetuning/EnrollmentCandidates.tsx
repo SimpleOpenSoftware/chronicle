@@ -44,13 +44,14 @@ export default function EnrollmentCandidates() {
   const player = useGaplessPlayer()
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [enrolling, setEnrolling] = useState(false)
+  const [privacyHeld, setPrivacyHeld] = useState(false)
   const [resultMsg, setResultMsg] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Off by default: only clips you relabelled by hand are candidates. When on,
   // segments auto-labelled by identification are also shown (never pre-ticked).
   const [includeIdentified, setIncludeIdentified] = useState(false)
 
-  const { data, isLoading, refetch, isFetching } = useQuery<CandidatesResponse>({
+  const { data, isLoading, isError: candidatesError, refetch, isFetching } = useQuery<CandidatesResponse>({
     queryKey: ['finetuning', 'enrollmentCandidates', includeIdentified],
     queryFn: () => finetuningApi.getEnrollmentCandidates(includeIdentified).then((r) => r.data),
   })
@@ -115,6 +116,7 @@ export default function EnrollmentCandidates() {
     if (selectedClips.length === 0) return
     setError(null)
     setResultMsg(null)
+    setPrivacyHeld(false)
     setEnrolling(true)
     try {
       const payload = selectedClips.map((c) => ({
@@ -128,6 +130,10 @@ export default function EnrollmentCandidates() {
       const parts = [
         `${res.total_enrolled} enrolled (${res.enrolled_new} new, ${res.appended} appended)`,
       ]
+      if (res.privacy_held > 0) {
+        setPrivacyHeld(true)
+        parts.push(`${res.privacy_held} held by privacy screening; review these periods in Timeline`)
+      }
       if (res.failed) parts.push(`${res.failed} failed`)
       if (res.skipped) parts.push(`${res.skipped} skipped`)
       setResultMsg(parts.join(', '))
@@ -157,9 +163,7 @@ export default function EnrollmentCandidates() {
         </Button>
       </div>
       <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
-        Only the segments <strong>you relabelled by hand</strong> are candidates, gated for quality
-        (≥ {data?.min_duration ?? 3}s, no cross-talk, deduped). Clean clips are pre-selected; greyed clips are
-        excluded with a reason — tick them to override. Only the checked clips are enrolled.
+        Review clips from <strong>your speaker corrections</strong>. Only checked clips are enrolled.
       </p>
       <label className="mb-4 inline-flex items-center gap-2 cursor-pointer select-none text-sm text-gray-600 dark:text-gray-400">
         <input
@@ -169,11 +173,11 @@ export default function EnrollmentCandidates() {
           className="h-4 w-4 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
         />
         Also show auto-identified segments
-        <span className="text-xs text-gray-400">(off by default — never pre-ticked; enrolling auto-matches reinforces weak IDs)</span>
+        <span className="text-xs text-gray-400">(review before selecting)</span>
       </label>
 
       {resultMsg && (
-        <Alert tone="success" className="mb-4" icon={<Check className="h-4 w-4" />}>
+        <Alert tone={privacyHeld ? "warning" : "success"} className="mb-4" icon={privacyHeld ? <AlertTriangle className="h-4 w-4" /> : <Check className="h-4 w-4" />}>
           {resultMsg}
         </Alert>
       )}
@@ -183,11 +187,13 @@ export default function EnrollmentCandidates() {
         </Alert>
       )}
 
-      {isLoading ? (
+      {candidatesError ? (
+        <Alert tone="warning">Candidate list is unavailable. Privacy screening may have changed; refresh to try again.</Alert>
+      ) : isLoading ? (
         <p className="text-sm text-gray-500 dark:text-gray-400">Loading candidates…</p>
       ) : !data || data.candidates.length === 0 ? (
         <p className="text-sm text-gray-500 dark:text-gray-400 italic">
-          No enrollment candidates — annotate and apply speaker labels on a conversation, then they'll appear here.
+          No candidates. Apply a speaker correction to add clips here.
         </p>
       ) : (
         <>

@@ -7,6 +7,7 @@ import {
 import { useFinetuningStatus, useCronJobs, useRunCronJob, useDeleteOrphanedAnnotations, useRetryFailedAnnotations, useDeleteFailedAnnotations } from '../hooks/useFinetuning'
 import { useExternalServices } from '../hooks/useSystem'
 import { useAuth } from '../contexts/AuthContext'
+import { sourceDate } from '../utils/sourceTime'
 import { Button, Alert } from '../components/ui'
 
 interface AnnotationTypeCounts {
@@ -19,8 +20,8 @@ interface AnnotationTypeCounts {
 }
 
 function formatTimestamp(iso: string | null | undefined): string {
-  if (!iso) return 'never run'
-  return new Date(iso).toLocaleString()
+  if (!iso) return 'No recorded run'
+  return sourceDate(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
 }
 
 // One card per model we can teach. Speaker recognition is instant kNN enrollment
@@ -30,8 +31,8 @@ interface ModelTarget {
   label: string
   blurb: string
   icon: any
-  /** Applied-but-not-trained human signal, grouped from annotation_counts. */
-  readyTypes: string[]
+  /** Applied correction counts; these are not model-readiness or deployment evidence. */
+  correctionTypes: string[]
   /** null = no batch trigger here (link out instead). */
   cronJobId: string | null
   runVerb: string
@@ -41,27 +42,27 @@ const MODEL_TARGETS: ModelTarget[] = [
   {
     key: 'speaker',
     label: 'Speaker recognition',
-    blurb: 'Voiceprints built from your speaker relabels + enrollment.',
+    blurb: 'Review speaker corrections for voice enrollment.',
     icon: Mic,
-    readyTypes: ['diarization'],
+    correctionTypes: ['diarization'],
     cronJobId: null, // instant kNN — enrolled deliberately in Data Audit
     runVerb: 'Enroll',
   },
   {
     key: 'asr',
-    label: 'ASR model (VibeVoice LoRA)',
-    blurb: 'Transcript corrections exported as fine-tuning data.',
+    label: 'ASR training',
+    blurb: 'Export corrected transcripts and speaker labels to the configured ASR service.',
     icon: FileAudio,
-    readyTypes: ['transcript', 'speech_suggestion_correction', 'timing', 'insert', 'deletion'],
+    correctionTypes: ['transcript', 'diarization'],
     cronJobId: 'asr_finetuning',
-    runVerb: 'Export & train',
+    runVerb: 'Run ASR export',
   },
   {
     key: 'prompts',
     label: 'LLM prompts',
-    blurb: 'Title & memory edits tune the extraction prompts.',
+    blurb: 'Use title and memory corrections in prompt optimization.',
     icon: Sparkles,
-    readyTypes: ['title', 'memory'],
+    correctionTypes: ['title', 'memory'],
     cronJobId: 'prompt_optimization',
     runVerb: 'Optimize prompts',
   },
@@ -81,8 +82,8 @@ const TYPE_LABEL: Record<string, string> = {
 export default function Finetuning() {
   const { isAdmin } = useAuth()
   const { data: externalServices } = useExternalServices(isAdmin, false)
-  const { data: status = null, isLoading: statusLoading, refetch: refetchStatus } = useFinetuningStatus()
-  const { data: cronJobs = [], isLoading: cronLoading, refetch: refetchCron } = useCronJobs()
+  const { data: status = null, isLoading: statusLoading, error: statusError, refetch: refetchStatus } = useFinetuningStatus()
+  const { data: cronJobs = [], isLoading: cronLoading, error: cronError, refetch: refetchCron } = useCronJobs()
   const runJob = useRunCronJob()
   const retryFailed = useRetryFailedAnnotations()
   const deleteFailed = useDeleteFailedAnnotations()
@@ -106,8 +107,8 @@ export default function Finetuning() {
     try {
       const data = await runJob.mutateAsync(t.cronJobId)
       if (data.error) setError(`${t.label}: ${data.error}`)
-      else if (data.processed === 0 && data.message) setError(`${t.label}: ${data.message}`)
-      else setSuccessMessage(`${t.label}: ${data.processed ?? 0} processed`)
+      else if (data.message) setSuccessMessage(`${t.label}: ${data.message}`)
+      else setSuccessMessage(`${t.label}: job completed. Check the run result in Queue & Events.`)
       refetchStatus(); refetchCron()
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'Run failed')
@@ -173,7 +174,7 @@ export default function Finetuning() {
           <Zap className="h-6 w-6 text-blue-600" />
           <div>
             <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">Training</h1>
-            <p className="text-sm text-gray-500 dark:text-gray-400">Teach the models from what you've corrected. Schedules live in Settings → Automation.</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400">Corrections and training jobs.</p>
           </div>
         </div>
         <Button variant="secondary" size="md" onClick={() => { refetchStatus(); refetchCron() }} icon={<RefreshCw className="h-4 w-4" />}>Refresh</Button>
@@ -186,12 +187,13 @@ export default function Finetuning() {
         <Alert tone="success" className="mb-4" icon={<CheckCircle2 className="h-5 w-5 flex-shrink-0" />}>{successMessage}</Alert>
       )}
 
+      {(statusError || cronError) && <Alert role="alert" tone="danger" className="mb-4">Training status could not be loaded. Refresh to try again.</Alert>}
+
       {/* Model cards */}
-      <div className="space-y-4">
+      {!statusError && !cronError && <div className="space-y-4">
         {MODEL_TARGETS.map((t) => {
-          const breakdown = t.readyTypes.map((ty) => ({ ty, count: counts[ty]?.applied || 0 }))
-          const ready = breakdown.reduce((s, b) => s + b.count, 0)
-          const trained = t.readyTypes.reduce((s, ty) => s + (counts[ty]?.trained || 0), 0)
+          const breakdown = t.correctionTypes.map((ty) => ({ ty, count: counts[ty]?.applied || 0 }))
+          const applied = breakdown.reduce((s, b) => s + b.count, 0)
           const cron = cronFor(t.cronJobId)
           const Icon = t.icon
           const running = runningKey === t.key || cron?.running
@@ -213,14 +215,14 @@ export default function Finetuning() {
                   </div>
                 </div>
                 <div className="text-right flex-shrink-0">
-                  <div className="text-3xl font-bold text-gray-900 dark:text-gray-100">{ready}</div>
-                  <div className="text-[11px] uppercase tracking-wide text-gray-400">ready to teach</div>
+                  <div className="text-3xl font-bold text-gray-900 dark:text-gray-100">{applied}</div>
+                  <div className="text-[11px] uppercase tracking-wide text-gray-400">applied corrections</div>
                 </div>
               </div>
 
               {t.key === 'speaker' && (
                 <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-gray-600 dark:text-gray-300">
-                  <span>Enrollment changes identification immediately; review its evidence after adding or relabeling clips.</span>
+                  <span>Enrollment updates voice identification.</span>
                   {speakerHealthUrl && (
                     <a
                       href={`${speakerHealthUrl}/enrollment-health`}
@@ -237,10 +239,10 @@ export default function Finetuning() {
               <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-700 flex items-center justify-between">
                 <div className="flex items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
                   {cron?.enabled
-                    ? <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400"><CheckCircle2 className="h-3.5 w-3.5" /> auto-on</span>
-                    : <span className="inline-flex items-center gap-1"><CircleDashed className="h-3.5 w-3.5" /> {t.cronJobId ? 'manual' : 'instant'}</span>}
+                    ? <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400"><CheckCircle2 className="h-3.5 w-3.5" /> Scheduled</span>
+                    : <span className="inline-flex items-center gap-1"><CircleDashed className="h-3.5 w-3.5" /> {t.cronJobId ? 'Manual' : 'Human review'}</span>}
                   {t.cronJobId && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" /> {formatTimestamp(cron?.last_run)}</span>}
-                  <span>{trained} taught</span>
+
                   {cron?.last_error && <span className="text-red-500 truncate max-w-[180px]" title={cron.last_error}>error</span>}
                 </div>
                 {t.cronJobId ? (
@@ -248,24 +250,24 @@ export default function Finetuning() {
                     variant="primary"
                     size="md"
                     onClick={() => handleRun(t)}
-                    disabled={!!running || ready === 0}
+                    disabled={!!running || !cron}
                     icon={running ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                   >
                     {running ? 'Running…' : t.runVerb}
                   </Button>
                 ) : (
                   <Link
-                    to="/data-audit"
+                    to="/data-audit?view=enroll"
                     className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 text-sm font-medium hover:bg-blue-50 dark:hover:bg-blue-900/20"
                   >
-                    Review &amp; enroll in Data Audit <ArrowUpRight className="h-4 w-4" />
+                    Review enrollment <ArrowUpRight className="h-4 w-4" />
                   </Link>
                 )}
               </div>
             </div>
           )
         })}
-      </div>
+      </div>}
 
       {/* Maintenance — failed/orphaned annotation recovery (collapsed) */}
       {(failedCount > 0 || totalOrphaned > 0) && (

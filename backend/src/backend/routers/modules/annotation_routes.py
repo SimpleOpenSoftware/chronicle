@@ -34,6 +34,7 @@ from backend.models.annotation import (
 )
 from backend.models.conversation import Conversation
 from backend.models.job import JobPriority
+from backend.services import privacy
 from backend.services.memory import get_memory_service
 from backend.services.memory.audit import MemoryCause, UpdateStrategy
 from backend.users import User
@@ -42,6 +43,73 @@ from backend.workers.memory_jobs import enqueue_memory_processing
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/annotations", tags=["annotations"])
+
+
+async def _annotation_responses(annotations, user_id):
+    """Copies of transcript/note text obey their original evidence policy."""
+    visibility = privacy.ConversationPrivacyFilter()
+    records = [
+        {"conversation_id": a.conversation_id} for a in annotations if a.conversation_id
+    ]
+    permitted = {row["conversation_id"] for row in await visibility.filter(records)}
+    note_snapshot = None
+    visible = []
+    for annotation in annotations:
+        if annotation.conversation_id:
+            if annotation.conversation_id in permitted:
+                visible.append(annotation)
+        elif (
+            annotation.annotation_type == AnnotationType.MEMORY and annotation.memory_id
+        ):
+            if note_snapshot is None:
+                note_snapshot = await privacy.load_snapshot(user_id)
+            try:
+                await privacy.guard_payload(
+                    user_id, {"note_path": annotation.memory_id}, snapshot=note_snapshot
+                )
+            except privacy.PrivacyHeld:
+                continue
+            visible.append(annotation)
+    await visibility.assert_current()
+    if note_snapshot is not None:
+        await privacy.assert_current(user_id, note_snapshot)
+    return [AnnotationResponse.model_validate(a) for a in visible]
+
+
+async def _annotation_privacy(annotation, user_id):
+    """Bind an edit to the original evidence owner and one policy revision."""
+    if annotation.conversation_id:
+        record = await privacy.database().conversations.find_one(
+            {"conversation_id": annotation.conversation_id},
+            privacy._RECORD_PROJECTION,
+        )
+        if not record:
+            raise privacy.PrivacyHeld()
+        return str(record["user_id"]), await privacy.require_record(record)
+    if annotation.annotation_type == AnnotationType.MEMORY and annotation.memory_id:
+        owner = str(user_id)
+        snapshot = await privacy.guard_payload(
+            owner, {"note_path": annotation.memory_id}
+        )
+        return owner, snapshot
+    raise privacy.PrivacyHeld()
+
+
+async def _save_with_privacy(document, owner, snapshot):
+    """Order database publication against policy changes and their invalidation.
+
+    Keep the lock around the database write only. Memory jobs and other services
+    may acquire the same publication lock independently.
+    """
+    async with privacy.distributed_lock(
+        privacy.timeline_publication_lock(owner),
+        timeout=120,
+        blocking_timeout=30,
+        renew=True,
+    ):
+        await privacy.assert_current(owner, snapshot)
+        await document.save()
+        await privacy.assert_current(owner, snapshot)
 
 
 def _apply_diarization_label(segment, corrected_speaker: str) -> None:
@@ -94,6 +162,15 @@ async def get_pending_suggestions(
         if not annotations:
             return []
 
+        visibility = privacy.ConversationPrivacyFilter()
+        permitted = {
+            row["conversation_id"]
+            for row in await visibility.filter(
+                [{"conversation_id": a.conversation_id} for a in annotations]
+            )
+        }
+        annotations = [a for a in annotations if a.conversation_id in permitted]
+
         # Batch-fetch conversations for context
         conversation_ids = list(
             {a.conversation_id for a in annotations if a.conversation_id}
@@ -136,12 +213,15 @@ async def get_pending_suggestions(
                 }
             )
 
+        await visibility.assert_current()
         return results
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching suggestions: {e}", exc_info=True)
+        logger.error(f"Error fetching suggestions: {type(e).__name__}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to fetch suggestions: {str(e)}"
+            status_code=500, detail=f"Failed to fetch suggestions: {type(e).__name__}"
         )
 
 
@@ -178,6 +258,11 @@ async def create_memory_annotation(
     - Re-embeds if content changed
     """
     try:
+        privacy_owner = str(current_user.user_id)
+        privacy_snapshot = await privacy.guard_payload(
+            privacy_owner, {"note_path": annotation_data.memory_id}
+        )
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         memory_service = get_memory_service()
 
         # Verify memory ownership
@@ -185,10 +270,13 @@ async def create_memory_annotation(
             memory = await memory_service.get_memory(
                 annotation_data.memory_id, current_user.user_id
             )
+            await privacy.assert_current(privacy_owner, privacy_snapshot)
             if not memory:
                 raise HTTPException(status_code=404, detail="Memory not found")
+        except privacy.PrivacyHeld:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching memory: {e}")
+            logger.error(f"Error fetching memory: {type(e).__name__}")
             raise HTTPException(status_code=404, detail="Memory not found")
 
         # Create annotation
@@ -200,7 +288,7 @@ async def create_memory_annotation(
             corrected_text=annotation_data.corrected_text,
             status=annotation_data.status,
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created memory annotation {annotation.id} for memory {annotation_data.memory_id}"
         )
@@ -208,30 +296,37 @@ async def create_memory_annotation(
         # Update memory content if accepted
         if annotation.status == AnnotationStatus.ACCEPTED:
             try:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
                 await memory_service.update_memory(
                     memory_id=annotation_data.memory_id,
                     content=annotation_data.corrected_text,
                     user_id=current_user.user_id,
                 )
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
                 logger.info(
                     f"Updated memory {annotation_data.memory_id} with corrected text"
                 )
+            except privacy.PrivacyHeld:
+                raise
             except Exception as e:
-                logger.error(f"Error updating memory: {e}")
+                logger.error(f"Error updating memory: {type(e).__name__}")
                 # Annotation is saved, but memory update failed - log but don't fail the request
                 logger.warning(
                     f"Memory annotation {annotation.id} saved but memory update failed"
                 )
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating memory annotation: {e}", exc_info=True)
+        logger.error(f"Error creating memory annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create memory annotation: {str(e)}",
+            detail=f"Failed to create memory annotation: {type(e).__name__}",
         )
 
 
@@ -258,6 +353,10 @@ async def create_transcript_annotation(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         # Validate segment index
         active_transcript = conversation.active_transcript
         if not active_transcript or annotation_data.segment_index >= len(
@@ -278,7 +377,7 @@ async def create_transcript_annotation(
             status=AnnotationStatus.PENDING,  # Changed from ACCEPTED
             processed=False,  # Not applied yet
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created transcript annotation {annotation.id} for conversation {annotation_data.conversation_id} segment {annotation_data.segment_index}"
         )
@@ -287,15 +386,18 @@ async def create_transcript_annotation(
         # Do NOT trigger memory reprocessing yet
         # User must click "Apply Changes" button to apply all annotations together
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating transcript annotation: {e}", exc_info=True)
+        logger.error(f"Error creating transcript annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create transcript annotation: {str(e)}",
+            detail=f"Failed to create transcript annotation: {type(e).__name__}",
         )
 
 
@@ -312,13 +414,15 @@ async def get_memory_annotations(
             Annotation.user_id == current_user.user_id,
         ).to_list()
 
-        return [AnnotationResponse.model_validate(a) for a in annotations]
+        return await _annotation_responses(annotations, str(current_user.user_id))
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching memory annotations: {e}", exc_info=True)
+        logger.error(f"Error fetching memory annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch memory annotations: {str(e)}",
+            detail=f"Failed to fetch memory annotations: {type(e).__name__}",
         )
 
 
@@ -335,13 +439,15 @@ async def get_transcript_annotations(
             Annotation.user_id == current_user.user_id,
         ).to_list()
 
-        return [AnnotationResponse.model_validate(a) for a in annotations]
+        return await _annotation_responses(annotations, str(current_user.user_id))
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching transcript annotations: {e}", exc_info=True)
+        logger.error(f"Error fetching transcript annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch transcript annotations: {str(e)}",
+            detail=f"Failed to fetch transcript annotations: {type(e).__name__}",
         )
 
 
@@ -364,6 +470,11 @@ async def update_annotation_status(
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
 
+        privacy_owner, privacy_snapshot = await _annotation_privacy(
+            annotation, current_user.user_id
+        )
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         old_status = annotation.status
         annotation.status = status
         annotation.updated_at = datetime.now(timezone.utc)
@@ -380,23 +491,26 @@ async def update_annotation_status(
                 and annotation.is_transcript_annotation()
             ):
                 annotation.annotation_type = AnnotationType.SPEECH_SUGGESTION_CORRECTION
-                logger.info(
-                    f"Promoted annotation {annotation_id} to SPEECH_SUGGESTION_CORRECTION "
-                    f"(AI suggested: {annotation.model_suggested_text!r}, user decided: {annotation.corrected_text!r})"
-                )
+                logger.info("Promoted annotation to SPEECH_SUGGESTION_CORRECTION")
 
             if annotation.is_memory_annotation():
                 # Update memory
                 try:
                     memory_service = get_memory_service()
+                    await privacy.assert_current(privacy_owner, privacy_snapshot)
                     await memory_service.update_memory(
                         memory_id=annotation.memory_id,
                         content=annotation.corrected_text,
                         user_id=current_user.user_id,
                     )
+                    await privacy.assert_current(privacy_owner, privacy_snapshot)
                     logger.info(f"Applied suggestion to memory {annotation.memory_id}")
+                except privacy.PrivacyHeld:
+                    raise
                 except Exception as e:
-                    logger.error(f"Error applying memory suggestion: {e}")
+                    logger.error(
+                        f"Error applying memory suggestion: {type(e).__name__}"
+                    )
                     # Don't fail the status update if memory update fails
             elif (
                 annotation.is_transcript_annotation()
@@ -408,6 +522,7 @@ async def update_annotation_status(
                         Conversation.conversation_id == annotation.conversation_id,
                         Conversation.user_id == annotation.user_id,
                     )
+                    await privacy.assert_current(privacy_owner, privacy_snapshot)
                     if conversation:
                         transcript = conversation.active_transcript
                         if transcript and annotation.segment_index < len(
@@ -416,12 +531,18 @@ async def update_annotation_status(
                             transcript.segments[annotation.segment_index].text = (
                                 annotation.corrected_text
                             )
-                            await conversation.save()
+                            await _save_with_privacy(
+                                conversation, privacy_owner, privacy_snapshot
+                            )
                             logger.info(
                                 f"Applied suggestion to transcript segment {annotation.segment_index}"
                             )
+                except privacy.PrivacyHeld:
+                    raise
                 except Exception as e:
-                    logger.error(f"Error applying transcript suggestion: {e}")
+                    logger.error(
+                        f"Error applying transcript suggestion: {type(e).__name__}"
+                    )
                     # Don't fail the status update if segment update fails
             elif annotation.is_title_annotation():
                 # Update conversation title
@@ -430,17 +551,22 @@ async def update_annotation_status(
                         Conversation.conversation_id == annotation.conversation_id,
                         Conversation.user_id == annotation.user_id,
                     )
+                    await privacy.assert_current(privacy_owner, privacy_snapshot)
                     if conversation:
                         conversation.title = annotation.corrected_text
-                        await conversation.save()
+                        await _save_with_privacy(
+                            conversation, privacy_owner, privacy_snapshot
+                        )
                         logger.info(
                             f"Applied title suggestion to conversation {annotation.conversation_id}"
                         )
+                except privacy.PrivacyHeld:
+                    raise
                 except Exception as e:
-                    logger.error(f"Error applying title suggestion: {e}")
+                    logger.error(f"Error applying title suggestion: {type(e).__name__}")
                     # Don't fail the status update if title update fails
 
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(f"Updated annotation {annotation_id} status to {status}")
 
         return {
@@ -451,11 +577,13 @@ async def update_annotation_status(
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error updating annotation status: {e}", exc_info=True)
+        logger.error(f"Error updating annotation status: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to update annotation status: {str(e)}",
+            detail=f"Failed to update annotation status: {type(e).__name__}",
         )
 
 
@@ -493,11 +621,13 @@ async def delete_annotation(
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error deleting annotation: {e}", exc_info=True)
+        logger.error(f"Error deleting annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to delete annotation: {str(e)}",
+            detail=f"Failed to delete annotation: {type(e).__name__}",
         )
 
 
@@ -521,6 +651,11 @@ async def update_annotation(
         )
         if not annotation:
             raise HTTPException(status_code=404, detail="Annotation not found")
+
+        privacy_owner, privacy_snapshot = await _annotation_privacy(
+            annotation, current_user.user_id
+        )
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
 
         if annotation.processed:
             raise HTTPException(
@@ -549,18 +684,21 @@ async def update_annotation(
             annotation.insert_speaker = update_data.insert_speaker
 
         annotation.updated_at = datetime.now(timezone.utc)
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(f"Updated annotation {annotation_id}")
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error updating annotation: {e}", exc_info=True)
+        logger.error(f"Error updating annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to update annotation: {str(e)}",
+            detail=f"Failed to update annotation: {type(e).__name__}",
         )
 
 
@@ -586,6 +724,10 @@ async def create_insert_annotation(
         )
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
 
         active_transcript = conversation.active_transcript
         if not active_transcript:
@@ -620,21 +762,24 @@ async def create_insert_annotation(
             status=AnnotationStatus.PENDING,
             processed=False,
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created insert annotation {annotation.id} for conversation "
             f"{annotation_data.conversation_id} after index {annotation_data.insert_after_index}"
         )
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating insert annotation: {e}", exc_info=True)
+        logger.error(f"Error creating insert annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create insert annotation: {str(e)}",
+            detail=f"Failed to create insert annotation: {type(e).__name__}",
         )
 
 
@@ -651,13 +796,15 @@ async def get_insert_annotations(
             Annotation.user_id == current_user.user_id,
         ).to_list()
 
-        return [AnnotationResponse.model_validate(a) for a in annotations]
+        return await _annotation_responses(annotations, str(current_user.user_id))
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching insert annotations: {e}", exc_info=True)
+        logger.error(f"Error fetching insert annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch insert annotations: {str(e)}",
+            detail=f"Failed to fetch insert annotations: {type(e).__name__}",
         )
 
 
@@ -685,6 +832,10 @@ async def create_title_annotation(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         # Create annotation (instantly applied)
         annotation = Annotation(
             annotation_type=AnnotationType.TITLE,
@@ -697,7 +848,7 @@ async def create_title_annotation(
             processed_at=datetime.now(timezone.utc),
             processed_by="instant",
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created title annotation {annotation.id} for conversation {annotation_data.conversation_id}"
         )
@@ -705,23 +856,28 @@ async def create_title_annotation(
         # Apply title change immediately
         try:
             conversation.title = annotation_data.corrected_text
-            await conversation.save()
+            await _save_with_privacy(conversation, privacy_owner, privacy_snapshot)
             logger.info(
                 f"Updated title for conversation {annotation_data.conversation_id}"
             )
+        except privacy.PrivacyHeld:
+            raise
         except Exception as e:
-            logger.error(f"Error updating conversation title: {e}")
+            logger.error(f"Error updating conversation title: {type(e).__name__}")
             # Annotation is saved but title update failed — log but don't fail the request
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating title annotation: {e}", exc_info=True)
+        logger.error(f"Error creating title annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create title annotation: {str(e)}",
+            detail=f"Failed to create title annotation: {type(e).__name__}",
         )
 
 
@@ -738,13 +894,15 @@ async def get_title_annotations(
             Annotation.user_id == current_user.user_id,
         ).to_list()
 
-        return [AnnotationResponse.model_validate(a) for a in annotations]
+        return await _annotation_responses(annotations, str(current_user.user_id))
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching title annotations: {e}", exc_info=True)
+        logger.error(f"Error fetching title annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch title annotations: {str(e)}",
+            detail=f"Failed to fetch title annotations: {type(e).__name__}",
         )
 
 
@@ -773,6 +931,10 @@ async def create_diarization_annotation(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         # Validate segment index
         active_transcript = conversation.active_transcript
         if not active_transcript or annotation_data.segment_index >= len(
@@ -794,7 +956,7 @@ async def create_diarization_annotation(
             status=annotation_data.status,
             processed=False,  # Not applied or sent to training yet
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created diarization annotation {annotation.id} for conversation {annotation_data.conversation_id} segment {annotation_data.segment_index}"
         )
@@ -810,6 +972,7 @@ async def create_diarization_annotation(
                 start = float(annotation_data.segment_start_time)
                 seg = active_transcript.segments[annotation_data.segment_index]
                 seg_end = float(getattr(seg, "end", None) or start + 4.0)
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
                 await background_bucket_controller.add_background_clip(
                     annotation_data.conversation_id,
                     start,
@@ -818,18 +981,26 @@ async def create_diarization_annotation(
                     source="triage",
                     user=current_user,
                 )
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
+            except privacy.PrivacyHeld:
+                raise
             except Exception as e:  # noqa: BLE001 - bucket add is best-effort
-                logger.warning(f"Background bucket add failed for {annotation.id}: {e}")
+                logger.warning(
+                    f"Background bucket add failed for {annotation.id}: {type(e).__name__}"
+                )
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating diarization annotation: {e}", exc_info=True)
+        logger.error(f"Error creating diarization annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create diarization annotation: {str(e)}",
+            detail=f"Failed to create diarization annotation: {type(e).__name__}",
         )
 
 
@@ -854,6 +1025,10 @@ async def create_timing_annotation(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         active_transcript = conversation.active_transcript
         if not active_transcript or annotation_data.segment_index >= len(
             active_transcript.segments
@@ -875,22 +1050,25 @@ async def create_timing_annotation(
             status=annotation_data.status,
             processed=False,
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created timing annotation {annotation.id} for conversation "
             f"{annotation_data.conversation_id} segment {annotation_data.segment_index} "
             f"→ [{annotation_data.new_start:.2f}, {annotation_data.new_end:.2f}]"
         )
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating timing annotation: {e}", exc_info=True)
+        logger.error(f"Error creating timing annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create timing annotation: {str(e)}",
+            detail=f"Failed to create timing annotation: {type(e).__name__}",
         )
 
 
@@ -905,7 +1083,7 @@ async def get_timing_annotations(
         Annotation.user_id == current_user.user_id,
         Annotation.annotation_type == AnnotationType.TIMING,
     ).to_list()
-    return [AnnotationResponse.model_validate(a) for a in annotations]
+    return await _annotation_responses(annotations, str(current_user.user_id))
 
 
 @router.post("/deletion", response_model=AnnotationResponse)
@@ -928,6 +1106,10 @@ async def create_deletion_annotation(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         active_transcript = conversation.active_transcript
         if not active_transcript or annotation_data.segment_index >= len(
             active_transcript.segments
@@ -942,21 +1124,24 @@ async def create_deletion_annotation(
             status=annotation_data.status,
             processed=False,
         )
-        await annotation.save()
+        await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created deletion annotation {annotation.id} for conversation "
             f"{annotation_data.conversation_id} segment {annotation_data.segment_index}"
         )
 
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
         return AnnotationResponse.model_validate(annotation)
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error creating deletion annotation: {e}", exc_info=True)
+        logger.error(f"Error creating deletion annotation: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create deletion annotation: {str(e)}",
+            detail=f"Failed to create deletion annotation: {type(e).__name__}",
         )
 
 
@@ -971,7 +1156,7 @@ async def get_deletion_annotations(
         Annotation.user_id == current_user.user_id,
         Annotation.annotation_type == AnnotationType.DELETION,
     ).to_list()
-    return [AnnotationResponse.model_validate(a) for a in annotations]
+    return await _annotation_responses(annotations, str(current_user.user_id))
 
 
 @router.get("/diarization/{conversation_id}", response_model=List[AnnotationResponse])
@@ -987,13 +1172,15 @@ async def get_diarization_annotations(
             Annotation.user_id == current_user.user_id,
         ).to_list()
 
-        return [AnnotationResponse.model_validate(a) for a in annotations]
+        return await _annotation_responses(annotations, str(current_user.user_id))
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching diarization annotations: {e}", exc_info=True)
+        logger.error(f"Error fetching diarization annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch diarization annotations: {str(e)}",
+            detail=f"Failed to fetch diarization annotations: {type(e).__name__}",
         )
 
 
@@ -1020,6 +1207,10 @@ async def apply_diarization_annotations(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         # Get unprocessed diarization annotations
         annotations = await Annotation.find(
             Annotation.annotation_type == AnnotationType.DIARIZATION,
@@ -1027,6 +1218,7 @@ async def apply_diarization_annotations(
             Annotation.user_id == current_user.user_id,
             Annotation.processed == False,  # Only unprocessed
         ).to_list()
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
 
         if not annotations:
             return JSONResponse(
@@ -1107,7 +1299,7 @@ async def apply_diarization_annotations(
         if active_transcript.diarization_source:
             new_version.diarization_source = active_transcript.diarization_source
 
-        await conversation.save()
+        await _save_with_privacy(conversation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Created new transcript version {new_version_id} with {len(annotations)} diarization corrections"
         )
@@ -1117,13 +1309,14 @@ async def apply_diarization_annotations(
             annotation.processed = True
             annotation.processed_at = datetime.now(timezone.utc)
             annotation.processed_by = "apply"
-            await annotation.save()
+            await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
 
         # Chain memory reprocessing unless this is an annotation/training import.
         # Diarization-only edits change speaker attribution, so use the same
         # speaker-diff strategy as a speaker reprocess (it falls back to full
         # re-extraction if no diff applies).
         if _should_reprocess_memory(conversation):
+            await privacy.assert_current(privacy_owner, privacy_snapshot)
             enqueue_memory_processing(
                 conversation_id=conversation_id,
                 priority=JobPriority.NORMAL,
@@ -1146,11 +1339,13 @@ async def apply_diarization_annotations(
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error applying diarization annotations: {e}", exc_info=True)
+        logger.error(f"Error applying diarization annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to apply diarization annotations: {str(e)}",
+            detail=f"Failed to apply diarization annotations: {type(e).__name__}",
         )
 
 
@@ -1176,12 +1371,17 @@ async def apply_all_annotations(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+        privacy_owner = str(conversation.user_id)
+        privacy_snapshot = await privacy.require_record(conversation)
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
+
         # Get ALL unprocessed annotations (both types)
         annotations = await Annotation.find(
             Annotation.conversation_id == conversation_id,
             Annotation.user_id == current_user.user_id,
             Annotation.processed == False,
         ).to_list()
+        await privacy.assert_current(privacy_owner, privacy_snapshot)
 
         if not annotations:
             return JSONResponse(
@@ -1354,7 +1554,7 @@ async def apply_all_annotations(
         if active_transcript.diarization_source:
             new_version.diarization_source = active_transcript.diarization_source
 
-        await conversation.save()
+        await _save_with_privacy(conversation, privacy_owner, privacy_snapshot)
         logger.info(
             f"Applied {len(annotations)} annotations "
             f"(diarization: {len(diarization_annotations)}, "
@@ -1370,12 +1570,13 @@ async def apply_all_annotations(
             annotation.processed_at = datetime.now(timezone.utc)
             annotation.processed_by = "apply"
             annotation.status = AnnotationStatus.ACCEPTED
-            await annotation.save()
+            await _save_with_privacy(annotation, privacy_owner, privacy_snapshot)
 
         # Trigger memory reprocessing (once for all changes) unless this is an
         # annotation/training import. Combined apply may change transcript text as
         # well as speakers, so re-extract in full for normal conversations.
         if _should_reprocess_memory(conversation):
+            await privacy.assert_current(privacy_owner, privacy_snapshot)
             enqueue_memory_processing(
                 conversation_id=conversation_id,
                 priority=JobPriority.NORMAL,
@@ -1408,9 +1609,11 @@ async def apply_all_annotations(
 
     except HTTPException:
         raise
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error applying annotations: {e}", exc_info=True)
+        logger.error(f"Error applying annotations: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to apply annotations: {str(e)}",
+            detail=f"Failed to apply annotations: {type(e).__name__}",
         )

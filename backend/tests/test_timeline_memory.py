@@ -48,7 +48,8 @@ def make_episode(
             ),
             started_at=started,
             ended_at=started + timedelta(minutes=minutes),
-            role="uncertain",
+            role="user_statement",
+            excerpt="A meaningful statement supporting this activity.",
             metadata=(
                 {"conversation_id": evidence_conversation_id}
                 if evidence_conversation_id

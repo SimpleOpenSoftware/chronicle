@@ -210,13 +210,13 @@ function EventRow({
 
 function SummaryStrip({ summary }: { summary?: SystemEventsSummary }) {
   const bySev = summary?.by_severity ?? {}
-  const cards: { label: string; value: number; cls: string }[] = [
-    { label: 'Total (window)', value: summary?.total ?? 0, cls: 'text-gray-900 dark:text-gray-100' },
-    { label: 'Critical', value: bySev.critical ?? 0, cls: 'text-red-600 dark:text-red-400' },
-    { label: 'Error', value: bySev.error ?? 0, cls: 'text-red-500 dark:text-red-400' },
-    { label: 'Warning', value: bySev.warning ?? 0, cls: 'text-amber-600 dark:text-amber-400' },
-    { label: 'Info', value: bySev.info ?? 0, cls: 'text-blue-600 dark:text-blue-400' },
-    { label: 'Unacknowledged', value: summary?.unacked ?? 0, cls: 'text-orange-600 dark:text-orange-400' },
+  const cards: { label: string; value: number | string; cls: string }[] = [
+    { label: 'Total (window)', value: summary?.total ?? '—', cls: 'text-gray-900 dark:text-gray-100' },
+    { label: 'Critical', value: summary ? bySev.critical ?? 0 : '—', cls: 'text-red-600 dark:text-red-400' },
+    { label: 'Error', value: summary ? bySev.error ?? 0 : '—', cls: 'text-red-500 dark:text-red-400' },
+    { label: 'Warning', value: summary ? bySev.warning ?? 0 : '—', cls: 'text-amber-600 dark:text-amber-400' },
+    { label: 'Info', value: summary ? bySev.info ?? 0 : '—', cls: 'text-blue-600 dark:text-blue-400' },
+    { label: 'Unacknowledged', value: summary?.unacked ?? '—', cls: 'text-orange-600 dark:text-orange-400' },
   ]
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -242,85 +242,29 @@ function MemoryFallbackBand({
   onInspect: () => void
 }) {
   const stats = summary?.memory_fallbacks
-  if (!stats) {
-    return (
-      <section className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-700 dark:bg-gray-900/40" aria-label="Deterministic memory fallback statistics">
-        <div className="text-sm font-medium text-gray-700 dark:text-gray-300">Deterministic memory fallback</div>
-        <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">Loading fallback telemetry…</div>
-      </section>
-    )
-  }
-
-  const hasFallbacks = stats.occurrences > 0
-  const reasons = Object.entries(stats.by_reason).sort((a, b) => b[1] - a[1])
+  if (!stats || stats.occurrences === 0) return null
 
   return (
-    <section
-      className={`rounded-lg border px-4 py-3 ${
-        hasFallbacks
-          ? 'border-amber-200 bg-amber-50/70 dark:border-amber-800/70 dark:bg-amber-950/20'
-          : 'border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-900/40'
-      }`}
-      aria-label="Deterministic memory fallback statistics"
-    >
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
-        <div className="flex min-w-0 items-start gap-3 lg:w-80 lg:flex-shrink-0">
-          <span className={`mt-0.5 rounded-md p-1.5 ${hasFallbacks ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-800 dark:text-gray-300'}`}>
-            {hasFallbacks ? <AlertTriangle className="h-4 w-4" /> : <Check className="h-4 w-4" />}
-          </span>
-          <div>
-            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Deterministic memory fallback</div>
-            <div className="mt-0.5 text-xs text-gray-600 dark:text-gray-400">
-              {hasFallbacks
-                ? `${stats.occurrences} write${stats.occurrences === 1 ? '' : 's'} across ${stats.affected_conversations} conversation${stats.affected_conversations === 1 ? '' : 's'}`
-                : 'No fallback writes in this window'}
-            </div>
+    <section className="rounded-lg border border-amber-200 bg-amber-50/70 px-4 py-3 dark:border-amber-800/70 dark:bg-amber-950/20" aria-label="Memory fallback events">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Memory writes used fallback</div>
+          <div className="mt-0.5 text-xs text-gray-600 dark:text-gray-400">
+            {stats.occurrences} writes across {stats.affected_conversations} conversations
           </div>
         </div>
-
-        <div className="min-w-0 flex-1 border-t border-gray-200 pt-3 dark:border-gray-700 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
-          {hasFallbacks ? (
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-medium text-gray-500 dark:text-gray-400">Agent path</span>
-                {stats.agent_paths.length > 0 ? stats.agent_paths.slice(0, 3).map(path => (
-                  <span key={`${path.primary_backend}:${path.recovery_backend}`} className="rounded bg-white/80 px-2 py-1 font-mono text-gray-700 ring-1 ring-inset ring-amber-200 dark:bg-gray-900/60 dark:text-gray-200 dark:ring-amber-800/70">
-                    {path.primary_backend} → {path.recovery_backend === 'none' ? 'no recovery' : path.recovery_backend} → deterministic
-                    <span className="ml-1 text-gray-400">×{path.occurrences}</span>
-                  </span>
-                )) : (
-                  <span className="text-gray-500 dark:text-gray-400">Unavailable for earlier events</span>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-medium text-gray-500 dark:text-gray-400">Reasons</span>
-                {reasons.map(([reason, count]) => (
-                  <span key={reason} className="rounded bg-white/80 px-2 py-1 text-gray-700 ring-1 ring-inset ring-gray-200 dark:bg-gray-900/60 dark:text-gray-200 dark:ring-gray-700">
-                    {metricLabel(reason)} <span className="text-gray-400">×{count}</span>
-                  </span>
-                ))}
-                {stats.latest_at && (
-                  <span className="text-gray-500 dark:text-gray-400">Latest {formatTime(stats.latest_at)}</span>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="text-xs text-gray-500 dark:text-gray-400">
-              Counts are derived from the durable event ledger; rapid retries are counted individually.
-            </div>
-          )}
-        </div>
-
-        {hasFallbacks && (
-          <button
-            type="button"
-            onClick={onInspect}
-            className="self-start rounded-md px-2.5 py-1.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-300 hover:bg-amber-100 dark:text-amber-300 dark:ring-amber-700 dark:hover:bg-amber-900/30 lg:self-center"
-          >
-            Inspect memory events
-          </button>
-        )}
+        <button type="button" onClick={onInspect} className="rounded-md px-2.5 py-1.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-300 dark:text-amber-300 dark:ring-amber-700">
+          Inspect memory events
+        </button>
       </div>
+      <details className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+        <summary className="cursor-pointer">Fallback details</summary>
+        <ul className="mt-2 space-y-1">
+          {Object.entries(stats.by_reason).map(([reason, count]) => <li key={reason}>{metricLabel(reason)} ×{count}</li>)}
+          {stats.agent_paths.map(path => <li key={`${path.primary_backend}:${path.recovery_backend}`}>{path.primary_backend} → {path.recovery_backend === 'none' ? 'no recovery' : path.recovery_backend} → deterministic ×{path.occurrences}</li>)}
+        </ul>
+        {stats.latest_at && <div className="mt-1">Latest {formatTime(stats.latest_at)}</div>}
+      </details>
     </section>
   )
 }
@@ -418,7 +362,7 @@ export default function SystemEvents() {
       <div className="rounded-lg border border-dashed border-gray-300 p-10 text-center dark:border-gray-700">
         <ShieldAlert className="mx-auto mb-3 h-8 w-8 text-gray-400" />
         <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Access Restricted</h2>
-        <p className="text-sm text-gray-500 dark:text-gray-400">System errors are visible to administrators only.</p>
+        <p className="text-sm text-gray-500 dark:text-gray-400">System events are visible to administrators only.</p>
       </div>
     )
   }
@@ -516,7 +460,7 @@ export default function SystemEvents() {
       <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center space-x-2">
           <AlertTriangle className="h-6 w-6 text-red-600 flex-shrink-0" />
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">System Errors</h1>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">System Events</h1>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {selected.size > 0 && (
@@ -528,7 +472,7 @@ export default function SystemEvents() {
                 title="Copy the selected events to the clipboard"
                 icon={copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
               >
-                {copied ? 'Copied!' : `Copy errors (${selected.size})`}
+                {copied ? 'Copied!' : `Copy events (${selected.size})`}
               </Button>
               <button
                 onClick={onAckSelected}
@@ -544,7 +488,7 @@ export default function SystemEvents() {
             onClick={onAckAll}
             disabled={(summary?.unacked ?? 0) === 0}
             className="flex items-center gap-2 rounded-md bg-green-50 px-3 py-2 text-sm font-medium text-green-700 hover:bg-green-100 disabled:opacity-50 disabled:hover:bg-green-50 dark:bg-green-900/30 dark:text-green-300 dark:hover:bg-green-900/50"
-            title="Acknowledge all unacknowledged events matching the current filters"
+            title="Mark all matching events as acknowledged; this does not resolve an active failure"
           >
             <Check className="h-4 w-4" />
             Acknowledge all
@@ -565,9 +509,7 @@ export default function SystemEvents() {
       </div>
 
       <p className="mb-5 text-sm text-gray-500 dark:text-gray-400">
-        Operational and application failures across the system — captured backend errors, client
-        error-disconnects, failed jobs, plugin failures, and service crash-loop / recovery transitions.
-        New events stream in live. Times shown in IST. Retained for 30 days.
+        Events from the last 30 days. Times in IST. Unacknowledged counts include historical events, not just current failures.
       </p>
 
       {error && (
@@ -652,7 +594,7 @@ export default function SystemEvents() {
         </div>
       ) : events.length === 0 ? (
         <div className="rounded-lg border border-dashed border-gray-300 p-10 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
-          No events for the current filters. 🎉
+          No events match these filters.
         </div>
       ) : (
         <div className="space-y-2">

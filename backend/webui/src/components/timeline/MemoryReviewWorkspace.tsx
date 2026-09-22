@@ -83,7 +83,7 @@ export default function MemoryReviewWorkspace() {
 
       {shouldOfferBrowserTimezone && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper)] px-3 py-2 text-xs text-gray-600 dark:text-gray-300">
-          <span>{storedTimezone ? `Times are shown in ${storedTimezone}; this browser reports ${browserTimezone}.` : `Times are shown in the browser timezone, ${browserTimezone}. Save it to keep day boundaries consistent on other devices.`}</span>
+          <span>{storedTimezone ? `Times are shown in ${storedTimezone}; this browser reports ${browserTimezone}.` : `Using browser timezone: ${browserTimezone}.`}</span>
           <Button variant="ghost" size="sm" onClick={saveBrowserTimezone} disabled={savingBrowserTimezone}>
             {storedTimezone ? 'Use browser timezone' : 'Save browser timezone'}
           </Button>
@@ -94,7 +94,7 @@ export default function MemoryReviewWorkspace() {
         <div className="flex h-40 items-center justify-center text-sm text-gray-500 dark:text-gray-400">Loading review day…</div>
       ) : selectedDay.isError ? (
         <div className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
-          Could not load this review day. {(selectedDay.error as Error).message}
+          Could not load this review day. <Button variant="secondary" size="sm" onClick={() => selectedDay.refetch()}>Retry</Button>
         </div>
       ) : (
         <ReviewDesk

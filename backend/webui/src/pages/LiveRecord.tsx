@@ -1,12 +1,12 @@
 import { useState } from 'react'
-import { Radio, Zap, Archive, Settings, Monitor, Mic } from 'lucide-react'
+import { Radio, Settings, Monitor, Mic, Headphones } from 'lucide-react'
 import { useRecording, isLoopbackDevice, isMacOS } from '../contexts/RecordingContext'
 import { Button } from '../components/ui'
 import SimplifiedControls from '../components/audio/SimplifiedControls'
-import StatusDisplay from '../components/audio/StatusDisplay'
 import AudioVisualizer from '../components/audio/AudioVisualizer'
-import SimpleDebugPanel from '../components/audio/SimpleDebugPanel'
 import WakeFeedback from '../components/audio/WakeFeedback'
+import DialogueTasks from '../components/DialogueTasks'
+import { ConversationPhase, SpeechEngine, VoiceTaskStatus } from '../protocol/audioV2'
 
 export default function LiveRecord({
   memorySpaceId,
@@ -17,12 +17,33 @@ export default function LiveRecord({
   destinationLabel?: string
   embedded?: boolean
 } = {}) {
+  const params = new URLSearchParams(window.location.search)
+  const threadId = params.get("thread") || undefined
+  memorySpaceId = memorySpaceId || params.get("memory_space_id") || undefined
   const recording = useRecording()
   const [isLoadingMicrophones, setIsLoadingMicrophones] = useState(false)
   const microphoneDevices = recording.availableDevices.filter(
     device => recording.audioSource === 'mic' || !isLoopbackDevice(device.label)
   )
   const microphoneLabelsKnown = microphoneDevices.some(device => device.label)
+  const voice = recording.conversationState
+  const engaged = Boolean(voice && voice.phase !== ConversationPhase.ENDED && voice.phase !== ConversationPhase.UNSPECIFIED)
+  const voiceLabel = recording.conversationStarting ? 'Starting conversation…' : voice ? {
+    [ConversationPhase.UNSPECIFIED]: 'Ready to talk',
+    [ConversationPhase.LISTENING]: 'Listening',
+    [ConversationPhase.THINKING]: 'Thinking',
+    [ConversationPhase.SPEAKING]: 'Responding',
+    [ConversationPhase.ENDED]: 'Conversation ended',
+  }[voice.phase] : 'Ready to talk'
+  const activities = engaged && !recording.conversationError ? [
+    recording.voiceProcessing?.transcribing && 'Transcribing',
+    recording.voiceProcessing?.generatingText && 'Generating reply',
+    recording.voiceProcessing?.synthesizingSpeech && 'Generating speech (TTS)',
+    recording.voiceProcessing?.generatingResponse && 'Generating response',
+    recording.playbackActivity && ({ preparing: 'Preparing audio', playing: 'Playing', buffering: 'Buffering', idle: '' }[recording.playbackActivity]),
+  ].filter((label): label is string => Boolean(label)) : []
+  const recordingBusy = !['idle', 'error', 'streaming'].includes(recording.currentStep ?? 'idle')
+
 
   const loadMicrophones = async () => {
     setIsLoadingMicrophones(true)
@@ -44,45 +65,13 @@ export default function LiveRecord({
           </h1>
         </div>
 
-        {/* Mode Toggle */}
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={() => recording.setMode('streaming')}
-            disabled={recording.isRecording}
-            className={`
-              flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all
-              ${recording.mode === 'streaming'
-                ? 'bg-blue-600 text-white shadow-md'
-                : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-300 dark:hover:bg-gray-600'
-              }
-              ${recording.isRecording ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
-            `}
-          >
-            <Zap className="h-4 w-4" />
-            <span>Streaming</span>
-          </button>
-          <button
-            onClick={() => recording.setMode('batch')}
-            disabled={recording.isRecording}
-            className={`
-              flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all
-              ${recording.mode === 'batch'
-                ? 'bg-blue-600 text-white shadow-md'
-                : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-300 dark:hover:bg-gray-600'
-              }
-              ${recording.isRecording ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
-            `}
-          >
-            <Archive className="h-4 w-4" />
-            <span>Batch</span>
-          </button>
-        </div>
       </div>
 
       {/* Audio Source Toggle */}
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <div className={`inline-flex rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 p-0.5 ${recording.isRecording ? 'opacity-50 pointer-events-none' : ''}`}>
           <button
+            aria-pressed={recording.audioSource === 'mic'}
             onClick={() => recording.setAudioSource('mic')}
             disabled={recording.isRecording}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
@@ -95,6 +84,7 @@ export default function LiveRecord({
             <span>Mic</span>
           </button>
           <button
+            aria-pressed={recording.audioSource === 'meeting'}
             onClick={() => recording.setAudioSource('meeting')}
             disabled={recording.isRecording}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
@@ -108,6 +98,7 @@ export default function LiveRecord({
             <span>Meeting</span>
           </button>
           <button
+            aria-pressed={recording.audioSource === 'tab'}
             onClick={() => recording.setAudioSource('tab')}
             disabled={recording.isRecording}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
@@ -192,28 +183,10 @@ export default function LiveRecord({
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400">
               {recording.monitorDeviceId
-                ? 'Selected — the share picker will be skipped and everything playing through this output is recorded. Clear it to share a single tab instead.'
-                : 'Leave unset to pick a browser tab from the share dialog instead.'}{' '}
-              {recording.likelyLacksDisplayAudio && (
-                <>
-                  {isMacOS ? (
-                    <>
-                      Firefox can't share tab audio (bugzilla #1541425) and macOS has no built-in loopback input, so
-                      this needs a virtual audio driver. <strong>Simplest fix: use a Chromium browser</strong>, where
-                      tab audio works with no setup. To stay in Firefox: <code>brew install --cask blackhole-2ch</code>,
-                      build a Multi-Output Device in Audio MIDI Setup so you can still hear the meeting, then select
-                      BlackHole above.
-                    </>
-                  ) : (
-                    <>
-                      Firefox can't share tab audio, so pick the "Monitor of …" entry for the output you're actually
-                      listening through — headphones and speakers each have their own.
-                    </>
-                  )}{' '}
-                  If browser capture still doesn't work, use the Chronicle tray's ScreenPipe recorder instead; it
-                  captures the meeting outside Firefox.
-                </>
-              )}
+                ? 'Records all audio from the selected output.'
+                : recording.likelyLacksDisplayAudio
+                  ? 'This browser needs a loopback audio input. You can also use a Chromium browser to share tab audio.'
+                  : 'Leave unset to choose a browser tab.'}
             </p>
           </div>
         )
@@ -265,34 +238,100 @@ export default function LiveRecord({
           </div>
           {!microphoneLabelsKnown && (
             <p className="pl-6 text-xs text-gray-500 dark:text-gray-400">
-              Your browser will ask for microphone access so Chronicle can list devices. Recording will not start.
+              Allow access to choose a microphone. Recording will not start.
             </p>
           )}
         </div>
       )}
 
-      {/* Mode Description */}
-      <div className="mb-4 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-3">
-        <p className="text-sm text-gray-700 dark:text-gray-300">
-          {recording.mode === 'streaming' ? (
-            <>
-              <strong>Streaming Mode:</strong> Audio is sent in real-time chunks and processed immediately.
-              Transcription starts while you're still speaking.
-            </>
-          ) : (
-            <>
-              <strong>Batch Mode:</strong> Audio is accumulated and sent as a complete file when you stop recording.
-              Transcription begins after recording ends.
-            </>
-          )}
-        </p>
-      </div>
-
-      {/* Main Controls - Single START button */}
-      <div className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
-        Recording destination: <strong>{destinationLabel}</strong>
+      <div className="mb-3 text-sm text-[var(--tape-activity)]">
+        Recording destination: <strong className="text-[var(--tape-ink)]">{destinationLabel}</strong>
       </div>
       <SimplifiedControls recording={recording} memorySpaceId={memorySpaceId} />
+
+      {recording.audioSource === 'mic' && (
+        <section aria-label="Voice conversation" className="mb-6 rounded-lg border border-gray-200 dark:border-gray-700 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-gray-900 dark:text-gray-100">
+              <Headphones className="h-4 w-4 text-blue-600" aria-hidden="true" />
+              <h2 className="font-medium">Talk to Chronicle</h2>
+              <span role="status" aria-live="polite" className="text-sm text-gray-500 dark:text-gray-400">{voiceLabel}</span>
+            </div>
+            {engaged || recording.conversationStarting ? (
+              <Button variant="secondary" size="sm" onClick={recording.endConversation}>End conversation</Button>
+            ) : (
+              <Button size="sm" onClick={() => void (threadId ? recording.startConversation(memorySpaceId, threadId) : recording.startConversation(memorySpaceId))}
+                disabled={!recording.headphonesConfirmed || Boolean(recording.conversationUnavailableReason) || recordingBusy || (recording.isRecording && !recording.conversationReady)}>
+                Start conversation
+              </Button>
+            )}
+          </div>
+          {(voice?.threadId || threadId) && <div className="text-sm">
+            <a className="underline" href={`/chat?session=${encodeURIComponent(voice?.threadId || threadId!)}`}>Open this dialogue in Chat</a>
+            {engaged && voice?.threadId && <DialogueTasks sessionId={voice.threadId} />}
+          </div>}
+          {activities.length > 0 && (
+            <div role="status" aria-label="Conversation activity" aria-live="polite" aria-atomic="true"
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-600 dark:text-gray-300">
+              {activities.map((label, index) => <span key={label} className="inline-flex items-center gap-3">
+                {index > 0 && <span aria-hidden="true" className="text-gray-400">·</span>}<span>{label}</span>
+              </span>)}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-3 text-sm">
+            <label className="flex items-center gap-2 text-gray-700 dark:text-gray-300">
+              <input type="checkbox" checked={Boolean(recording.headphonesConfirmed)}
+                disabled={recording.isRecording || recordingBusy}
+                onChange={event => recording.setHeadphonesConfirmed(event.target.checked)} />
+              I’m using headphones
+            </label>
+            <label className="flex items-center gap-2 text-gray-700 dark:text-gray-300">
+              Conversation engine
+              <select value={recording.voiceEngine ?? SpeechEngine.MODULAR}
+                disabled={engaged || recording.conversationStarting || recordingBusy}
+                onChange={event => recording.setVoiceEngine(Number(event.target.value) as SpeechEngine)}
+                className="rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-2 py-1.5 text-gray-900 dark:text-gray-100">
+                <option value={SpeechEngine.MODULAR}>Local Qwen + Kokoro</option>
+                <option value={SpeechEngine.REALTIME}>Online realtime</option>
+              </select>
+            </label>
+          </div>
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            {recording.conversationUnavailableReason || (
+              recording.isRecording && !recording.conversationReady
+                ? 'To enable conversation, stop recording and confirm headphones before starting again.'
+                : engaged
+                  ? 'Speak naturally, or interrupt an answer. Ending the conversation keeps recording on.'
+                  : 'Start here with the selected engine, or say “Hey Hermes” to use the local engine while recording with headphones. Follow-up turns need no wake word.'
+            )}
+          </p>
+          {recording.conversationError && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{recording.conversationError}</p>}
+          {voice?.detail && voice.detail !== 'user_ended' && (
+            <p className="text-sm text-gray-600 dark:text-gray-400">{voice.detail}</p>
+          )}
+          {voice?.responseText && <p className="whitespace-pre-wrap text-gray-900 dark:text-gray-100">{voice.responseText}</p>}
+          {Boolean(voice?.tasks.length) && (
+            <ul aria-label="Conversation tasks" className="space-y-2 border-t border-gray-200 dark:border-gray-700 pt-3">
+              {voice!.tasks.map(task => {
+                const canCancel = task.status === VoiceTaskStatus.QUEUED || task.status === VoiceTaskStatus.RUNNING
+                const taskLabel = task.toolName === 'search_memories' ? 'Searching memories' : 'Hermes'
+                const status = {
+                  [VoiceTaskStatus.UNSPECIFIED]: 'Waiting', [VoiceTaskStatus.QUEUED]: 'Queued',
+                  [VoiceTaskStatus.RUNNING]: 'Working', [VoiceTaskStatus.COMPLETED]: 'Complete',
+                  [VoiceTaskStatus.FAILED]: 'Failed', [VoiceTaskStatus.CANCEL_REQUESTED]: 'Stop requested',
+                  [VoiceTaskStatus.CANCELLED]: 'Stopped', [VoiceTaskStatus.UNKNOWN]: 'Outcome unknown',
+                }[task.status]
+                return <li key={task.taskId} className="flex items-center justify-between gap-3 text-sm">
+                  <div><span className="font-medium text-gray-800 dark:text-gray-200">{taskLabel}</span>{' '}
+                    <span className="text-gray-500 dark:text-gray-400">{status}{task.detail ? ` · ${task.detail}` : ''}</span></div>
+                  {canCancel && <Button variant="secondary" size="sm" onClick={() => recording.cancelVoiceTask(task.taskId)}>Stop task</Button>}
+                </li>
+              })}
+            </ul>
+          )}
+          {voice?.vaultRetrievalEnabled && <p className="text-xs text-gray-500 dark:text-gray-400">Memory search is available for this conversation.</p>}
+        </section>
+      )}
 
       {/* System-audio capture health (meeting/tab mode) */}
       {recording.isRecording && recording.audioSource !== 'mic' && (
@@ -308,22 +347,15 @@ export default function LiveRecord({
           )}
           {recording.systemAudioStatus === 'silent' && (
             <span>
-              {' '}— <strong>no signal detected.</strong> If something is playing, this is the wrong capture
-              device: pick the "Monitor of …" entry matching the output you're actually listening through
-              (headphones vs speakers each have their own monitor), then restart the recording.
+              {' '}— <strong>no signal detected.</strong> Check the selected audio output if sound is playing.
             </span>
           )}
         </div>
       )}
 
-      {/* Status Display - Shows setup progress */}
-      <StatusDisplay recording={recording} />
-
-      {/* Audio Visualizer - Shows waveform when recording */}
-      <AudioVisualizer
-        isRecording={recording.isRecording}
-        analyser={recording.analyser}
-      />
+      {recording.isRecording && (
+        <AudioVisualizer isRecording analyser={recording.analyser} />
+      )}
 
       {/* Live streaming transcript - real-time text from the streaming STT provider */}
       {(recording.isRecording || recording.liveTranscript) && (
@@ -353,29 +385,6 @@ export default function LiveRecord({
       {/* Wake-word feedback - pulses on arm/end-of-turn + shows recognized command */}
       <WakeFeedback />
 
-      {/* Instructions */}
-      <div className="mt-8 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-        <h3 className="font-medium text-gray-700 dark:text-gray-200 mb-2">
-          📝 How it Works
-        </h3>
-        <ul className="text-sm text-gray-600 dark:text-gray-400 space-y-1">
-          <li>• <strong>Choose your mode:</strong> Streaming for real-time or Batch for complete file processing</li>
-          <li>• <strong>One-click recording:</strong> Single button handles complete setup automatically</li>
-          <li>• <strong>Sequential process:</strong> Mic access → WebSocket connection → Audio session → Recording</li>
-          <li>• <strong>Mode-based processing:</strong>
-            {recording.mode === 'streaming'
-              ? 'Real-time chunks sent as you speak'
-              : 'Complete audio sent after you stop'
-            }
-          </li>
-          <li>• <strong>Audio v2:</strong> Every Opus packet carries its session binding, clock, and sequence</li>
-          <li>• <strong>Efficient audio:</strong> 16kHz mono Opus with noise suppression and echo cancellation</li>
-          <li>• <strong>View results:</strong> Check Conversations page for transcribed content and memories</li>
-        </ul>
-      </div>
-
-      {/* Debug Information Panel */}
-      <SimpleDebugPanel recording={recording} />
     </div>
   )
 }

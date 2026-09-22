@@ -23,7 +23,7 @@ best-effort so they pick up whatever code the checkout ends on. On client-only
 nodes there are no compose services at all — the update is just checkout move +
 client-unit restarts.
 
-Used by ``services.py update`` (CLI) and the node agent's ``/update`` routes
+Used by ``./services update`` (CLI) and the node agent's ``/update`` routes
 (edge/service_manager.py), which the hub fans out across the cluster.
 """
 
@@ -172,7 +172,7 @@ def check_update(target: str | None = None, fetch: bool = True) -> dict:
 
 
 def _enabled_services() -> list[str]:
-    """The services this node runs — same set ``services.py start --all`` uses."""
+    """The services this node runs — same set ``./services start --all`` uses."""
     return [
         s
         for s in services.SERVICES
@@ -238,7 +238,7 @@ def perform_update(
     ``target``   — explicit tag/ref; default resolves per _resolve_target().
     ``prebuilt`` — image tag: pull ``CHRONICLE_REGISTRY`` images at that tag
                    instead of building locally (same env contract as
-                   ``services.py start --use-prebuilt``).
+                   ``./services start --use-prebuilt``).
     ``progress`` — optional callable(str) for step-by-step phase reporting
                    (the node agent surfaces it to the WebUI).
 

@@ -9,7 +9,10 @@ import ReconciliationProgress from '../components/timeline/ReconciliationProgres
 import EpisodeCard from '../components/timeline/EpisodeCard'
 import EpisodeLabelBar from '../components/timeline/EpisodeLabelBar'
 import DayReviewBoard from '../components/timeline/DayReviewBoard'
+import PrivacyIntervals from '../components/timeline/PrivacyIntervals'
 import MemorySelectionPanel from '../components/timeline/MemorySelectionPanel'
+import SessionMemoryBoard from '../components/timeline/SessionMemoryBoard'
+import ContextRefreshes from '../components/ContextRefreshes'
 import PhotoExplorationPanel from '../components/timeline/PhotoExplorationPanel'
 import EpisodeReviewCheckpoint from '../components/timeline/EpisodeReviewCheckpoint'
 import { TapeCoverageInterval } from '../components/timeline/EvidenceTape'
@@ -49,7 +52,7 @@ function visualEvidenceMessage(request?: TimelineReconciliationRequest) {
   if (visual.state === 'pending') return 'Photo metadata is available; visual exploration is queued.'
   if (visual.state === 'running') return 'Chronicle is sampling photo grids and investigating follow-up questions.'
   const useful = `${visual.helpful_count} useful for reconstructing the day`
-  if (visual.state === 'failed') return `None of the ${visual.candidate_count} selected photos could be understood.`
+  if (visual.state === 'failed') return `Photo review failed for ${visual.candidate_count} selected photos.`
   if (visual.state === 'partial') return `${visual.analyzed_count} photos described (${useful}); ${visual.failed_count} failed.`
   return `${visual.analyzed_count} of ${visual.candidate_count} photos inspected; ${visual.uninspected_count} remain uninspected. ${useful}.`
 }
@@ -275,7 +278,8 @@ export default function Timeline() {
   const unreconciled = timeline.data?.reconciliation?.ranges || []
   const failedRanges = unreconciled.filter(range => range.state === 'failed')
   const unstableEpisodes = episodes.filter(episode =>
-    (episode.status === 'open' || episode.status === 'provisional')
+    episode.requires_activity_review
+    && (episode.status === 'open' || episode.status === 'provisional')
     && !hasStableEpisodeStructure(episode))
   const progressMessage = analysisMessage(status?.state, status?.retry_after)
   const processing = !!status && ['pending', 'preparing', 'running', 'validating', 'quota_deferred'].includes(status.state)
@@ -302,7 +306,7 @@ export default function Timeline() {
       <header className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold text-gray-900 dark:text-gray-100"><CalendarDays className="h-6 w-6 text-[var(--tape-media)]" /> Timeline</h1>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">A semantic account of the day, grounded in capture evidence.</p>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">Sessions and episodes from your captured evidence.</p>
         </div>
         <div className="flex items-end gap-1.5">
           <Button variant="ghost" size="sm" aria-label="Previous day" onClick={() => setDay(shiftDate(day, -1))}><ChevronLeft className="h-4 w-4" /></Button>
@@ -316,7 +320,7 @@ export default function Timeline() {
 
       {shouldOfferBrowserTimezone && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper)] px-3 py-2 text-xs text-gray-600 dark:text-gray-300">
-          <span>{storedTimezone ? `Times are shown in ${storedTimezone}; this browser reports ${browserTimezone}.` : `Times are shown in the browser timezone, ${browserTimezone}. Save it to keep day boundaries consistent on other devices.`}</span>
+          <span>{storedTimezone ? `Times are shown in ${storedTimezone}; this browser reports ${browserTimezone}.` : `Using browser timezone: ${browserTimezone}.`}</span>
           <Button variant="ghost" size="sm" onClick={saveBrowserTimezone} disabled={savingBrowserTimezone}>{storedTimezone ? 'Use browser timezone' : 'Save browser timezone'}</Button>
         </div>
       )}
@@ -341,17 +345,19 @@ export default function Timeline() {
       </section>
 
       {progressMessage && episodes.length > 0 && <div className="rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper)] px-3 py-2.5 text-sm text-gray-600 dark:text-gray-300">{progressMessage}</div>}
-      {reconciliationStatus?.progress && <ReconciliationProgress progress={reconciliationStatus.progress} status={reconciliationStatus.state} />}
+      {reconciliationStatus?.progress && ['queued', 'running'].includes(reconciliationStatus.state) && <ReconciliationProgress progress={reconciliationStatus.progress} status={reconciliationStatus.state} />}
       {reconciliationStatus && (
         <div className={`rounded-lg border px-3 py-3 text-sm ${reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed' ? 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200' : 'border-[var(--tape-line)] bg-[var(--tape-paper)] text-gray-700 dark:text-gray-200'}`}>
           <div className="flex flex-wrap items-center gap-2">
             {(reconciliationStatus.state === 'queued' || reconciliationStatus.state === 'running') && <RefreshCw className="h-4 w-4 animate-spin" />}
             {(reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed') && <AlertTriangle className="h-4 w-4" />}
             <span className="font-semibold">Reconciliation {reconciliationStatus.state}{reconciliationStatus.state === 'completed' && ` through ${new Date(reconciliationStatus.evidence_cutoff).toLocaleString('en-IN', { timeZone: timezone })} (${timezone})`}</span>
-            <span className="text-xs opacity-70">Checked {new Date(reconciliationStatus.checked_at).toLocaleString('en-IN', { timeZone: timezone })}</span>
           </div>
-          <p className="mt-1.5">{readinessMessage(reconciliationStatus)}</p>
-          <p className="mt-1 text-xs opacity-80">Evidence cutoff: {new Date(reconciliationStatus.evidence_cutoff).toLocaleString('en-IN', { timeZone: timezone })} ({timezone}). Later capture and late-arriving evidence remain awaiting reconciliation. Photo availability does not mean every phone photo has finished backing up.</p>
+          {reconciliationStatus.state !== 'completed' && <p className="mt-1.5">{readinessMessage(reconciliationStatus)}</p>}
+          <p className="mt-1 text-xs">{reconciliationStatus.state === 'completed' ? 'Later evidence is not included.' : `Evidence cutoff: ${new Date(reconciliationStatus.evidence_cutoff).toLocaleString('en-IN', { timeZone: timezone })} (${timezone}).`}</p>
+          <details className="mt-2 text-xs">
+            <summary className="cursor-pointer">Evidence details</summary>
+            <p className="mt-2">Checked {new Date(reconciliationStatus.checked_at).toLocaleString('en-IN', { timeZone: timezone })} ({timezone})</p>
           {visualEvidenceMessage(reconciliationStatus) && <p className="mt-1 text-xs opacity-80">{visualEvidenceMessage(reconciliationStatus)}</p>}
           {reconciliationStatus.immich_evidence && reconciliationStatus.immich_evidence.evidence_count > 0 && (
             <details className="mt-2 text-xs">
@@ -361,14 +367,15 @@ export default function Timeline() {
               <div className="mt-1 grid gap-1 opacity-80">
                 {reconciliationStatus.immich_evidence.windows.map(window => (
                   <span key={`${window.started_at}-${window.ended_at}`}>
-                    {new Date(window.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}–{new Date(window.ended_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: {window.asset_count} photo{window.asset_count === 1 ? '' : 's'}, {window.helpful_asset_count} useful
+                    {new Date(window.started_at).toLocaleTimeString('en-IN', { timeZone: timezone, hour: '2-digit', minute: '2-digit' })}–{new Date(window.ended_at).toLocaleTimeString('en-IN', { timeZone: timezone, hour: '2-digit', minute: '2-digit' })}: {window.asset_count} photo{window.asset_count === 1 ? '' : 's'}, {window.helpful_asset_count} useful
                   </span>
                 ))}
               </div>
             </details>
           )}
           {reconciliationStatus.immich_visual?.artifact_id && <PhotoExplorationPanel requestId={reconciliationStatus.request_id} />}
-          {reconciliationStatus.notification_id && <p className="mt-1 text-xs opacity-75">Backup reminder: {reconciliationStatus.notification_status || 'queued'}</p>}
+          </details>
+          {reconciliationStatus.state === 'blocked' && reconciliationStatus.notification_id && <p className="mt-1 text-xs opacity-75">Backup reminder: {reconciliationStatus.notification_status || 'queued'}</p>}
           {reconciliationStatus.last_error && <p className="mt-1 text-xs text-red-700 dark:text-red-300">{reconciliationStatus.last_error}</p>}
           {(reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed') && (
             <div className="mt-2 flex flex-wrap gap-2">
@@ -390,16 +397,21 @@ export default function Timeline() {
           <Button size="sm" variant="danger" onClick={() => timeline.refetch()}>Retry</Button>
         </div>
       )}
-      {unreconciled.some(range => range.state === 'pending') && (
+      {episodes.length > 0 && unreconciled.some(range => range.state === 'pending') && (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           <div>
             <p className="font-semibold">Evidence still needs reconciliation.</p>
-            <p className="mt-1 text-xs">A completed run covers its checkpoint. Reconcile again to include available evidence and update this day’s episodes.</p>
+            <p className="mt-1 text-xs">New or updated evidence is available for this day.</p>
           </div>
           <Button size="sm" onClick={() => reconcile.mutate()} disabled={reconcile.isPending || bypassImmich.isPending || ['queued', 'running'].includes(reconciliationStatus?.state || '')}>Reconcile available evidence</Button>
         </div>
       )}
       <CoverageInspector coverage={coverage} />
+      <PrivacyIntervals intervals={timeline.data?.coverage?.privacy_intervals || []} timezone={timezone} />
+      <ContextRefreshes day={day} />
+      {episodes.length > 0 && timeline.data?.current_snapshot_id && <SessionMemoryBoard day={day} timezone={timezone} snapshotId={timeline.data.current_snapshot_id} />}
+      {(episodes.length > 0 || failedRanges.length > 0) && <details open={failedRanges.length > 0 || undefined} className="rounded-lg border border-[var(--tape-line)] p-3 text-[var(--tape-ink)]">
+        <summary className="cursor-pointer text-sm">Individual episodes & structure tools</summary>
       {episodes.length > 0 && <MemorySelectionPanel day={day} timezone={timezone} snapshotId={timeline.data?.current_snapshot_id} episodes={episodes} />}
       {((timeline.data?.review && episodes.length > 0) || failedRanges.length > 0) && (
         <EpisodeReviewCheckpoint
@@ -433,6 +445,7 @@ export default function Timeline() {
           onFinish={() => timeline.data?.current_snapshot_id && finalizeEpisodes.mutate()}
         />
       )}
+      </details>}
       {showManualMemories && (manualMemories.isLoading ? <div className="rounded-lg border border-[var(--tape-line)] p-4 text-sm text-gray-500">Loading manual memories…</div> : <ManualMemories items={manualMemories.data || []} />)}
 
       {labeling && (
@@ -445,6 +458,8 @@ export default function Timeline() {
       )}
 
       {timeline.data?.review_projection && episodes.length ? (
+        <details open={labeling || undefined} className="rounded-lg border border-[var(--tape-line)] p-3 text-[var(--tape-ink)]">
+        <summary className="cursor-pointer text-sm">Inspect episode timeline & grouping</summary>
         <DayReviewBoard
           day={day}
           timezone={timezone}
@@ -481,28 +496,31 @@ export default function Timeline() {
             </div>
           )}
         />
+        </details>
       ) : !timeline.isLoading && !timeline.isError ? (
         <EmptyDayHandoff
           items={reviewQueue.data || []}
           title={processing
             ? day === today ? 'Today’s episodes are still processing.' : 'This day’s episodes are still processing.'
             : status?.state === 'awaiting_evidence'
-            ? day === today ? 'Nothing captured today.' : 'Nothing was captured for this day.'
+            ? 'No usable evidence for analysis yet.'
             : status?.state === 'complete'
               ? 'Analysis found no episodes for this day.'
               : status?.state === 'failed'
                 ? 'This day’s analysis needs attention.'
               : day === today ? 'Today has no processed episodes yet.' : 'This day has no processed episodes yet.'}
           description={processing
-            ? `${progressMessage || 'Analysis is in progress.'} Continue reviewing an earlier episode day while it finishes.`
+            ? progressMessage || 'Analysis is in progress.'
+            : unreconciled.some(range => range.state === 'pending')
+            ? 'Captured evidence is awaiting reconciliation.'
             : status?.state === 'awaiting_evidence'
-            ? 'There is no capture evidence to turn into episodes. Continue with the review trail whenever you are ready.'
+            ? 'Captured material may still be arriving or processing.'
             : status?.state === 'complete'
-              ? 'The analysis completed without producing a semantic episode. You can run it again or continue the review trail.'
+              ? 'Analysis completed without producing an episode.'
               : status?.state === 'failed'
-                ? 'Use Retry above for this day, or continue reviewing an earlier episode day.'
-              : 'Start processing this day, or resume the oldest review action that needs you.'}
-          canAnalyze={!status || status.state === 'complete'}
+                ? 'Retry this day or continue an earlier review.'
+              : 'Reconcile this day or continue an earlier review.'}
+          canAnalyze={!status || status.state === 'complete' || (status.state === 'awaiting_evidence' && unreconciled.some(range => range.state === 'pending'))}
           analyzing={reconcile.isPending || ['queued', 'running'].includes(reconciliationStatus?.state || '')}
           analyzeLabel={reconciliationStatus?.state === 'blocked' ? 'Check Immich again' : 'Reconcile this day'}
           onAnalyze={() => reconcile.mutate()}

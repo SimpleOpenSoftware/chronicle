@@ -6,14 +6,18 @@ OpenAI, Ollama, and other OpenAI-compatible APIs.
 """
 
 import asyncio
+import copy
 import logging
 from abc import ABC, abstractmethod
+from contextlib import aclosing
 from typing import Any, Dict, Optional
 
+import anyio
 import openai
 
 from backend.model_registry import get_models_registry
 from backend.openai_factory import create_openai_client, model_supports_temperature
+from backend.services.chat_runs import current_run, run_step
 from backend.services.memory.config import load_config_yml as _load_root_config
 from backend.services.memory.config import resolve_value as _resolve_value
 
@@ -308,6 +312,7 @@ async def _generate_with_op(
     model: str | None,
     temperature: float | None,
     operation: str,
+    request_trace: list | None = None,
 ) -> str:
     """One generation attempt against a ResolvedLLMOperation."""
     client = op.get_client(is_async=True)
@@ -319,7 +324,12 @@ async def _generate_with_op(
     if not model_supports_temperature(api_params.get("model")):
         api_params.pop("temperature", None)
     api_params["messages"] = op.prepare_messages([{"role": "user", "content": prompt}])
+    exchange = {"request": api_params}
+    if request_trace is not None:
+        request_trace.append(exchange)
     response = await client.chat.completions.create(**api_params)
+    if request_trace is not None:
+        exchange["response"] = response.model_dump(mode="json")
     choice = response.choices[0]
     content = (choice.message.content or "").strip()
     if not content:
@@ -340,6 +350,7 @@ async def async_generate(
     model: str | None = None,
     temperature: float | None = None,
     operation: str | None = None,
+    request_trace: list | None = None,
 ) -> str:
     """Async wrapper for LLM text generation.
 
@@ -362,7 +373,7 @@ async def async_generate(
             op = registry.get_llm_operation(operation)
             try:
                 return await _generate_with_op(
-                    op, prompt, model, temperature, operation
+                    op, prompt, model, temperature, operation, request_trace
                 )
             except _FALLBACK_EXCEPTIONS as e:
                 fb_op = registry.get_fallback_llm_operation(operation, primary=op)
@@ -376,7 +387,7 @@ async def async_generate(
                 # No explicit model override on the retry — it would repoint
                 # the fallback endpoint back at the (dead) primary model.
                 return await _generate_with_op(
-                    fb_op, prompt, None, temperature, operation
+                    fb_op, prompt, None, temperature, operation, request_trace
                 )
 
     # Fallback: use singleton client
@@ -407,6 +418,7 @@ async def async_chat_with_tools(
     operation: str | None = None,
     force_fallback: bool = False,
     timeout_seconds: float | None = None,
+    request_trace: list | None = None,
 ):
     """Async wrapper for chat completion with tool calling.
 
@@ -430,12 +442,32 @@ async def async_chat_with_tools(
         api_params["messages"] = op.prepare_messages(messages)
         if tools:
             api_params["tools"] = tools
-        request = client.chat.completions.create(**api_params)
-        if timeout_seconds is None:
-            return await request
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        return await asyncio.wait_for(request, timeout=timeout_seconds)
+
+        exchange = (
+            {"request": copy.deepcopy(api_params)} if request_trace is not None else {}
+        )
+        if request_trace is not None:
+            request_trace.append(exchange)
+        async with run_step(
+            "model",
+            operation or "chat",
+            {
+                "provider": op.model_def.model_provider if current_run() else None,
+                "parameters": api_params,
+            },
+        ) as attempt:
+            request = client.chat.completions.create(**api_params)
+            if timeout_seconds is None:
+                response = await request
+            else:
+                if timeout_seconds <= 0:
+                    raise ValueError("timeout_seconds must be positive")
+                response = await asyncio.wait_for(request, timeout=timeout_seconds)
+            if request_trace is not None:
+                exchange["response"] = response.model_dump(mode="json")
+            if current_run():
+                attempt.output = response.model_dump(mode="json")
+        return response
 
     if operation:
         registry = get_models_registry()
@@ -523,6 +555,8 @@ async def async_chat_with_tools_stream(
     model: str | None = None,
     temperature: float | None = None,
     operation: str | None = None,
+    *,
+    allow_fallback: bool = True,
 ):
     """Streaming counterpart of :func:`async_chat_with_tools`.
 
@@ -540,7 +574,7 @@ async def async_chat_with_tools_stream(
     therefore only fall back when the primary failed before emitting anything.
     """
 
-    async def _stream_once(op, model_override):
+    async def _attempt(op, model_override):
         client = op.get_client(is_async=True)
         api_params = op.to_api_params()
         if temperature is not None:
@@ -551,33 +585,62 @@ async def async_chat_with_tools_stream(
         if tools:
             api_params["tools"] = tools
         api_params["stream"] = True
-        return await client.chat.completions.create(**api_params)
-
-    async def _drain(stream):
-        """Yield content deltas, accumulating tool calls, then the terminal event."""
-        content_parts: list[str] = []
-        tool_call_acc: Dict[int, Dict] = {}
-        finish_reason = None
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-            delta = choice.delta
-            if delta is None:
-                continue
-            if delta.content:
-                content_parts.append(delta.content)
-                yield {"type": "content", "text": delta.content}
-            if getattr(delta, "tool_calls", None):
-                _accumulate_tool_call_delta(tool_call_acc, delta.tool_calls)
-        yield {
-            "type": "done",
-            "content": "".join(content_parts),
-            "tool_calls": [tool_call_acc[i] for i in sorted(tool_call_acc)],
-            "finish_reason": finish_reason,
-        }
+        api_params["stream_options"] = {"include_usage": True}
+        async with run_step(
+            "model",
+            operation,
+            {
+                "provider": op.model_def.model_provider if current_run() else None,
+                "parameters": api_params,
+            },
+        ) as attempt:
+            content_parts = []
+            reasoning_parts = []
+            tool_call_acc = {}
+            finish_reason = None
+            usage = None
+            stream = await client.chat.completions.create(**api_params)
+            try:
+                async for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage.model_dump(mode="json")
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
+                    delta = choice.delta
+                    if delta is None:
+                        continue
+                    if delta.content:
+                        content_parts.append(delta.content)
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                    if getattr(delta, "tool_calls", None):
+                        _accumulate_tool_call_delta(tool_call_acc, delta.tool_calls)
+                    attempt.output = {
+                        "content": "".join(content_parts),
+                        "reasoning_content": "".join(reasoning_parts),
+                        "tool_calls": [tool_call_acc[i] for i in sorted(tool_call_acc)],
+                        "finish_reason": finish_reason,
+                        "usage": usage,
+                    }
+                    if delta.content:
+                        yield {"type": "content", "text": delta.content}
+                attempt.output = {
+                    "content": "".join(content_parts),
+                    "reasoning_content": "".join(reasoning_parts),
+                    "tool_calls": [tool_call_acc[i] for i in sorted(tool_call_acc)],
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                }
+                if finish_reason not in ("stop", "tool_calls"):
+                    attempt.status = "incomplete"
+            finally:
+                with anyio.move_on_after(5, shield=True):
+                    await stream.close()
+        yield {"type": "done", **attempt.output}
 
     if not operation:
         raise ValueError("async_chat_with_tools_stream requires an operation name")
@@ -589,13 +652,13 @@ async def async_chat_with_tools_stream(
     op = registry.get_llm_operation(operation)
     emitted = False
     try:
-        stream = await _stream_once(op, model)
-        async for event in _drain(stream):
-            emitted = emitted or event["type"] == "content"
-            yield event
+        async with aclosing(_attempt(op, model)) as events:
+            async for event in events:
+                emitted = emitted or event["type"] == "content"
+                yield event
         return
     except Exception as e:
-        if emitted:
+        if emitted or not allow_fallback:
             raise
         if not isinstance(e, _FALLBACK_EXCEPTIONS) and not _is_context_length_error(e):
             raise
@@ -607,9 +670,9 @@ async def async_chat_with_tools_stream(
             f"{operation!r} ({e}); retrying with fallback LLM {fb_op.model_name!r}"
         )
 
-    stream = await _stream_once(fb_op, None)
-    async for event in _drain(stream):
-        yield event
+    async with aclosing(_attempt(fb_op, None)) as events:
+        async for event in events:
+            yield event
 
 
 async def async_health_check() -> Dict:

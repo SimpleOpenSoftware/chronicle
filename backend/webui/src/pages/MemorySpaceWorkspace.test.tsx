@@ -269,3 +269,27 @@ describe('MemorySpaceWorkspace scope', () => {
     expect(resolve).not.toHaveBeenCalled()
   })
 })
+
+describe('MemorySpaceWorkspace request recovery', () => {
+  const activeSpace = { space_id: SPACE_ID, name: 'Notebook', state: 'active', sync_state: 'healthy', seed_notes: [] }
+
+  it('keeps a failed notes request distinct from an empty notebook and retries it', async () => {
+    vi.spyOn(memorySpacesApi, 'get').mockResolvedValue({ data: activeSpace } as never)
+    vi.spyOn(memorySpacesApi, 'notes').mockRejectedValueOnce(new Error('Offline')).mockResolvedValue({ data: [{ note_path: 'Notes/Idea.md', content: '# Idea', updated_at: '2026-09-13T00:00:00Z' }] } as never)
+    renderWorkspace(`/spaces/${SPACE_ID}/notes`)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load notes.')
+    expect(screen.queryByText('No notes yet.')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('button', { name: 'Notes/Idea.md' })).toBeVisible()
+  })
+
+  it('does not claim a space is missing when its request fails', async () => {
+    vi.spyOn(memorySpacesApi, 'get').mockRejectedValueOnce({ response: { status: 503 } }).mockResolvedValue({ data: activeSpace } as never)
+    vi.spyOn(memorySpacesApi, 'notes').mockResolvedValue({ data: [] } as never)
+    renderWorkspace(`/spaces/${SPACE_ID}/notes`)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load this memory space.')
+    expect(screen.queryByText('Memory space not found.')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('heading', { name: 'Notebook' })).toBeVisible()
+  })
+})

@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+import backend.services.privacy as privacy
 from backend.models.conversation import Conversation
 from backend.models.timeline import (
     AudioEvidenceSpan,
@@ -576,6 +577,10 @@ async def publish_reconciliation(
     **kwargs: Any,
 ) -> PublishResult:
     """Publish one validated staged result through the crash-safe journal."""
+
+    snapshot = await privacy.load_snapshot(user_id)
+    if any(not snapshot.permits_record(item) for item in bundle.manifest.evidence):
+        raise privacy.PrivacyHeld()
 
     return await _publish_reconciliation_locked(
         user_id, dirty_range, bundle, action, **kwargs

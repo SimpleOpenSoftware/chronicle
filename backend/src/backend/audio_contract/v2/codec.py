@@ -107,6 +107,24 @@ def parse_client_control_json(payload: str) -> audio_pb2.ClientControl:
         _require_id(acknowledgement.response_id.value, "response_id")
         if acknowledgement.state == audio_pb2.PLAYBACK_STATE_UNSPECIFIED:
             raise AudioProtocolV2Error("playback acknowledgement requires state")
+    elif event == "conversation_command":
+        command = message.conversation_command
+        _require_binding(command.binding)
+        if command.action not in {
+            audio_pb2.CONVERSATION_ACTION_START,
+            audio_pb2.CONVERSATION_ACTION_END,
+            audio_pb2.CONVERSATION_ACTION_CANCEL_TASK,
+            audio_pb2.CONVERSATION_ACTION_SNAPSHOT,
+        }:
+            raise AudioProtocolV2Error("invalid conversation action")
+        if (
+            command.action == audio_pb2.CONVERSATION_ACTION_START
+            and command.engine
+            not in {audio_pb2.SPEECH_ENGINE_MODULAR, audio_pb2.SPEECH_ENGINE_REALTIME}
+        ):
+            raise AudioProtocolV2Error("start conversation requires an engine")
+        if command.action == audio_pb2.CONVERSATION_ACTION_CANCEL_TASK:
+            _require_id(command.task_id, "task_id")
     return message
 
 

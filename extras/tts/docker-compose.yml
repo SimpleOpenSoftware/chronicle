@@ -128,7 +128,11 @@ services:
       - TTS_MODEL=${KOKORO_TTS_MODEL:-hexgrad/Kokoro-82M}
       - TTS_VOICE=${KOKORO_TTS_VOICE:-af_heart}
       - TTS_LANG_CODE=${KOKORO_TTS_LANG_CODE:-a}
+      - TTS_HINDI_VOICE=${KOKORO_TTS_HINDI_VOICE:-hf_alpha}
+      - TTS_ENGLISH_VOICE=${KOKORO_TTS_ENGLISH_VOICE:-}
       - TTS_SPEED=${KOKORO_TTS_SPEED:-1.0}
+      - TTS_DEVICE=${KOKORO_TTS_DEVICE:-auto}
+      - TTS_CPU_THREADS=${KOKORO_TTS_CPU_THREADS:-4}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8770/health"]
       interval: 30s

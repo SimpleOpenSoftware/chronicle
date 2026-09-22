@@ -702,9 +702,18 @@ Rules:
     # avoids any import-order coupling (the agent module is heavy).
     from backend.services.memory.agent.memory_agent import (
         DEFAULT_AGENT_SYSTEM_PROMPT,
+        DEFAULT_SESSION_SYSTEM_PROMPT,
         SEARCH_SYSTEM_PROMPT,
     )
 
+    registry.register_default(
+        "memory.session_system",
+        template=DEFAULT_SESSION_SYSTEM_PROMPT,
+        name="Session Memory System Prompt",
+        description="Attributed session changes without mandatory diary output.",
+        category="memory",
+        variables=["vault_summary"],
+    )
     registry.register_default(
         "memory.agent_system",
         template=DEFAULT_AGENT_SYSTEM_PROMPT,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
@@ -49,7 +50,20 @@ def bounded_episode_transcript(episode: TimelineEpisode) -> str:
             ref.metadata.get("conversation_id") or ref.source_item_id or ref.evidence_id
         )
         first, lines = sources.setdefault(source, (ref_start, []))
-        sources[source] = (min(first, ref_start), [*lines, text])
+        attributed = json.dumps(
+            {
+                "evidence_id": ref.evidence_id,
+                "content_hash": ref.content_hash,
+                "locator": ref.locator.model_dump(mode="json"),
+                "role": ref.role,
+                "direction": ref.metadata.get("direction", "unknown"),
+                "started_at": ref_start.isoformat(),
+                "ended_at": ref_end.isoformat(),
+                "text": text,
+            },
+            ensure_ascii=False,
+        )
+        sources[source] = (min(first, ref_start), [*lines, attributed])
 
     blocks = sorted(
         (
@@ -65,6 +79,8 @@ def bounded_episode_transcript(episode: TimelineEpisode) -> str:
         "record the same speech from input and output streams. Reconcile duplicates; "
         "do not describe repeated capture as repeated conversation. Summarize only "
         "content inside the selected episode bounds.\n\n"
+        "Retain attribution: media, application output and assistant content are not "
+        "the user's speech or life. Uncertain speech remains uncertain.\n\n"
         + "\n\n".join(block for _, block in blocks)
     )
 

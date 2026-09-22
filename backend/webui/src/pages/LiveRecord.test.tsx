@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { type RecordingContextType, useRecording } from '../contexts/RecordingContext'
 import LiveRecord from './LiveRecord'
+import { create } from '@bufbuild/protobuf'
+import { ConversationPhase, ConversationStateSchema, SpeechEngine, VoiceTaskStatus } from '../protocol/audioV2'
 
 vi.mock('../contexts/RecordingContext', () => ({
   useRecording: vi.fn(),
@@ -24,8 +26,6 @@ const setSelectedDeviceId = vi.fn()
 function recording(overrides: Partial<RecordingContextType> = {}): RecordingContextType {
   return {
     isRecording: false,
-    mode: 'streaming',
-    setMode: vi.fn(),
     audioSource: 'mic',
     setAudioSource: vi.fn(),
     availableDevices: [],
@@ -38,6 +38,19 @@ function recording(overrides: Partial<RecordingContextType> = {}): RecordingCont
     systemAudioLabel: null,
     systemAudioStatus: 'unknown',
     liveTranscript: '',
+    currentStep: 'idle',
+    headphonesConfirmed: false,
+    setHeadphonesConfirmed: vi.fn(),
+    voiceEngine: SpeechEngine.MODULAR,
+    setVoiceEngine: vi.fn(),
+    conversationState: null,
+    conversationStarting: false,
+    conversationReady: false,
+    conversationUnavailableReason: null,
+    conversationError: null,
+    startConversation: vi.fn(async () => {}),
+    endConversation: vi.fn(),
+    cancelVoiceTask: vi.fn(),
     analyser: null,
     ...overrides,
   } as RecordingContextType
@@ -89,4 +102,36 @@ describe('LiveRecord microphone setup', () => {
     expect(screen.queryByRole('button', { name: 'Choose microphone…' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: /Microphone/ })).not.toBeInTheDocument()
   })
+  it('requires headphones before starting and passes the current recording destination', () => {
+    const value = recording()
+    vi.mocked(useRecording).mockReturnValue(value)
+    const rendered = render(<LiveRecord memorySpaceId="space-one" />)
+    expect(screen.getByRole('button', { name: 'Start conversation' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: /using headphones/ }))
+    expect(value.setHeadphonesConfirmed).toHaveBeenCalledWith(true)
+    vi.mocked(useRecording).mockReturnValue({ ...value, headphonesConfirmed: true })
+    rendered.rerender(<LiveRecord memorySpaceId="space-one" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Start conversation' }))
+    expect(value.startConversation).toHaveBeenCalledWith('space-one')
+  })
+
+  it('separates End conversation and task cancellation from recording', () => {
+    const value = recording({
+      isRecording: true, currentStep: 'streaming', headphonesConfirmed: true, conversationReady: true,
+      conversationState: create(ConversationStateSchema, { phase: ConversationPhase.SPEAKING, engine: SpeechEngine.MODULAR,
+        tasks: [{ taskId: 'task-one', toolName: 'delegate_to_hermes', status: VoiceTaskStatus.RUNNING }],
+      }),
+    })
+    vi.mocked(useRecording).mockReturnValue(value)
+    render(<LiveRecord />)
+    expect(screen.getByRole('combobox', { name: 'Conversation engine' })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /using headphones/ })).toBeDisabled()
+    expect(screen.getByText('Responding')).toBeVisible()
+    expect(screen.getByText('Hermes')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'End conversation' }))
+    expect(value.endConversation).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop task' }))
+    expect(value.cancelVoiceTask).toHaveBeenCalledWith('task-one')
+  })
+
 })

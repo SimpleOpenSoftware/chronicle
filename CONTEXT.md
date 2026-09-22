@@ -41,6 +41,20 @@ objects. Capture and meaning are different layers.
 
 ## Invariants
 
+### Assistant dialogue
+
+- **Dialogue thread**: a continuing exchange between a user and the assistant,
+  shared across typed and spoken interaction. It is distinct from a captured Conversation.
+- **Utterance**: what the user or assistant communicated. Questions, answers,
+  corrections and acknowledgements are meanings of utterances in context.
+- **Dialogue task**: work carried through a thread that can wait for input, pause,
+  resume or finish independently of a device's voice engagement.
+- **Input wait**: a dialogue task awaiting user input after an assistant utterance.
+- **Utterance delivery**: evidence of what was displayed or played to a particular
+  device, distinct from the assistant's generated content.
+
+### Capture invariants
+
 1. Redis accepting audio never depends on a Conversation existing.
 2. Every stored audio document has immutable absolute time and capture identity. An
    audio document never bridges a discontinuity in that capture clock; persistence
@@ -124,3 +138,17 @@ archives cannot be used with replace restore.
 Vault regeneration is derived work. Preserve audio, screenshots, conversations,
 artifacts, annotations, and timeline evidence; clear/rebuild only the selected derived
 stage.
+
+## Service deployment
+
+- **Deployment**: one configured compute capability group and its allowed instances.
+- **Instance**: one deployment running on one explicitly registered node.
+- **Single owner**: the only node allowed to run a deployment. Failure does not
+  transfer ownership.
+- **Warm standby**: an allowed, running replica that can serve new requests when
+  a preferred instance is unavailable.
+- **Deployment authority**: the single owner of the fleet's placement decisions.
+- **Activation reservation**: an outstanding permission to activate an instance;
+  a placement change must wait for that permission to be returned.
+- **Catalog snapshot**: immutable enrolled speaker identities and their embedding
+  space. Speaker inference replicas are interchangeable only for the same snapshot.

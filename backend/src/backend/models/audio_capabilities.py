@@ -31,6 +31,7 @@ class VoiceCapabilities(BaseModel):
         "remote",
         "unknown",
     ]
+    incremental_playback: bool = False
     native_sample_rate: int = Field(gt=0, le=384_000)
     aec: EffectStatus
     noise_suppression: EffectStatus

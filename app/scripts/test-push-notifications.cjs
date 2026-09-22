@@ -31,13 +31,19 @@ const requests = [];
 const opened = [];
 const alerts = [];
 let pushTokenListener = null;
+let nativeTokenFetches = 0;
 const notifications = {
   PermissionStatus: { DENIED: 'denied' },
   AndroidImportance: { HIGH: 4, DEFAULT: 3 },
   getPermissionsAsync: async () => permission,
   requestPermissionsAsync: async () => permission,
-  getExpoPushTokenAsync: async ({ projectId }) => {
+  getExpoPushTokenAsync: async ({ projectId, devicePushToken }) => {
     assert.equal(projectId, 'project-one');
+    // Expo requests a native token if none is supplied; iOS emits the listener
+    // again when that request completes. Bound the buggy loop in this fixture.
+    if (!devicePushToken && pushTokenListener && ++nativeTokenFetches < 5) {
+      pushTokenListener({ type: 'ios', data: 'rotated' });
+    }
     return { data: 'ExpoPushToken[abcdefghijklmnopqrstuvwxyz]' };
   },
   setNotificationHandler() {},
@@ -100,8 +106,9 @@ const push = loadTypeScript(sourcePath, {
   await push.refreshPushRegistration('wss://chronicle/ws/audio');
   assert.equal(requests.length, 2, 'authenticated launch refreshes the registration');
   const stopTokenListener = push.listenForPushTokenChanges('wss://chronicle/ws/audio');
-  pushTokenListener({ type: 'expo', data: 'rotated' });
+  pushTokenListener({ type: 'ios', data: 'rotated' });
   await new Promise(resolve => setImmediate(resolve));
+  assert.equal(nativeTokenFetches, 0, 'rotation must use the supplied native token without requesting another');
   assert.equal(requests.length, 3, 'native token changes refresh the Expo registration');
   stopTokenListener();
 

@@ -174,8 +174,7 @@ export default function SpeakerLabelReview({
         <div>
           <h3 className="font-semibold text-gray-900 dark:text-gray-100">Review speaker labels</h3>
           <p className="mt-1 max-w-3xl text-sm text-gray-500 dark:text-gray-400">
-            Active-learning sample across conversations and speakers: three boundary claims plus
-            two deterministic controls. Reviewing measures recognition; it never changes enrollment.
+            Listen and verify five speaker labels. Enrollment is separate.
           </p>
         </div>
         <div className="text-right text-xs text-gray-500 dark:text-gray-400">
@@ -189,15 +188,14 @@ export default function SpeakerLabelReview({
         <div className="border-b border-gray-200 bg-gray-50 px-5 py-4 dark:border-gray-700 dark:bg-gray-900/30">
           <div className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
             <div>
-              <span className="text-xs text-gray-500">Control-sample precision</span>
+              <span className="text-xs text-gray-500">Calibration checks</span>
               <div className="text-2xl font-semibold text-gray-900 dark:text-gray-100">
-                {metrics.control.precision == null ? '—' : `${(metrics.control.precision * 100).toFixed(1)}%`}
+                {metrics.control.correct} of {metrics.control.evaluable} correct
               </div>
             </div>
             <div className="text-xs text-gray-500">
-              {metrics.control.correct}/{metrics.control.evaluable} deterministic control claims correct
               {metrics.boundary.evaluable > 0 && metrics.boundary.precision != null
-                ? ` · boundary ${(metrics.boundary.precision * 100).toFixed(1)}% (${metrics.boundary.evaluable})`
+                ? `Uncertain claims: ${metrics.boundary.correct} of ${metrics.boundary.evaluable} correct`
                 : ''}
               {metrics.overall.excluded > 0 ? ` · ${metrics.overall.excluded} mixed/bad excluded` : ''}
             </div>

@@ -14,12 +14,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import chronicle_screenpipe.screening as screening
 import httpx
 
 from .meeting import MeetingTracker, RecorderMeetingLog, pipewire_capture_apps
 from .observations import ObservationTracker, display_track_id, timestamp_seconds
 
 logger = logging.getLogger(__name__)
+
+
+def error_summary(error: Exception) -> str:
+    """Describe a failure without echoing capture paths, URLs or response text."""
+    kind = type(error).__name__
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"{kind} (HTTP {error.response.status_code})"
+    return kind
+
 
 # SQLite's default compiled limit on host parameters in one statement is 999.
 _SQLITE_PARAMETER_LIMIT = 500
@@ -48,6 +58,8 @@ class Config:
     # Detect active calls from the PipeWire graph and tag forwarded audio, so
     # the backend can bound sessions on real meeting intervals.
     meeting_detection: bool = True
+    privacy_screening: bool = False
+    privacy_device: str = "cpu"
 
 
 class Checkpoints:
@@ -158,6 +170,15 @@ class Collector:
             headers={"Authorization": f"Bearer {config.token}"},
             timeout=60,
         )
+        self.screening = None
+        self.screening_store = None
+        if config.privacy_screening:
+
+            self.screening_store = screening.ScreeningStore(
+                state_dir / "privacy.sqlite"
+            )
+            self.screening = screening.ScreeningWorker(config, state_dir)
+            self.screening.start()
 
     @property
     def database_path(self) -> Path:
@@ -182,6 +203,8 @@ class Collector:
         }
         if error:
             health["error"] = error
+        if getattr(self, "screening", None):
+            health["privacy_screening"] = dict(self.screening.health)
         response = self.client.post(
             "/api/device-input/heartbeat",
             json={"status": "error" if error else "online", "health": health},
@@ -220,9 +243,7 @@ class Collector:
             if not path.is_file():
                 captured = timestamp_seconds(iso_timestamp(row["timestamp"]))
                 if time.time() - captured < 120:
-                    logger.warning(
-                        "audio chunk %s is not available yet: %s", row["id"], path
-                    )
+                    logger.warning("audio chunk %s is not available yet", row["id"])
                     break
                 self.rejections_path.parent.mkdir(parents=True, exist_ok=True)
                 with self.rejections_path.open("a", encoding="utf-8") as rejected:
@@ -274,7 +295,13 @@ class Collector:
             if response.status_code >= 500:
                 response.raise_for_status()
             if response.status_code >= 400:
-                logger.error("audio chunk %s rejected: %s", row["id"], response.text)
+                # Validation responses can echo submitted capture metadata. Keep
+                # diagnostics content-free even before screening has completed.
+                logger.error(
+                    "audio chunk %s rejected with HTTP %s",
+                    row["id"],
+                    response.status_code,
+                )
                 self.rejections_path.parent.mkdir(parents=True, exist_ok=True)
                 with self.rejections_path.open("a", encoding="utf-8") as rejected:
                     rejected.write(
@@ -283,7 +310,7 @@ class Collector:
                                 "stream": "audio",
                                 "source_item_id": row["id"],
                                 "status": response.status_code,
-                                "detail": response.text[:1000],
+                                "detail": "backend rejected audio; checkpoint retained",
                             }
                         )
                         + "\n"
@@ -486,6 +513,8 @@ class Collector:
         now = datetime.now(timezone.utc).isoformat()
         events: list[dict[str, Any]] = []
         for row in rows:
+            if getattr(self, "screening_store", None):
+                self.screening_store.observe(row)
             track_id = display_track_id(row)
             tracker = trackers.setdefault(
                 track_id, self._new_observation_tracker(track_id)
@@ -540,8 +569,8 @@ class Collector:
                             by_frame[row["id"]]["metadata"]["capture_trigger"] = row[
                                 "capture_trigger"
                             ]
-        except sqlite3.Error:
-            logger.warning("could not read capture triggers", exc_info=True)
+        except sqlite3.Error as exc:
+            logger.warning("could not read capture triggers: %s", error_summary(exc))
 
     def _frames_across_interval(self, start: str, end: str, count: int) -> list[int]:
         """Pick `count` frame ids spread evenly across [start, end).
@@ -782,7 +811,7 @@ class Collector:
             self._attach_capture_triggers(items)
             result = {"success": True, "items": items}
         except Exception as exc:
-            result = {"success": False, "items": [], "error": str(exc)}
+            result = {"success": False, "items": [], "error": error_summary(exc)}
         done = self.client.post(
             f"/api/device-input/jobs/{job['id']}/complete", json=result
         )
@@ -795,8 +824,8 @@ class Collector:
             try:
                 with open_screenpipe_db(self.database_path) as connection:
                     self.collect_meetings(connection)
-                    self.collect_audio(connection)
                     self.collect_observations(connection)
+                    self.collect_audio(connection)
                 self.process_job()
                 if time.monotonic() - last_heartbeat >= 30:
                     self.heartbeat()
@@ -804,20 +833,26 @@ class Collector:
             except KeyboardInterrupt:
                 try:
                     self.close_observation()
-                except Exception:
-                    logger.exception("failed to close observation during shutdown")
+                except Exception as exc:
+                    logger.error(
+                        "failed to close observation during shutdown: %s",
+                        error_summary(exc),
+                    )
                 return
             except Exception as exc:
-                logger.exception("collector pass failed")
+                logger.error("collector pass failed: %s", error_summary(exc))
                 try:
-                    self.heartbeat(str(exc))
-                except Exception:
-                    logger.exception("heartbeat failed")
+                    self.heartbeat(error_summary(exc))
+                except Exception as heartbeat_error:
+                    logger.error("heartbeat failed: %s", error_summary(heartbeat_error))
             try:
                 time.sleep(self.config.poll_seconds)
             except KeyboardInterrupt:
                 try:
                     self.close_observation()
-                except Exception:
-                    logger.exception("failed to close observation during shutdown")
+                except Exception as exc:
+                    logger.error(
+                        "failed to close observation during shutdown: %s",
+                        error_summary(exc),
+                    )
                 return

@@ -6,6 +6,8 @@ Provides unified config loading with environment variable interpolation.
 
 import logging
 import os
+import threading
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 # Global config cache
 _config_cache: Optional[DictConfig] = None
+_config_warnings: tuple[str, ...] = ()
+_config_lock = threading.RLock()
 
 # Runtime overrides registered by save_config_section(), keyed by section path.
 # Re-applied on every load_config() so they survive cache reloads even when
@@ -53,11 +57,34 @@ def load_config(force_reload: bool = False) -> DictConfig:
     Returns:
         Merged DictConfig with all settings
     """
-    global _config_cache
-
+    global _config_warnings
     if _config_cache is not None and not force_reload:
         return _config_cache
+    with _config_lock:
+        if _config_cache is not None and not force_reload:
+            return _config_cache
+        # Keep diagnostics attached to the actual load, rather than doing a new
+        # YAML parse on every health poll just to rediscover its warnings.
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            config = _load_config_uncached()
+        _config_warnings = tuple(str(item.message) for item in captured)
+        for item in captured:
+            warnings.warn_explicit(
+                item.message, item.category, item.filename, item.lineno
+            )
+        return config
 
+
+def get_config_load_warnings() -> tuple[str, ...]:
+    """Warnings from the active configuration; loading occurs only when uncached."""
+    with _config_lock:
+        load_config()
+        return _config_warnings
+
+
+def _load_config_uncached() -> DictConfig:
+    global _config_cache
     config_dir = get_config_dir()
     defaults_path = config_dir / "defaults.yml"
 
@@ -139,8 +166,6 @@ def load_config(force_reload: bool = False) -> DictConfig:
 
 def reload_config() -> DictConfig:
     """Reload configuration from disk (invalidate cache)."""
-    global _config_cache
-    _config_cache = None
     return load_config(force_reload=True)
 
 
@@ -192,40 +217,41 @@ def save_config_section(section_path: str, values: dict) -> bool:
     Returns:
         True if saved successfully
     """
-    try:
-        config_path = get_config_dir() / "config.yml"
+    with _config_lock:
+        try:
+            config_path = get_config_dir() / "config.yml"
 
-        # Load existing config. Must be a DictConfig even when the file doesn't
-        # exist yet — OmegaConf.update() raises "Unexpected type" on a plain
-        # dict, which made the very first runtime settings save fail silently
-        # on installs without a config.yml.
-        existing_config = OmegaConf.create({})
-        if config_path.exists():
-            existing_config = OmegaConf.load(config_path)
+            # Load existing config. Must be a DictConfig even when the file doesn't
+            # exist yet — OmegaConf.update() raises "Unexpected type" on a plain
+            # dict, which made the very first runtime settings save fail silently
+            # on installs without a config.yml.
+            existing_config = OmegaConf.create({})
+            if config_path.exists():
+                existing_config = OmegaConf.load(config_path)
 
-        # Update section using dot notation
-        OmegaConf.update(existing_config, section_path, values, merge=True)
+            # Update section using dot notation
+            OmegaConf.update(existing_config, section_path, values, merge=True)
 
-        # Save back to file
-        OmegaConf.save(existing_config, config_path)
+            # Save back to file
+            OmegaConf.save(existing_config, config_path)
 
-        # Register a runtime override BEFORE reloading: when CONFIG_FILE points
-        # to a different file than config.yml (test configs), the value we just
-        # saved is not in the file load_config() reads, so it must be re-applied
-        # on every load — a one-shot in-memory patch would silently revert on
-        # the next reload_config() from any code path.
-        _runtime_overrides[section_path] = values
+            # Register a runtime override BEFORE reloading: when CONFIG_FILE points
+            # to a different file than config.yml (test configs), the value we just
+            # saved is not in the file load_config() reads, so it must be re-applied
+            # on every load — a one-shot in-memory patch would silently revert on
+            # the next reload_config() from any code path.
+            _runtime_overrides[section_path] = values
 
-        # Reload config from the primary config file (CONFIG_FILE env var);
-        # load_config() re-applies _runtime_overrides on top.
-        reload_config()
+            # Reload config from the primary config file (CONFIG_FILE env var);
+            # load_config() re-applies _runtime_overrides on top.
+            reload_config()
 
-        logger.info(f"Saved config section '{section_path}' to {config_path}")
-        return True
+            logger.info(f"Saved config section '{section_path}' to {config_path}")
+            return True
 
-    except Exception as e:
-        logger.error(f"Error saving config section '{section_path}': {e}")
-        return False
+        except Exception as e:
+            logger.error(f"Error saving config section '{section_path}': {e}")
+            return False
 
 
 def _load_raw_config() -> DictConfig:
@@ -264,20 +290,21 @@ def save_models_list(models: list) -> bool:
     must also ``load_models_config(force_reload=True)`` to refresh the model
     registry (kept out of here to avoid a config_loader→model_registry import).
     """
-    try:
-        config_path = get_config_dir() / "config.yml"
+    with _config_lock:
+        try:
+            config_path = get_config_dir() / "config.yml"
 
-        existing_config = OmegaConf.create({})
-        if config_path.exists():
-            existing_config = OmegaConf.load(config_path)
+            existing_config = OmegaConf.create({})
+            if config_path.exists():
+                existing_config = OmegaConf.load(config_path)
 
-        existing_config["models"] = OmegaConf.create(models)
-        OmegaConf.save(existing_config, config_path)
+            existing_config["models"] = OmegaConf.create(models)
+            OmegaConf.save(existing_config, config_path)
 
-        reload_config()
-        logger.info(f"Saved {len(models)} models to {config_path}")
-        return True
+            reload_config()
+            logger.info(f"Saved {len(models)} models to {config_path}")
+            return True
 
-    except Exception as e:
-        logger.error(f"Error saving models list: {e}")
-        return False
+        except Exception as e:
+            logger.error(f"Error saving models list: {e}")
+            return False

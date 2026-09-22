@@ -88,7 +88,7 @@ describe('DayReviewBoard', () => {
       status: 'provisional',
       confirmed_at: null,
       confirmed_fields: [],
-      memory_policy: 'auto',
+      requires_activity_review: true, memory_eligible: true, memory_policy: 'auto',
       salience: 'routine',
       confidence: 0.9,
       activity_mode: 'foreground',

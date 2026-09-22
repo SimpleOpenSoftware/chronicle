@@ -5,6 +5,7 @@ import { Link, useNavigate } from 'react-router-dom'
 
 import { Button, Input } from '../components/ui'
 import { memorySpacesApi } from '../services/api'
+import { spaceStateLabel, spaceSyncLabel } from '../utils/memorySpaceStatus'
 
 function formatBytes(value: number) {
   if (value < 1024) return `${value} B`
@@ -55,11 +56,11 @@ export default function MemorySpaces() {
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-800 dark:text-emerald-300">Private working notebooks</p>
             <h1 className="mt-1 text-3xl font-semibold tracking-tight text-stone-900 dark:text-stone-100">Memory Spaces</h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-stone-600 dark:text-stone-400">
-              Think freely in a sealed vault. Main sees nothing until you review and publish a merge.
+              A separate notebook. Publish selected changes to Main when you are ready.
             </p>
           </div>
           <Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreating(value => !value)}>
-            New space
+            {creating ? 'Cancel' : 'New space'}
           </Button>
         </div>
       </header>
@@ -76,12 +77,14 @@ export default function MemorySpaces() {
                 <div className="mb-2 flex items-end justify-between gap-3">
                   <div>
                     <h2 className="text-sm font-semibold text-stone-900 dark:text-stone-100">Bring notes from Main <span className="font-normal text-stone-500">— optional</span></h2>
-                    <p className="text-xs text-stone-500 dark:text-stone-400">Only notes you check are copied. Linked notes are suggestions, never followed automatically.</p>
+                    <p className="text-xs text-stone-500 dark:text-stone-400">Only notes you check are copied.</p>
                   </div>
                 </div>
                 <Input value={noteQuery} onChange={event => setNoteQuery(event.target.value)} placeholder="Search Main notes" />
                 <div className="mt-2 max-h-72 divide-y divide-stone-200 overflow-auto border-y border-stone-200 dark:divide-stone-800 dark:border-stone-800">
-                  {mainNotes.isLoading && <p className="py-4 text-sm text-stone-500">Looking through Main…</p>}
+                  {mainNotes.isLoading && <p className="py-4 text-sm text-stone-500">Loading Main notes…</p>}
+                  {mainNotes.isError && <p role="alert" className="py-4 text-sm text-red-700 dark:text-red-300">Could not load Main notes. <button type="button" className="underline" onClick={() => mainNotes.refetch()}>Retry</button></p>}
+                  {mainNotes.isSuccess && !mainNotes.data.length && <p className="py-4 text-sm text-stone-500">{noteQuery ? 'No notes match this search.' : 'No Main notes available.'}</p>}
                   {mainNotes.data?.map(note => (
                     <label key={note.note_path} className="flex cursor-pointer gap-3 py-3">
                       <input
@@ -96,7 +99,7 @@ export default function MemorySpaces() {
                       />
                       <span className="min-w-0">
                         <span className="block break-all font-mono text-xs font-semibold text-stone-800 dark:text-stone-200">{note.note_path}</span>
-                        <span className="mt-1 line-clamp-2 block text-xs leading-5 text-stone-500 dark:text-stone-400">{note.excerpt}</span>
+
                       </span>
                     </label>
                   ))}
@@ -108,10 +111,10 @@ export default function MemorySpaces() {
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-stone-500">Starting contents</p>
               <p className="mt-3 text-3xl font-semibold text-stone-900 dark:text-stone-100">{selected.size}</p>
               <p className="text-sm text-stone-500">selected notes · {formatBytes(preview.data?.total_bytes ?? 0)}</p>
-              {!selected.size && <p className="mt-4 text-sm leading-6 text-stone-600 dark:text-stone-400">This space will begin with Chronicle’s empty notebook scaffold.</p>}
+              {!selected.size && <p className="mt-4 text-sm leading-6 text-stone-600 dark:text-stone-400">No notes will be copied from Main.</p>}
               {!!suggestions.length && (
                 <div className="mt-5">
-                  <p className="flex items-center gap-1.5 text-xs font-semibold text-stone-700 dark:text-stone-300"><Link2 className="h-3.5 w-3.5" /> First-hop suggestions</p>
+                  <p className="flex items-center gap-1.5 text-xs font-semibold text-stone-700 dark:text-stone-300"><Link2 className="h-3.5 w-3.5" /> Linked notes</p>
                   <div className="mt-2 space-y-2">
                     {suggestions.map((item: { note_path: string; byte_size: number }) => (
                       <button
@@ -141,7 +144,8 @@ export default function MemorySpaces() {
 
       <section aria-label="Your memory spaces">
         {spaces.isLoading && <p className="py-8 text-sm text-stone-500">Opening the notebook shelf…</p>}
-        {!spaces.isLoading && !spaces.data?.length && (
+        {spaces.isError && <p role="alert" className="py-8 text-sm text-red-700 dark:text-red-300">Could not load memory spaces. <button className="underline" onClick={() => spaces.refetch()}>Retry</button></p>}
+        {spaces.isSuccess && !spaces.data.length && (
           <div className="py-14 text-center">
             <BookOpen className="mx-auto h-8 w-8 text-stone-400" />
             <p className="mt-3 text-sm text-stone-600 dark:text-stone-400">No spaces yet. Start blank, or bring only the Main notes you need.</p>
@@ -156,7 +160,7 @@ export default function MemorySpaces() {
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-base font-semibold text-stone-900 dark:text-stone-100">{space.name}</span>
                 <span className="mt-1 block text-xs text-stone-500 dark:text-stone-400">
-                  {space.state} · {space.sync_state} · {space.seed_notes.length ? `${space.seed_notes.length} seeded notes` : 'started blank'}
+                  {spaceStateLabel[space.state]} · {spaceSyncLabel[space.sync_state]}
                 </span>
               </span>
               <ChevronRight className="h-5 w-5 text-stone-400 transition-transform group-hover:translate-x-1" />

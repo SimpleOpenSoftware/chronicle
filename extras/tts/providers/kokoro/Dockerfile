@@ -35,6 +35,11 @@ RUN pip install --no-cache-dir \
         "soundfile>=0.12" \
         "kokoro>=0.9.2"
 
+# English G2P uses spaCy. Bake its pinned language package into the image so
+# startup never installs it into an ephemeral container layer.
+RUN pip install --no-cache-dir \
+        "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+
 # Application code
 COPY common/ ./common/
 COPY providers/kokoro/ ./providers/kokoro/

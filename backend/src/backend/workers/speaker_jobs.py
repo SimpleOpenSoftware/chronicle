@@ -32,6 +32,7 @@ from backend.models.annotation import (
 from backend.models.audio_capture import ConversationTranscriptRevision
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 from backend.services.audio_claims import range_duration, resolve_conversation_audio
 from backend.services.audio_stream import TranscriptionResultsAggregator
 from backend.services.forced_alignment import (
@@ -46,6 +47,7 @@ from backend.services.processing_artifacts import (
     persist_word_timed_revision,
     resolve_transcript_artifact_ids,
 )
+from backend.services.speaker_gallery_privacy import protect_result_logs, result_scope
 from backend.services.timeline.dirty_ranges import note_conversation_dirty
 from backend.services.transcript_integrity import (
     TranscriptTimingError,
@@ -806,6 +808,8 @@ async def _apply_background_references(
     segments: list[dict],
     user,
     speaker_client: SpeakerRecognitionClient,
+    *,
+    privacy_visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> set[float]:
     """Mark segments that match a background exemplar, and disclose it.
 
@@ -819,6 +823,10 @@ async def _apply_background_references(
     user restored as important speech) — the set cluster propagation must not
     write names onto.
     """
+    visibility = privacy_visibility or privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     user_id = str(user.user_id)
     if await background_suppression.get_subject_override(user_id, conversation_id):
         logger.info(
@@ -852,7 +860,9 @@ async def _apply_background_references(
             else:
                 if wav is None:
                     raise ValueError("background-reference segment has no audio")
+                await visibility.assert_current()
                 embedded = await speaker_client.extract_speaker_embedding(wav)
+                await visibility.assert_current()
             if embedded.get("error") or "embedding" not in embedded:
                 return
             scores = {}
@@ -862,6 +872,7 @@ async def _apply_background_references(
                     [embedded["embedding"]],
                     bucket_type,
                     embedded.get("embedding_model"),
+                    visibility=visibility,
                 )
                 results = matched.get("results") or []
                 scores[bucket_type] = (
@@ -911,6 +922,8 @@ async def _apply_background_references(
     if needs_audio:
         try:
             resolved_audio = await resolve_conversation_audio(conversation_id)
+        except privacy.PrivacyHeld:
+            raise
         except Exception as error:  # keep the suppression ledger explicitly incomplete
             logger.warning(
                 "Background-reference audio claim failed for %s: %s",
@@ -931,6 +944,8 @@ async def _apply_background_references(
                         ranges,
                         conversation_id=conversation_id,
                     )
+                except privacy.PrivacyHeld:
+                    raise
                 except Exception as error:  # one bad batch must not hide later verdicts
                     logger.warning(
                         "Background-reference audio batch failed for %s at %d: %s",
@@ -946,6 +961,10 @@ async def _apply_background_references(
                         return_exceptions=True,
                     )
                 )
+    for result in results:
+        if isinstance(result, privacy.PrivacyHeld):
+            raise result
+    await visibility.assert_current()
     failures = sum(isinstance(result, Exception) for result in results)
     if failures:
         logger.warning(
@@ -960,12 +979,16 @@ async def _apply_background_references(
             # A scan with failed segments is incomplete — don't treat missing
             # records as "no longer in zone".
             prune=failures == 0,
+            privacy_visibility=visibility,
         )
+    except privacy.PrivacyHeld:
+        raise
     except Exception:
         logger.exception(
             "Failed to write background suppression ledger for %s",
             conversation_id[:8],
         )
+    await visibility.assert_current()
     excluded = set()
     for record in ledger_records:
         start_key = background_suppression.segment_key(record["segment_start"])
@@ -1120,6 +1143,7 @@ async def check_enrolled_speakers_job(
 
 
 @async_job(redis=True, beanie=True)
+@protect_result_logs
 async def recognise_speakers_job(
     conversation_id: str,
     version_id: str,
@@ -1185,6 +1209,12 @@ async def recognise_speakers_job(
 
     # Get user_id from conversation
     user_id = conversation.user_id
+
+    target_visibility = privacy.ConversationPrivacyFilter()
+    target_snapshot = await privacy.load_snapshot(str(user_id))
+    if not target_snapshot.permits_record(conversation):
+        raise privacy.PrivacyHeld()
+    target_visibility.snapshots[str(user_id)] = target_snapshot
 
     # Resolve the SOURCE version (what we read from) and the write mode.
     #
@@ -1256,7 +1286,8 @@ async def recognise_speakers_job(
     except TranscriptTimingError as error:
         reason = f"{error.code}: {error}"
         conversation.transcript_integrity_error = reason
-        await conversation.save()
+        async with target_visibility.publication():
+            await conversation.save()
         record_event_sync(
             severity="error",
             category="data_integrity",
@@ -1272,15 +1303,16 @@ async def recognise_speakers_job(
         raise SpeakerDataIntegrityError(reason) from error
 
     if normalized_segments != preflight_segments or normalized_words != preflight_words:
-        transcript_version = await persist_timing_normalized_revision(
-            conversation,
-            transcript_version,
-            segments=normalized_segments,
-            words=normalized_words,
-            audio_duration=conversation.audio_total_duration or 0.0,
-        )
-        source_version = transcript_version
-        await conversation.save()
+        async with target_visibility.publication():
+            transcript_version = await persist_timing_normalized_revision(
+                conversation,
+                transcript_version,
+                segments=normalized_segments,
+                words=normalized_words,
+                audio_duration=conversation.audio_total_duration or 0.0,
+            )
+            source_version = transcript_version
+            await conversation.save()
         logger.info(
             "Normalized harmless transcript edge timing for %s into derived "
             "version %s",
@@ -1448,18 +1480,19 @@ async def recognise_speakers_job(
                     )
 
     if word_timing_method and actual_words:
-        transcript_version = await persist_word_timed_revision(
-            conversation,
-            transcript_version,
-            words=actual_words,
-            method=word_timing_method,
-            audio_duration=float(conversation.audio_total_duration or 0.0),
-        )
-        source_version = transcript_version
-        actual_words = [
-            word.model_dump(mode="python") for word in transcript_version.words
-        ]
-        await conversation.save()
+        async with target_visibility.publication():
+            transcript_version = await persist_word_timed_revision(
+                conversation,
+                transcript_version,
+                words=actual_words,
+                method=word_timing_method,
+                audio_duration=float(conversation.audio_total_duration or 0.0),
+            )
+            source_version = transcript_version
+            actual_words = [
+                word.model_dump(mode="python") for word in transcript_version.words
+            ]
+            await conversation.save()
         logger.info(
             "🔤 Persisted %d %s word clocks as derived source version %s",
             len(actual_words),
@@ -1527,6 +1560,7 @@ async def recognise_speakers_job(
                 {"start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker}
                 for s in speech_segments
             ]
+            await target_visibility.assert_current()
             speaker_result = await speaker_client.identify_provider_segments(
                 conversation_id=conversation_id,
                 segments=segments_data,
@@ -1570,6 +1604,7 @@ async def recognise_speakers_job(
             logger.info(
                 f"🎤 Calling speaker recognition service with conversation_id..."
             )
+            await target_visibility.assert_current()
             speaker_result = await speaker_client.diarize_identify_match(
                 conversation_id=conversation_id,
                 backend_token=backend_token,
@@ -1588,7 +1623,8 @@ async def recognise_speakers_job(
 
             if error_type == "transcript_data_error":
                 conversation.transcript_integrity_error = error_message
-                await conversation.save()
+                async with target_visibility.publication():
+                    await conversation.save()
                 record_event_sync(
                     severity="error",
                     category="data_integrity",
@@ -1656,6 +1692,7 @@ async def recognise_speakers_job(
                     "provider-independent word-timeline span(s)",
                     len(fallback_segments),
                 )
+                await target_visibility.assert_current()
                 speaker_result = await speaker_client.identify_provider_segments(
                     conversation_id=conversation_id,
                     segments=fallback_segments,
@@ -1698,6 +1735,10 @@ async def recognise_speakers_job(
                 "processing_time_seconds": time.time() - start_time,
             }
 
+        gallery_scope = result_scope(speaker_result)
+        await gallery_scope.assert_current()
+        await target_visibility.assert_current()
+
         claim_duration = (
             range_duration(conversation.audio_ranges)
             if conversation.audio_ranges
@@ -1723,6 +1764,7 @@ async def recognise_speakers_job(
                 speaker_segments,
                 background_user,
                 speaker_client,
+                privacy_visibility=target_visibility,
             )
 
         # Per-segment mode names only the clear utterances; propagate agreeing
@@ -1873,8 +1915,11 @@ async def recognise_speakers_job(
             if identified_as and identified_as != "Unknown":
                 identified_speakers.add(identified_as)
 
+        reference_receipt = await target_visibility.reference_receipt(user_id)
         sr_metadata = {
             "enabled": True,
+            "privacy_reference_receipt": reference_receipt,
+            "privacy_gallery_receipt": gallery_scope.receipt(),
             "identification_mode": _speaker_identification_mode(
                 ran_pyannote_diarization=ran_pyannote_diarization,
                 used_word_timeline_fallback=used_word_timeline_fallback,
@@ -1978,60 +2023,63 @@ async def recognise_speakers_job(
             if centroids_map:
                 transcript_version.metadata["cluster_centroids"] = centroids_map
 
-        projected_version = new_version if create_mode else transcript_version
-        if create_mode:
-            compacted_versions = await _compact_embedded_speaker_history(
-                conversation,
-                keep_version_id=projected_version.version_id,
-            )
-            if compacted_versions:
-                logger.info(
-                    "🎤 Compacted %d archived speaker projection(s) from the "
-                    "Conversation read model",
-                    compacted_versions,
+        async with gallery_scope.publication(target_visibility):
+            projected_version = new_version if create_mode else transcript_version
+            if create_mode:
+                compacted_versions = await _compact_embedded_speaker_history(
+                    conversation,
+                    keep_version_id=projected_version.version_id,
                 )
-        diarization_artifact = await persist_diarization_artifact(
-            user_id=user_id,
-            audio_ranges=conversation.audio_ranges,
-            retry_key=f"speaker-diarization:{conversation_id}:{version_id}",
-            provider=(
-                "word_timeline_fallback"
-                if used_word_timeline_fallback
-                else ("pyannote" if ran_pyannote_diarization else "provider")
-            ),
-            model=speaker_result.get("diarization_model"),
-            segments=speaker_segments,
-            configuration={
-                **dict(diarization_settings),
-                "requested_source": preferred_source,
-                "ran_pyannote_segmentation": ran_pyannote_diarization,
-                "pyannote_returned_turns": not used_word_timeline_fallback,
-                "fallback_mode": (
-                    "word_timeline" if used_word_timeline_fallback else None
+                if compacted_versions:
+                    logger.info(
+                        "🎤 Compacted %d archived speaker projection(s) from the "
+                        "Conversation read model",
+                        compacted_versions,
+                    )
+            diarization_artifact = await persist_diarization_artifact(
+                user_id=user_id,
+                audio_ranges=conversation.audio_ranges,
+                retry_key=f"speaker-diarization:{conversation_id}:{version_id}",
+                provider=(
+                    "word_timeline_fallback"
+                    if used_word_timeline_fallback
+                    else ("pyannote" if ran_pyannote_diarization else "provider")
                 ),
-                "neural_window_ceiling_seconds": 1200,
-            },
-        )
-        projected_version.metadata["diarization_artifact_id"] = (
-            diarization_artifact.artifact_id
-        )
-        transcript_artifact_ids = await resolve_transcript_artifact_ids(
-            conversation_id,
-            source_version,
-        )
-        if transcript_artifact_ids:
-            projected_version.metadata["transcript_artifact_ids"] = (
-                transcript_artifact_ids
+                model=speaker_result.get("diarization_model"),
+                segments=speaker_segments,
+                configuration={
+                    "privacy_reference_receipt": reference_receipt,
+                    "privacy_gallery_receipt": gallery_scope.receipt(),
+                    **dict(diarization_settings),
+                    "requested_source": preferred_source,
+                    "ran_pyannote_segmentation": ran_pyannote_diarization,
+                    "pyannote_returned_turns": not used_word_timeline_fallback,
+                    "fallback_mode": (
+                        "word_timeline" if used_word_timeline_fallback else None
+                    ),
+                    "neural_window_ceiling_seconds": 1200,
+                },
             )
-        revision = await persist_conversation_revision(
-            conversation,
-            projected_version,
-            retry_key=f"speaker-projection:{conversation_id}:{version_id}",
-            transcript_artifact_ids=transcript_artifact_ids,
-            diarization_artifact_ids=[diarization_artifact.artifact_id],
-        )
+            projected_version.metadata["diarization_artifact_id"] = (
+                diarization_artifact.artifact_id
+            )
+            transcript_artifact_ids = await resolve_transcript_artifact_ids(
+                conversation_id,
+                source_version,
+            )
+            if transcript_artifact_ids:
+                projected_version.metadata["transcript_artifact_ids"] = (
+                    transcript_artifact_ids
+                )
+            revision = await persist_conversation_revision(
+                conversation,
+                projected_version,
+                retry_key=f"speaker-projection:{conversation_id}:{version_id}",
+                transcript_artifact_ids=transcript_artifact_ids,
+                diarization_artifact_ids=[diarization_artifact.artifact_id],
+            )
 
-        await conversation.save()
+            await conversation.save()
 
         await note_conversation_dirty(
             conversation_id,
@@ -2056,6 +2104,11 @@ async def recognise_speakers_job(
             "transcript_revision_id": revision.revision_id,
             "processing_time_seconds": processing_time,
         }
+
+    except privacy.PrivacyHeld:
+        # A hold is a policy outcome. Do not serialize recognition names into
+        # error strings, traces, job metadata or a successful result.
+        raise
 
     except asyncio.TimeoutError as e:
         logger.error(f"❌ Speaker recognition timeout: {e}")

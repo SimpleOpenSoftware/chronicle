@@ -51,6 +51,29 @@ def isolated_system_event_ingest(monkeypatch):
 
 
 # --- Tests that need a real backing service ---------------------------------
+@pytest.fixture(autouse=True)
+def isolated_privacy_database(monkeypatch):
+    """Unit tests must never consult or mutate the production privacy ledger."""
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    from mongomock_motor import AsyncMongoMockClient
+
+    from backend.services import privacy
+
+    database = AsyncMongoMockClient().privacy_test
+    monkeypatch.setattr(privacy, "database", lambda: database)
+    locks = {}
+
+    @asynccontextmanager
+    async def publication_lock(key, **_kwargs):
+        async with locks.setdefault(key, asyncio.Lock()):
+            yield
+
+    monkeypatch.setattr(privacy, "distributed_lock", publication_lock)
+    return database
+
+
 #
 # A few modules genuinely exercise Redis or MongoDB rather than mocking them.
 # Vault writes take a Redis lock that fails CLOSED by design (see
@@ -101,3 +124,13 @@ def mongo_service():
             f"needs MongoDB at {url} — "
             "podman run -d --rm --name chr-test-mongo -p 27018:27017 mongo:8"
         )
+
+
+@pytest.fixture(autouse=True)
+def isolated_client_diagnostic_files(monkeypatch, tmp_path):
+    """Server voice diagnostics in unit tests must never write deployment data."""
+    from backend.services import client_diagnostics
+
+    monkeypatch.setattr(
+        client_diagnostics, "CLIENT_DIAGNOSTICS_DIR", tmp_path / "client_diagnostics"
+    )

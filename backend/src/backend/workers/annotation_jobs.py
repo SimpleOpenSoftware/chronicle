@@ -22,6 +22,7 @@ from backend.models.annotation import (
 from backend.models.conversation import Conversation
 from backend.models.user import User
 from backend.prompt_registry import get_prompt_registry
+from backend.services import privacy
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ async def surface_error_suggestions():
     """
     logger.info("Checking for annotation suggestions...")
     total_created = 0
+    privacy_held = 0
 
     try:
         users = await User.find_all().to_list()
@@ -92,20 +94,28 @@ async def surface_error_suggestions():
                 if conversation.conversation_id in skip_conversation_ids:
                     continue
 
+                try:
+                    snapshot = await privacy.require_record(conversation)
+                except privacy.PrivacyHeld:
+                    privacy_held += 1
+                    continue
+
                 active_transcript = conversation.active_transcript
                 if not active_transcript or not active_transcript.segments:
-                    logger.debug(
-                        f"  Conversation '{conversation.title or conversation.conversation_id}': no transcript/segments, skipping"
-                    )
+                    logger.debug("No transcript segments; skipping annotation analysis")
                     continue
 
                 seg_count = len(active_transcript.segments)
-                logger.info(
-                    f"  Analyzing '{conversation.title or TITLE_NOT_GENERATED}' "
-                    f"({seg_count} segments, id={conversation.conversation_id[:8]}...)"
-                )
+                logger.info("Analyzing transcript (%d segments)", seg_count)
 
-                suggestions = await _analyze_transcript(conversation, active_transcript)
+                try:
+                    suggestions = await _analyze_transcript(
+                        conversation, active_transcript, snapshot
+                    )
+                    await privacy.assert_current(user_id, snapshot)
+                except privacy.PrivacyHeld:
+                    privacy_held += 1
+                    continue
 
                 if not suggestions:
                     logger.info(f"    No issues found")
@@ -131,26 +141,29 @@ async def surface_error_suggestions():
                         source=AnnotationSource.MODEL_SUGGESTION,
                         status=AnnotationStatus.PENDING,
                     )
+                    try:
+                        await privacy.assert_current(user_id, snapshot)
+                    except privacy.PrivacyHeld:
+                        privacy_held += 1
+                        break
                     await annotation.save()
                     total_created += 1
                     created_for_user += 1
-                    logger.info(
-                        f"    Created suggestion: segment {seg_idx} - "
-                        f"'{suggestion.get('reason', 'unknown')}'"
-                    )
+                    logger.info("Created a transcript correction suggestion")
 
             logger.info(
                 f"User {user.email or user_id}: {created_for_user} suggestions created"
             )
 
         logger.info(f"Suggestion check complete: {total_created} annotations created")
+        return {"created": total_created, "privacy_held": privacy_held}
 
     except Exception as e:
         logger.error(f"Error in surface_error_suggestions: {e}", exc_info=True)
         raise
 
 
-async def _analyze_transcript(conversation, transcript) -> list[dict]:
+async def _analyze_transcript(conversation, transcript, snapshot) -> list[dict]:
     """Use LLM to analyze a transcript for potential errors."""
     segments = transcript.segments[:MAX_SEGMENTS_PER_PROMPT]
     segments_text = "\n".join(
@@ -172,7 +185,9 @@ async def _analyze_transcript(conversation, transcript) -> list[dict]:
 
     try:
         logger.debug(f"    Sending {len(segments)} segments to LLM for analysis...")
+        await privacy.assert_current(str(conversation.user_id), snapshot)
         response = await async_generate(prompt)
+        await privacy.assert_current(str(conversation.user_id), snapshot)
         logger.debug(f"    LLM response length: {len(response)} chars")
         # Parse JSON from response, handling markdown code blocks
         text = response.strip()
@@ -185,15 +200,12 @@ async def _analyze_transcript(conversation, transcript) -> list[dict]:
             return []
         return suggestions
     except json.JSONDecodeError as e:
-        logger.warning(
-            f"    Failed to parse LLM JSON for '{conversation.title or conversation.conversation_id}': {e}"
-        )
-        logger.debug(f"    Raw LLM response: {response[:500]}")
+        logger.warning("Invalid JSON in annotation analysis response")
         return []
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.warning(
-            f"    LLM call failed for '{conversation.title or conversation.conversation_id}': {e}"
-        )
+        logger.warning("Annotation analysis failed (%s)", type(e).__name__)
         return []
 
 

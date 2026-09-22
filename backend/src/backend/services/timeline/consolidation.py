@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
+import backend.services.privacy as privacy
 from backend.model_registry import get_models_registry
 from backend.models.conversation import Conversation
 from backend.models.timeline import (
@@ -114,6 +115,14 @@ async def snapshot_episodes(day: TimelineDay) -> list[TimelineEpisode]:
         raise ConsolidationResolutionError(
             "The canonical snapshot references an unavailable episode revision"
         )
+
+    visible = await privacy.filter_records(list(by_ref.values()), day.user_id)
+    allowed = {(item.episode_key, item.revision) for item in visible}
+    if any(
+        (item.episode_key, item.revision) not in allowed
+        for item in snapshot.episode_revisions
+    ):
+        raise privacy.PrivacyHeld()
     return sorted(
         [
             by_ref[(item.episode_key, item.revision)]
@@ -788,6 +797,14 @@ async def suggest_episode_consolidation(
                 "conversational": episode.conversational,
                 "entities": episode.entities,
                 "transcript_excerpt": transcript[:3500],
+                "source_roles": [
+                    {
+                        "locator": ref.locator.model_dump(mode="json"),
+                        "role": ref.role,
+                        "evidence_id": ref.evidence_id,
+                    }
+                    for ref in episode.evidence_refs
+                ],
             }
         )
     prompt = """Review this Chronicle day for over-fragmentation. The image is a canonical day tape: each row is labelled E01, E02, and so on, and its bar is positioned on a 24-hour axis. Use the structured episode evidence below for exact meaning.

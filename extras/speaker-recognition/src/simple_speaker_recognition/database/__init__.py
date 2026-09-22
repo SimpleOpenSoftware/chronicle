@@ -42,6 +42,15 @@ def init_db():
     from . import models  # Import models to register them
 
     Base.metadata.create_all(bind=engine)
+    # A durable target identity prevents an enrollment retry or compensation
+    # from acknowledging a different catalog after routing/failover changes.
+    import uuid
+
+    with SessionLocal.begin() as session:
+        if session.get(models.SpeakerCatalogIdentity, 1) is None:
+            session.add(
+                models.SpeakerCatalogIdentity(id=1, catalog_id=uuid.uuid4().hex)
+            )
 
 
 def get_db():

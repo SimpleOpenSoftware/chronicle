@@ -133,6 +133,73 @@ async def test_overlapping_triggers_coalesce_into_one_row(dirty_range_documents)
 
 
 @pytest.mark.asyncio
+async def test_repeated_screening_appends_without_rewriting_revision_history(
+    dirty_range_documents, monkeypatch
+):
+    """Historical screening must not resend a growing multi-megabyte work row."""
+    from bson import BSON
+
+    first = await _mark(0, 10, "privacy_screening", source_kind="privacy")
+    history = [f"synthetic-screening-{index:064d}" for index in range(5000)]
+    first.source_revisions = {"privacy": history, "transcript": ["retained-transcript"]}
+    await first.save()
+    original_deadline = first.force_after
+    collection = DirtyEvidenceRange.get_pymongo_collection()
+    write_sizes = []
+    for method_name in ("update_one", "find_one_and_update"):
+        original = getattr(collection, method_name)
+
+        async def measured(*args, _original=original, **kwargs):
+            update = args[1] if len(args) > 1 else kwargs["update"]
+            write_sizes.append(len(BSON.encode(update)))
+            return await _original(*args, **kwargs)
+
+        monkeypatch.setattr(collection, method_name, measured)
+
+    second = await _mark(5, 10, "privacy_screening", source_kind="privacy")
+    repeated = await _mark(5, 10, "privacy_screening", source_kind="privacy")
+    stored = await DirtyEvidenceRange.get(first.id)
+    expected = {
+        "privacy": history + ["rev-privacy_screening-5"],
+        "transcript": ["retained-transcript"],
+    }
+    assert (
+        second.source_revisions
+        == repeated.source_revisions
+        == stored.source_revisions
+        == expected
+    )
+    assert stored.evidence_revision == 3
+    assert _as_utc(stored.started_at) == START
+    assert _as_utc(stored.ended_at) == START + timedelta(minutes=15)
+    assert _as_utc(stored.force_after) == _as_utc(original_deadline)
+    assert stored.state == "pending" and stored.dispatch_authorized_at is None
+    assert write_sizes and max(write_sizes) < 16384
+
+
+@pytest.mark.asyncio
+async def test_coalescing_cannot_overwrite_a_new_authorization(
+    dirty_range_documents, monkeypatch
+):
+    first = await _mark(0, 10, "privacy_screening", source_kind="privacy")
+    collection = DirtyEvidenceRange.get_pymongo_collection()
+    original = collection.update_one
+
+    async def authorize_before_update(*args, **kwargs):
+        await original({"_id": first.id}, {"$set": {"state": "authorized_pending"}})
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(collection, "update_one", authorize_before_update)
+    with pytest.raises(RuntimeError, match="changed during coalescing"):
+        await _mark(5, 10, "privacy_screening", source_kind="privacy")
+    stored = await DirtyEvidenceRange.get(first.id)
+    assert stored.state == "authorized_pending"
+    assert stored.evidence_revision == first.evidence_revision
+    assert stored.source_revisions == first.source_revisions
+    assert _as_utc(stored.ended_at) == START + timedelta(minutes=10)
+
+
+@pytest.mark.asyncio
 async def test_nearby_ranges_within_the_gap_merge(dirty_range_documents):
     first = await _mark(0, 5, "conversation_closed")
     # Starts 3 minutes after the first ends — inside COALESCE_GAP_MINUTES.

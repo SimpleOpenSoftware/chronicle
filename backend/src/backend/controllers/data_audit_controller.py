@@ -17,8 +17,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
+import backend.services.privacy as privacy_module
+import backend.services.recording_purpose as recording_purpose
 from backend.client_manager import synthetic_client_id
 from backend.config import get_diarization_settings
 from backend.constants import is_non_enrollable_speaker, is_unknown_speaker_label
@@ -30,6 +32,7 @@ from backend.controllers.queue_controller import (
 )
 from backend.models.annotation import Annotation, AnnotationType
 from backend.models.conversation import Conversation, create_conversation
+from backend.services import privacy
 from backend.services.audio_claims import (
     apply_audio_ranges,
     merge_audio_ranges,
@@ -439,6 +442,7 @@ async def list_for_audit(
     sent to annotators.
     """
     try:
+        visibility = privacy.ConversationPrivacyFilter()
         base: dict = {} if user.is_superuser else {"user_id": str(user.user_id)}
 
         if archived_only:
@@ -482,6 +486,7 @@ async def list_for_audit(
         )
         raw_docs = await cursor.to_list(length=MAX_SCAN)
         scan_capped = len(raw_docs) >= MAX_SCAN
+        raw_docs = await visibility.filter(raw_docs)
 
         dataset_base: dict = {} if user.is_superuser else {"user_id": str(user.user_id)}
         dataset_base.update(
@@ -493,10 +498,13 @@ async def list_for_audit(
             }
         )
         dataset_docs = await (
-            collection.find(dataset_base, {"external_source_id": 1})
+            collection.find(
+                dataset_base, {"external_source_id": 1, "conversation_id": 1}
+            )
             .sort("created_at", -1)
             .limit(MAX_SCAN)
         ).to_list(length=MAX_SCAN)
+        dataset_docs = await visibility.filter(dataset_docs)
         available_datasets = list(
             dict.fromkeys(
                 source_id.rsplit(":", 1)[0]
@@ -634,11 +642,13 @@ async def list_for_audit(
                 "audio_integrity_error": None,
             },
             {
+                "conversation_id": 1,
                 "vad_analysis.frame_count": 1,
                 "vad_analysis.frame_hop_ms": 1,
                 "audio_total_duration": 1,
             },
         ).to_list(length=MAX_SCAN)
+        analyze_docs = await visibility.filter(analyze_docs)
         unanalyzed_count = sum(
             1
             for d in analyze_docs
@@ -646,6 +656,7 @@ async def list_for_audit(
             or _vad_stale(d.get("vad_analysis"), d.get("audio_total_duration") or 0.0)
         )
 
+        await visibility.assert_current()
         return {
             "conversations": page,
             "total": total,
@@ -661,6 +672,8 @@ async def list_for_audit(
             "datasets": available_datasets,
         }
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
         logger.exception(f"Error listing conversations for cleaning: {e}")
         return JSONResponse(
@@ -715,6 +728,10 @@ async def speaker_confidence_overview(user: User):
         collection = Conversation.get_pymongo_collection()
         cursor = collection.find(base, _SCAN_PROJECTION).limit(MAX_SCAN)
         docs = await cursor.to_list(length=MAX_SCAN)
+
+        scan_capped = len(docs) >= MAX_SCAN
+        visibility = privacy.ConversationPrivacyFilter()
+        docs = await visibility.filter(docs)
 
         per_speaker: Dict[str, List[float]] = {}
         per_speaker_convs: Dict[str, set] = {}
@@ -817,13 +834,14 @@ async def speaker_confidence_overview(user: User):
         except Exception:
             logger.warning("Could not list enrolled speakers for confidence overview")
 
+        await visibility.assert_current()
         return {
             "threshold": threshold,
             "margin": margin,
             "total_identified": total,
             "conversations_with_ids": convs_with_ids,
             "conversations_scanned": len(docs),
-            "scan_capped": len(docs) >= MAX_SCAN,
+            "scan_capped": scan_capped,
             "marginal_count": marginal,
             "marginal_fraction": round(marginal / total, 4) if total else 0.0,
             "histogram": {
@@ -835,6 +853,8 @@ async def speaker_confidence_overview(user: User):
             "recommended_threshold": _recommend_threshold(all_conf),
             "speakers": speakers,
         }
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
         logger.exception(f"Error computing speaker confidence overview: {e}")
         return JSONResponse(
@@ -933,6 +953,14 @@ async def _load_operable_conversation(
         return None, JSONResponse(
             status_code=403, content={"error": "Access forbidden"}
         )
+
+    try:
+        await privacy_module.require_record(conversation)
+    except privacy_module.PrivacyHeld:
+        return None, JSONResponse(
+            status_code=423,
+            content={"error": "Private or unscreened evidence is held from processing"},
+        )
     if conversation.deleted:
         return None, JSONResponse(
             status_code=409, content={"error": "Conversation is deleted"}
@@ -1005,6 +1033,7 @@ async def get_silence_gaps(
     if error:
         return error
 
+    policy = await privacy.require_record(conversation)
     chunks = await _chunk_timeline(conversation_id)
     if not chunks:
         return JSONResponse(
@@ -1029,6 +1058,7 @@ async def get_silence_gaps(
         )
     )
 
+    await privacy.assert_current(conversation.user_id, policy)
     return {
         "analyzed": not needs_analysis,
         "needs_analysis": needs_analysis,
@@ -1065,6 +1095,7 @@ async def get_speech_regions(
         )
     if not user.is_superuser and conversation.user_id != str(user.user_id):
         return JSONResponse(status_code=403, content={"error": "Access forbidden"})
+    policy = await privacy.require_record(conversation)
     if conversation.audio_archived or not conversation.audio_chunks_count:
         return JSONResponse(
             status_code=409, content={"error": "Conversation has no audio"}
@@ -1113,6 +1144,7 @@ async def get_speech_regions(
             )
 
         if not scored_any:
+            await privacy.assert_current(conversation.user_id, policy)
             return {
                 "analyzed": False,
                 "needs_analysis": True,
@@ -1134,9 +1166,11 @@ async def get_speech_regions(
         regions = merge_speech_regions(raw_intervals, duration)
         if not wanted and va is not None:
             va.speech_regions = regions
+            await privacy.assert_current(conversation.user_id, policy)
             await conversation.save()
 
     speech_seconds = sum(end - start for start, end in regions)
+    await privacy.assert_current(conversation.user_id, policy)
     return {
         "analyzed": True,
         "needs_analysis": False,
@@ -1166,6 +1200,7 @@ async def get_segments(user: User, conversation_id: str):
         )
     if not user.is_superuser and conversation.user_id != str(user.user_id):
         return JSONResponse(status_code=403, content={"error": "Access forbidden"})
+    policy = await privacy.require_record(conversation)
 
     version = _active_transcript_version(conversation)
     segments = []
@@ -1184,6 +1219,7 @@ async def get_segments(user: User, conversation_id: str):
             }
         )
 
+    await privacy.assert_current(conversation.user_id, policy)
     return {
         "conversation_id": conversation_id,
         "duration_seconds": round(conversation.audio_total_duration or 0.0, 2),
@@ -1212,6 +1248,7 @@ async def identify_segment_clip(
             status_code=400, content={"error": "end must be greater than start"}
         )
 
+    policy = await privacy.require_record(_conversation)
     speaker_client = SpeakerRecognitionClient()
     if not speaker_client.enabled:
         return JSONResponse(
@@ -1231,11 +1268,13 @@ async def identify_segment_clip(
     # segment — that name+score is the whole point of a triage suggestion. The
     # caller surfaces the cosine (color-coded) so a weak match reads as weak;
     # `found` reflects whether it would clear the real operating threshold.
+    await privacy.assert_current(_conversation.user_id, policy)
     suggest = await speaker_client.identify_segment(
         wav_bytes, user_id=str(user.user_id), similarity_threshold=0.0
     )
     confidence = suggest.get("confidence")
     threshold = get_diarization_settings().get("similarity_threshold", 0.5)
+    await privacy.assert_current(_conversation.user_id, policy)
     return {
         "found": confidence is not None and confidence >= threshold,
         "speaker_id": suggest.get("speaker_id"),
@@ -1252,6 +1291,7 @@ def _speaker_label_reviews_collection():
 
 async def next_speaker_label_reviews(user: User, batch_size: int = 5):
     """Serve a diverse active-learning batch plus calibration controls."""
+    visibility = privacy.ConversationPrivacyFilter()
     batch_size = max(1, min(batch_size, 20))
     scope = {} if user.is_superuser else {"user_id": str(user.user_id)}
     review_rows = (
@@ -1262,6 +1302,7 @@ async def next_speaker_label_reviews(user: User, batch_size: int = 5):
         )
         .to_list()
     )
+    review_rows = await visibility.filter(review_rows)
     reviewed_keys = {row["review_key"] for row in review_rows}
     conversation_review_counts: Dict[str, int] = {}
     speaker_review_counts: Dict[str, int] = {}
@@ -1319,7 +1360,8 @@ async def next_speaker_label_reviews(user: User, batch_size: int = 5):
         .sort("created_at", -1)
         .limit(MAX_SCAN)
     )
-    async for doc in cursor:
+    docs = await visibility.filter(await cursor.to_list(length=MAX_SCAN))
+    for doc in docs:
         conversations_scanned += 1
         candidates.extend(_speaker_review_candidates(doc, excluded_keys))
     threshold = float(get_diarization_settings().get("similarity_threshold", 0.5))
@@ -1330,6 +1372,7 @@ async def next_speaker_label_reviews(user: User, batch_size: int = 5):
         conversation_review_counts,
         speaker_review_counts,
     )
+    await visibility.assert_current()
     return {
         "batch": batch,
         "reviewed_total": len(reviewed_keys),
@@ -1343,6 +1386,8 @@ async def speaker_label_review_metrics(user: User):
     """Human-measured assignment precision, globally and per claimed identity."""
     scope = {} if user.is_superuser else {"user_id": str(user.user_id)}
     rows = await _speaker_label_reviews_collection().find(scope, {"_id": 0}).to_list()
+    visibility = privacy.ConversationPrivacyFilter()
+    rows = await visibility.filter(rows)
     evaluable_verdicts = {"correct", "relabel", "unknown", "background"}
 
     def summarize(items: List[dict]) -> dict:
@@ -1369,6 +1414,7 @@ async def speaker_label_review_metrics(user: User):
         {"speaker": speaker, **summarize(items)} for speaker, items in grouped.items()
     ]
     speakers.sort(key=lambda item: (-item["evaluable"], item["speaker"]))
+    await visibility.assert_current()
     return {
         "overall": summarize(rows),
         "boundary": summarize(
@@ -1916,6 +1962,17 @@ async def merge_conversations(user: User, conversation_ids: List[str]):
                 return error
             sources.append(conversation)
 
+        if (
+            len({recording_purpose.is_personal_recording(source) for source in sources})
+            > 1
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Training-only and personal recordings cannot be merged"
+                },
+            )
+
         client_ids = {s.client_id for s in sources}
         if len(client_ids) != 1:
             return JSONResponse(
@@ -2372,6 +2429,8 @@ async def preview_export(
     recording is too slow for a synchronous endpoint; the UI points at the
     Analyze button.
     """
+
+    fences = []
     excluded_ranges = excluded_ranges or {}
     user_id = str(user.user_id)
     conversations: List[dict] = []
@@ -2380,15 +2439,31 @@ async def preview_export(
     try:
         for cid in dict.fromkeys(conversation_ids):
             conv = await Conversation.find_one(Conversation.conversation_id == cid)
-            entry: Dict[str, Any] = {
-                "conversation_id": cid,
-                "title": conv.title if conv else None,
-                "client_id": conv.client_id if conv else None,
-                "created_at": (
-                    conv.created_at.isoformat() if conv and conv.created_at else None
-                ),
-            }
+            entry: Dict[str, Any] = {"conversation_id": cid}
             skipped = export_eligibility(conv, user_id, user.is_superuser)
+            if skipped:
+                entry["skipped_reason"] = skipped
+                conversations.append(entry)
+                continue
+            try:
+                snapshot = await privacy_module.require_record(conv)
+            except privacy_module.PrivacyHeld:
+                entry["skipped_reason"] = (
+                    "Private or unscreened evidence is held from processing"
+                )
+                conversations.append(entry)
+                continue
+            entry.update(
+                {
+                    "title": conv.title if conv else None,
+                    "client_id": conv.client_id if conv else None,
+                    "created_at": (
+                        conv.created_at.isoformat()
+                        if conv and conv.created_at
+                        else None
+                    ),
+                }
+            )
             if not skipped:
                 plan = await plan_conversation_clips(
                     conv,
@@ -2399,6 +2474,17 @@ async def preview_export(
                     excluded_ranges.get(cid),
                 )
                 skipped = plan.skipped_reason
+            try:
+                await privacy_module.assert_current(str(conv.user_id), snapshot)
+            except privacy_module.PrivacyHeld:
+                conversations.append(
+                    {
+                        "conversation_id": cid,
+                        "skipped_reason": "Privacy changed; reload the export preview",
+                    }
+                )
+                continue
+            fences.append((str(conv.user_id), snapshot))
             if skipped:
                 entry["skipped_reason"] = skipped
                 conversations.append(entry)
@@ -2434,7 +2520,14 @@ async def preview_export(
         totals["exported_conversations"] = sum(
             1 for c in conversations if "skipped_reason" not in c
         )
+        for owner, snapshot in fences:
+            await privacy_module.assert_current(owner, snapshot)
         return {"conversations": conversations, "totals": totals}
+    except privacy_module.PrivacyHeld:
+        return JSONResponse(
+            status_code=423,
+            content={"error": "Privacy changed; reload the export preview"},
+        )
     except Exception as e:
         logger.exception(f"Error previewing annotation export: {e}")
         return JSONResponse(
@@ -2459,6 +2552,9 @@ async def start_export(
     confirmed from the privacy screen; ``dropped_ranges`` → clips the user
     unticked in the export preview. Both are carved out of the export.
     """
+
+    for identifier in conversation_ids:
+        await privacy_module.require_conversation(identifier)
     try:
         export_id = new_export_id()
         job = default_queue.enqueue(
@@ -2513,6 +2609,7 @@ def _read_export_meta(user: User, export_id: str):
 
 async def list_exports(user: User):
     """List completed exports (superusers see all, others their own)."""
+
     exports = []
     if EXPORTS_DIR.is_dir():
         for meta_path in EXPORTS_DIR.glob(f"*/{META_NAME}"):
@@ -2522,6 +2619,10 @@ async def list_exports(user: User):
                 logger.warning(f"Unreadable export metadata: {meta_path}")
                 continue
             if not user.is_superuser and meta.get("created_by") != str(user.user_id):
+                continue
+            try:
+                await privacy_module.guard_export(meta)
+            except privacy_module.PrivacyHeld:
                 continue
             meta["zip_ready"] = (meta_path.parent / ZIP_NAME).is_file()
             exports.append(meta)
@@ -2534,13 +2635,24 @@ async def download_export(user: User, export_id: str):
     meta, error = _read_export_meta(user, export_id)
     if error:
         return error
+
+    try:
+        snapshots = await privacy_module.guard_export(meta)
+    except privacy_module.PrivacyHeld:
+        return JSONResponse(
+            status_code=423,
+            content={"error": "Private or unscreened evidence is held from processing"},
+        )
     zip_path = export_dir(export_id) / ZIP_NAME
     if not zip_path.is_file():
         return JSONResponse(
             status_code=404, content={"error": "Export zip not found (job failed?)"}
         )
-    return FileResponse(
-        zip_path, media_type="application/zip", filename=f"{export_id}.zip"
+    return privacy_module.PrivacyFileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{export_id}.zip",
+        privacy_snapshots=snapshots,
     )
 
 

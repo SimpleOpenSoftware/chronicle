@@ -678,7 +678,7 @@ async def get_streaming_status(
     request: Request, current_user: User = Depends(current_superuser)
 ):
     """Get status of active streaming sessions and Redis Streams health. Admin only."""
-    return await session_controller.get_streaming_status(request)
+    return await session_controller.get_streaming_status(request, current_user)
 
 
 @router.post("/streaming/reclaim")
@@ -770,6 +770,29 @@ class NodeUpdateRequest(BaseModel):
     prebuilt: str | None = None
     # Owning node host (see ServiceActionRequest.node).
     node: str | None = None
+
+
+@router.get("/admin/service-deployments")
+async def get_service_deployments(current_user: User = Depends(current_superuser)):
+    return await system_controller._service_manager_request("GET", "/deployments")
+
+
+@router.put("/admin/service-deployments")
+async def put_service_deployments(
+    plan: dict = Body(...), current_user: User = Depends(current_superuser)
+):
+    return await system_controller._service_manager_request(
+        "PUT", "/deployments", plan, timeout=120
+    )
+
+
+@router.get("/admin/service-deployments/status")
+async def get_service_deployment_status(
+    current_user: User = Depends(current_superuser),
+):
+    return await system_controller._service_manager_request(
+        "GET", "/deployments/status", timeout=120
+    )
 
 
 @router.get("/admin/services")

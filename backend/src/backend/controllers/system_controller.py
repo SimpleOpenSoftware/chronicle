@@ -35,6 +35,7 @@ from backend.config import (
 )
 from backend.config_loader import (
     get_backend_config,
+    get_config_load_warnings,
     get_plugins_yml_path,
     get_raw_models,
     load_config,
@@ -175,20 +176,6 @@ def _is_self_hosted_model(model) -> bool:
     return host.endswith(".ts.net") or "." not in host
 
 
-def _reload_config_capturing_warnings() -> list[str]:
-    """Force a config reload; return the warning messages it raised.
-
-    Runs off the event loop: ``force_reload=True`` re-reads and re-parses both YAML
-    files and deep-merges them, which is over a second of pure CPU here. The warning
-    capture has to travel with it — ``catch_warnings`` mutates process-global state,
-    so the load must happen in the same thread that installed the filter.
-    """
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always")
-        load_config(force_reload=True)
-        return [str(w.message) for w in captured]
-
-
 async def get_config_diagnostics():
     """
     Get comprehensive configuration diagnostics.
@@ -206,7 +193,7 @@ async def get_config_diagnostics():
 
     # Test OmegaConf configuration loading
     try:
-        config_warnings = await asyncio.to_thread(_reload_config_capturing_warnings)
+        config_warnings = await asyncio.to_thread(get_config_load_warnings)
 
         # Check for OmegaConf warnings
         for warning_msg in config_warnings:
@@ -243,6 +230,7 @@ async def get_config_diagnostics():
         }
 
     # Test model registry
+    registry = None
     try:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
@@ -1838,6 +1826,8 @@ def _model_view(model_def: ModelDef, raw_by_name: dict, default_names: set) -> d
         "model_provider": model_def.model_provider,
         "model_name": model_def.model_name,
         "model_url": model_def.model_url,
+        "deployment": model_def.deployment,
+        "deployment_endpoint": model_def.deployment_endpoint,
         "api_family": model_def.api_family,
         "api_key": _mask_api_key(raw_api_key),
         "api_key_is_set": bool(raw_api_key)

@@ -2,7 +2,7 @@
   "expo": {
     "name": "chronicle",
     "slug": "friend-lite-app",
-    "version": "1.14.0",
+    "version": "1.15.0",
     "scheme": "chronicle",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -91,6 +91,7 @@
         {
           "android": {
             "usesCleartextTraffic": true,
+            "minSdkVersion": 31,
             "compileSdkVersion": 36,
             "targetSdkVersion": 35,
             "extraMavenRepos": [

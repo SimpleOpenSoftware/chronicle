@@ -319,9 +319,11 @@ class AudioEvidenceSpan(Document):
                     ("locator.track_id", ASCENDING),
                     ("first_source_item_id", ASCENDING),
                     ("last_source_item_id", ASCENDING),
+                    ("started_at", ASCENDING),
+                    ("ended_at", ASCENDING),
                 ],
                 unique=True,
-                name="audio_evidence_source_range",
+                name="audio_evidence_source_time_range",
             ),
             IndexModel(
                 [
@@ -849,6 +851,8 @@ class PotentialMemoryChange(BaseModel):
     after_text: Optional[str] = None
     summary: str = ""
     source_episode_keys: list[str] = Field(default_factory=list)
+    source_evidence_keys: list[str] = Field(default_factory=list)
+    source_session_keys: list[str] = Field(default_factory=list)
 
 
 class MemoryFreshnessResult(BaseModel):
@@ -861,24 +865,55 @@ class MemoryReviewProposal(Document):
     """One immutable diff generation for a human-authorized episode selection.
 
     request_id survives regeneration; proposal_id identifies the exact diff accepted.
-    Terminal generations remain audit evidence and never feed another candidate.
+    Terminal generations remain audit evidence. Explicit draft feedback can reuse
+    a prior account only while its source scope still matches and is revalidated.
     """
 
     proposal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     request_id: str
     generation: int = Field(default=1, ge=1)
     user_id: str
-    local_date: date
+    local_date: Optional[date]
+    memory_space_id: Optional[str] = None
+    source_kind: Literal["timeline", "undated"] = "timeline"
+    recording_id: Optional[str] = None
+    accepted_context: dict[str, Any] = Field(default_factory=dict)
+    refresh_assessment: Optional[dict[str, Any]] = None
     timezone: str
     snapshot_id: str
-    selected_episodes: list[EpisodeRevisionRef] = Field(min_length=1)
+    selected_episodes: list[EpisodeRevisionRef] = Field(default_factory=list)
     selection_hash: str
     selected_tokens: list[str] = Field(min_length=1)
     active: bool = True
     source_digest: str = ""
     group_revisions: list["TimelineSemanticGroupRevision"] = Field(default_factory=list)
+    source_scope: list[dict[str, Any]] = Field(default_factory=list)
+    excluded_source_keys: list[str] = Field(default_factory=list)
+    session_key: Optional[str] = None
+    session_revision: Optional[int] = None
+    session_owner_date: Optional[date] = None
+    source_scope_hash: str = ""
+    source_checked_at: Optional[datetime] = None
+    priority: int = 0
+    job_id: Optional[str] = None
+    attempts: int = 0
+    stage: str = "queued"
+    completed_sources: int = 0
+    total_sources: int = 0
+    investigation_activity: dict[str, Any] = Field(default_factory=dict)
+    failure_kind: Optional[str] = None
+    questions: list[str] = Field(default_factory=list)
+    inference_runs: list[dict[str, Any]] = Field(default_factory=list)
+    writer_inference_artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    account: Optional[dict[str, Any]] = None
+    revision_feedback: Optional[str] = Field(
+        default=None, min_length=1, max_length=4000
+    )
     supersedes_proposal_id: Optional[str] = None
     replacement_proposal_id: Optional[str] = None
+    replacement_feedback: Optional[str] = Field(
+        default=None, min_length=1, max_length=4000
+    )
     corrected_by_proposal_id: Optional[str] = None
     correction_of: list[str] = Field(default_factory=list)
     withdrawn: bool = False
@@ -903,6 +938,9 @@ class MemoryReviewProposal(Document):
         "regenerating",
         "correction_required",
         "corrected",
+        "needs_attention",
+        "deferred",
+        "paused",
     ] = "queued"
     changes: list[PotentialMemoryChange] = Field(default_factory=list)
     accepted_change_ids: list[str] = Field(default_factory=list)
@@ -914,6 +952,23 @@ class MemoryReviewProposal(Document):
     created_at: datetime = Field(default_factory=utcnow)
     generated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_source_selection(self):
+        if self.source_kind == "undated":
+            if (
+                self.local_date is not None
+                or self.selected_episodes
+                or not self.recording_id
+                or not self.session_key
+                or not self.session_revision
+            ):
+                raise ValueError(
+                    "Undated selections require a recording and session revision, without a fabricated day or episode"
+                )
+        elif self.local_date is None or not self.selected_episodes:
+            raise ValueError("Timeline selections require a date and episode revisions")
+        return self
 
     class Settings:
         name = "memory_review_proposals"
@@ -954,6 +1009,7 @@ class TimelineReviewDecision(BaseModel):
         "episode_delete",
         "episode_not_activity",
         "episode_coverage_only",
+        "session_organized",
     ]
     episode_ids: list[str] = Field(default_factory=list)
     suggestion_id: Optional[str] = None
@@ -977,9 +1033,11 @@ class TimelineSemanticGroupRevision(BaseModel):
     group_key: str = Field(default_factory=lambda: str(uuid.uuid4()))
     revision: int = Field(default=1, ge=1)
     relation_type: Literal["same_activity"] = "same_activity"
-    member_revisions: list[EpisodeRevisionRef] = Field(min_length=2)
+    member_revisions: list[EpisodeRevisionRef] = Field(min_length=1)
     # Episode ids are display locators only. Exact membership is the tuple above.
-    episode_ids: list[str] = Field(min_length=2)
+    episode_ids: list[str] = Field(min_length=1)
+    origin: Literal["human", "automatic"] = "human"
+    questions: list[str] = Field(default_factory=list)
     source_snapshot_id: str = Field(min_length=64, max_length=64)
     predecessor_revisions: list[GroupRevisionRef] = Field(default_factory=list)
     status: Literal["active", "tombstone"] = "active"
@@ -1000,8 +1058,8 @@ class TimelineSemanticGroupRevision(BaseModel):
             raise ValueError("semantic group member revisions must be unique")
         if len(self.episode_ids) != len(self.member_revisions):
             raise ValueError("semantic group display ids must match exact members")
-        if self.ended_at <= self.started_at:
-            raise ValueError("semantic group must have a positive envelope")
+        if self.ended_at < self.started_at:
+            raise ValueError("semantic group cannot end before it starts")
         if self.status == "active" and (not self.title or not self.summary):
             raise ValueError("an active semantic group requires an account")
         return self
@@ -1230,6 +1288,12 @@ class TimelineDay(Document):
     class Settings:
         name = "timeline_days"
         indexes = [
+            IndexModel(
+                [
+                    ("user_id", ASCENDING),
+                    ("semantic_group_history.episode_ids", ASCENDING),
+                ]
+            ),
             IndexModel(
                 [
                     ("user_id", ASCENDING),

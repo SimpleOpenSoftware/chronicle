@@ -17,6 +17,7 @@ from simple_speaker_recognition.api.core.utils import (
     require_speaker_owner,
     secure_temp_file,
 )
+from simple_speaker_recognition.core.gallery_privacy import require_available
 from simple_speaker_recognition.core.unified_speaker_db import UnifiedSpeakerDB
 from simple_speaker_recognition.database import get_db_session
 from simple_speaker_recognition.database.models import Speaker, SpeakerAudioSegment
@@ -32,6 +33,11 @@ log = logging.getLogger("speaker_service")
 def audio_content_hash(audio_data: bytes) -> str:
     """Return the enrollment deduplication key for one encoded audio file."""
     return hashlib.sha256(audio_data).hexdigest()
+
+
+def require_enrollment_available(speaker_id: str):
+    with get_db_session() as session:
+        require_available(session, speaker_id)
 
 
 def existing_enrollment_hashes(user_id: str, speaker_id: str) -> set[str]:
@@ -262,6 +268,7 @@ async def enroll_upload(
     db: UnifiedSpeakerDB = Depends(get_db),
 ):
     """Enroll a speaker from uploaded audio file."""
+    require_enrollment_available(speaker_id)
     log.info(f"Enrolling speaker: {speaker_name} (ID: {speaker_id}, User: {user_id})")
 
     # Check for duplicate speaker name (allow updates to existing speaker with same ID)
@@ -380,6 +387,7 @@ async def enroll_batch(
     db: UnifiedSpeakerDB = Depends(get_db),
 ):
     """Enroll a speaker using multiple audio segments, computing average embedding."""
+    require_enrollment_available(speaker_id)
     log.info(
         f"Batch enrolling speaker: {speaker_name} (ID: {speaker_id}, User: {user_id}) with {len(files)} files"
     )
@@ -544,6 +552,7 @@ async def enroll_append(
 ):
     """Append audio segments to an existing speaker, computing weighted average embedding."""
     require_speaker_owner(speaker_id, user_id)
+    require_enrollment_available(speaker_id)
     log.info(
         f"Appending to speaker: {speaker_id} (User: {user_id}) with {len(files)} files"
     )

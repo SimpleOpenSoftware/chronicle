@@ -12,13 +12,33 @@ import gzip
 import hashlib
 import json
 import os
+import re
+import shutil
 import tempfile
+import uuid as uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from backend.config import DATA_DIR
+
+_artifact_observer: ContextVar[list | None] = ContextVar(
+    "inference_artifact_observer", default=None
+)
+
+
+@contextmanager
+def capture_inference_artifacts():
+    """Link nested inference attempts, including failed calls, to their owning job."""
+    refs = []
+    token = _artifact_observer.set(refs)
+    try:
+        yield refs
+    finally:
+        _artifact_observer.reset(token)
 
 
 @dataclass(frozen=True)
@@ -92,6 +112,15 @@ def persist_inference_run(
             separators=(",", ":"),
         ).encode()
         _atomic_write(base / "requests" / f"{request_hash}.json", pointer)
+    observer = _artifact_observer.get()
+    if observer is not None:
+        observer.append(
+            {
+                "operation": operation,
+                "request_hash": request_hash,
+                "artifact_hash": artifact_hash,
+            }
+        )
     return request_hash, artifact_hash
 
 
@@ -168,6 +197,24 @@ def load_reusable_result(operation: str, request: dict[str, Any]) -> Any | None:
     return None if run is None else run.result
 
 
+def read_inference_artifact(operation: str, artifact_hash: str) -> dict[str, Any]:
+    """Read an immutable exchange by validated identity."""
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", operation) or not re.fullmatch(
+        r"[0-9a-f]{64}", artifact_hash
+    ):
+        raise ValueError("Invalid inference artifact identity")
+    with gzip.open(
+        _root() / operation / "artifacts" / f"{artifact_hash}.json.gz",
+        "rt",
+        encoding="utf-8",
+    ) as stream:
+        record = json.load(stream)
+    if canonical_hash(record) != artifact_hash:
+        raise ValueError("Inference artifact checksum mismatch")
+    return record
+
+
 def load_inference_runs(operation: str, *, limit: int = 500) -> list[dict[str, Any]]:
     """Load the newest durable records for offline observability/optimization."""
 
@@ -186,3 +233,13 @@ def load_inference_runs(operation: str, *, limit: int = 500) -> list[dict[str, A
         records.append(record)
     records.sort(key=lambda item: str(item.get("recorded_at", "")), reverse=True)
     return records[:limit]
+
+
+def delete_chat_run_artifacts(run_id: str) -> None:
+    """Delete payloads belonging exclusively to one authorized chat run."""
+
+    if str(uuid.UUID(run_id)) != run_id:
+        raise ValueError("Invalid chat run identity")
+    path = _root() / f"chat_run_{run_id}"
+    if path.exists():
+        shutil.rmtree(path)

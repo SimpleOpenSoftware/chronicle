@@ -95,7 +95,7 @@ export default function Archive() {
 
   const handlePermanentDelete = async (conversationId: string) => {
     const confirmed = window.confirm(
-      'Are you sure you want to PERMANENTLY delete this conversation? This action CANNOT be undone and will remove all data including audio.'
+      'Are you sure you want to permanently delete this recording? This action cannot be undone.'
     )
     if (!confirmed) return
 
@@ -160,7 +160,7 @@ export default function Archive() {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-        <span className="ml-2 text-gray-600 dark:text-gray-400">Loading archived conversations...</span>
+        <span className="ml-2 text-gray-600 dark:text-gray-400">Loading Trash…</span>
       </div>
     )
   }
@@ -183,7 +183,7 @@ export default function Archive() {
         <div className="flex min-w-0 items-center space-x-2">
           <ArchiveIcon className="h-6 w-6 text-orange-600" />
           <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 sm:text-2xl">
-            Archived Conversations
+            Trash
           </h1>
         </div>
         <Button
@@ -200,16 +200,16 @@ export default function Archive() {
       {/* Archive Info */}
       <div className="mb-4 p-3 bg-orange-50 dark:bg-orange-900/20 rounded-lg border border-orange-300 dark:border-orange-700">
         <p className="text-sm text-orange-800 dark:text-orange-300">
-          <strong>Archive:</strong> Deleted conversations are stored here. You can restore them to active view or permanently delete them {isAdmin && '(admin only)'}.
+          <strong>Trash:</strong> Deleted recordings are listed here. Restore them to Recordings or permanently delete them {isAdmin && '(admin only)'}.
         </p>
       </div>
 
-      {/* Archived Conversations List */}
+      {/* Trash List */}
       <div className="space-y-6">
         {conversations.length === 0 ? (
           <div className="text-center text-gray-500 dark:text-gray-400 py-12">
             <ArchiveIcon className="h-12 w-12 mx-auto mb-4 opacity-50" />
-            <p>No archived conversations</p>
+            <p>Trash is empty</p>
           </div>
         ) : (
           conversations.map((conversation) => (
@@ -222,7 +222,7 @@ export default function Archive() {
                 <div className="flex items-start space-x-2">
                   <ArchiveIcon className="h-5 w-5 text-red-600 dark:text-red-400 mt-0.5 flex-shrink-0" />
                   <div className="min-w-0 flex-1">
-                    <p className="font-semibold text-red-800 dark:text-red-300 text-sm">Archived Conversation</p>
+                    <p className="font-semibold text-red-800 dark:text-red-300 text-sm">Deleted recording</p>
                     <p className="text-xs text-red-700 dark:text-red-400 mt-1">
                       Reason: {conversation.deletion_reason === 'user_deleted'
                         ? 'User deleted'

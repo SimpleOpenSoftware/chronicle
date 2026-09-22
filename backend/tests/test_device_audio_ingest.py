@@ -304,8 +304,11 @@ def test_profile_wav_reports_decode_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("privacy_enabled", [False, True])
 async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
     monkeypatch,
+    privacy_enabled,
+    isolated_privacy_database,
 ):
     """VAD filters semantic Conversations, never the underlying capture evidence."""
 
@@ -337,6 +340,16 @@ async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
             self.deleted = True
 
     pending = PendingItem()
+    if privacy_enabled:
+        await isolated_privacy_database.capture_sources.insert_one(
+            {
+                "user_id": pending.user_id,
+                "source_id": pending.source_id,
+                "privacy_enabled_from": pending.captured_at,
+                "privacy_revision": 1,
+                "privacy_tracks": ["display"],
+            }
+        )
     events = []
     captured_range = AudioRangeRef(
         capture_source_id="rainbow:input",
@@ -409,11 +422,15 @@ async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
 
     result = await device_audio_ingest.process_device_audio()
 
-    assert events == ["mix", "capture", "vad"]
-    assert spans == [{"state": "no_speech", "audio_ranges": [captured_range]}]
-    assert pending.deleted is True
+    assert events == ([] if privacy_enabled else ["mix", "capture", "vad"])
+    assert spans == (
+        []
+        if privacy_enabled
+        else [{"state": "no_speech", "audio_ranges": [captured_range]}]
+    )
+    assert pending.deleted is not privacy_enabled
     assert result["processed_sessions"] == 0
-    assert result["rejected_no_speech"] == 1
+    assert result["rejected_no_speech"] == (0 if privacy_enabled else 1)
 
 
 @pytest.mark.asyncio

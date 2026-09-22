@@ -18,6 +18,7 @@ and the two-axis (speaker × channel-condition) design.
 import asyncio
 import hashlib
 import io
+import json
 import logging
 import re
 import wave
@@ -33,6 +34,7 @@ from rq.job import Job
 from backend.constants import BACKGROUND_SPEECH_LABEL, NOISE_LABEL
 from backend.controllers.queue_controller import JOB_RESULT_TTL, default_queue
 from backend.models.conversation import Conversation
+from backend.services import privacy
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.users import User
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
@@ -40,11 +42,24 @@ from backend.workers.background_benchmark import build_background_benchmark
 from backend.workers.background_cleanup_jobs import (
     apply_background_cleanup_job,
     build_background_cleanup_report,
+    require_cleanup_report,
 )
 from backend.workers.background_index_jobs import index_background_corpus_job
 from backend.workers.background_suppression import zone_for
 
 logger = logging.getLogger(__name__)
+
+
+async def _current_cache_privacy(cached, visibility):
+    try:
+        await visibility.require_receipt(cached.get("privacy_revisions"))
+        await visibility.require_reference_receipt(
+            cached["requested_by"], cached.get("privacy_reference_receipt")
+        )
+    except privacy.PrivacyHeld:
+        return False
+    return True
+
 
 MIN_CLIP_SECONDS = 1.0
 MAX_CLIP_SECONDS = 15.0
@@ -194,29 +209,34 @@ async def _embed_clip(
     conversation_id: str,
     start: float,
     end: float,
+    *,
+    visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> Optional[dict]:
     """Reconstruct a clip, embed it, and measure its SNR. None if unusable."""
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     end = max(end, start + MIN_CLIP_SECONDS)
     end = min(end, start + MAX_CLIP_SECONDS)
     try:
         wav = await reconstruct_audio_segment(conversation_id, start, end)
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            "background bucket: reconstruct failed %s@%.2f: %s",
-            conversation_id,
-            start,
-            e,
+            "background bucket: reconstruct failed (%s)",
+            type(e).__name__,
         )
         return None
+    await visibility.assert_current()
     if not wav:
         return None
     result = await speaker_client.extract_speaker_embedding(wav)
+    await visibility.assert_current()
     if result.get("error") or "embedding" not in result:
         logger.warning(
-            "background bucket: embed failed %s@%.2f: %s",
-            conversation_id,
-            start,
-            result.get("error"),
+            "background bucket: embedding unavailable",
         )
         return None
     return {
@@ -239,7 +259,10 @@ async def add_background_clip(
     speaker_client = SpeakerRecognitionClient()
     if not speaker_client.enabled:
         return None
-    measured = await _embed_clip(speaker_client, conversation_id, start, end)
+    visibility = privacy.ConversationPrivacyFilter()
+    measured = await _embed_clip(
+        speaker_client, conversation_id, start, end, visibility=visibility
+    )
     if measured is None:
         return None
     doc = {
@@ -248,6 +271,14 @@ async def add_background_clip(
         "segment_end": round(end, 3),
         "bucket_type": bucket_type,
         "user_id": str(user.user_id) if user else None,
+        "privacy_reference_receipt": await visibility.reference_receipt(
+            (
+                str(user.user_id)
+                if user
+                else visibility.originals[conversation_id]["user_id"]
+            ),
+            conversation_ids=[conversation_id],
+        ),
         "embedding": measured["embedding"],
         "embedding_model": measured["embedding_model"],
         "snr_db": measured["snr_db"],
@@ -255,6 +286,7 @@ async def add_background_clip(
         "added_by": str(user.id) if user else None,
         "created_at": datetime.now(timezone.utc),
     }
+    await visibility.assert_current()
     await _bucket_collection().update_one(
         {
             "conversation_id": conversation_id,
@@ -265,6 +297,7 @@ async def add_background_clip(
         {"$set": doc},
         upsert=True,
     )
+    await visibility.assert_current()
     return doc
 
 
@@ -283,7 +316,7 @@ async def seed_from_annotations(user: Optional[User] = None) -> dict:
             {"conversation_id": 1, "segment_start": 1, "bucket_type": 1},
         )
     }
-    added, skipped, failed = 0, 0, 0
+    added, skipped, failed, privacy_held = 0, 0, 0, 0
     async for a in _annotations_collection().find(query):
         cid, t = a.get("conversation_id"), a.get("segment_start_time")
         if cid is None or t is None:
@@ -298,15 +331,19 @@ async def seed_from_annotations(user: Optional[User] = None) -> dict:
             skipped += 1
             continue
         # use the annotated segment's real end if we can find it, else a short window
-        end = await _segment_end_for(cid, t)
-        doc = await add_background_clip(
-            cid,
-            float(t),
-            end,
-            bucket_type=bucket_type,
-            source="annotation",
-            user=user,
-        )
+        try:
+            end = await _segment_end_for(cid, t)
+            doc = await add_background_clip(
+                cid,
+                float(t),
+                end,
+                bucket_type=bucket_type,
+                source="annotation",
+                user=user,
+            )
+        except privacy.PrivacyHeld:
+            privacy_held += 1
+            continue
         if doc is None:
             failed += 1
         else:
@@ -318,16 +355,27 @@ async def seed_from_annotations(user: Optional[User] = None) -> dict:
         )
         for kind in BUCKET_TYPES
     }
-    return {"added": added, "skipped": skipped, "failed": failed, "bucket_sizes": sizes}
+    return {
+        "added": added,
+        "skipped": skipped,
+        "failed": failed,
+        "privacy_held": privacy_held,
+        "bucket_sizes": sizes,
+    }
 
 
 async def _segment_end_for(
     conversation_id: str, start: float, default_len: float = 4.0
 ) -> float:
+    visibility = privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     doc = await Conversation.get_pymongo_collection().find_one(
         {"conversation_id": conversation_id},
         {"transcript_versions": 1, "active_transcript_version": 1},
     )
+    await visibility.assert_current()
     if not doc:
         return start + default_len
     versions = doc.get("transcript_versions") or []
@@ -343,13 +391,20 @@ async def _segment_end_for(
 
 
 async def _bucket_matrix(
-    user: User, bucket_type: BucketType, embedding_model: Optional[str]
+    user: User,
+    bucket_type: BucketType,
+    embedding_model: Optional[str],
+    *,
+    visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Load bucket exemplars for the given model as a unit-normalized matrix + meta."""
     query: dict = {"user_id": str(user.user_id), "bucket_type": bucket_type}
     if embedding_model:
         query["embedding_model"] = embedding_model
     rows = [d async for d in _bucket_collection().find(query)]
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    rows = await visibility.filter_embeddings(rows)
+    await visibility.assert_current()
     if not rows:
         return np.empty((0, 0)), []
     M = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
@@ -381,9 +436,14 @@ async def match_embeddings(
     embeddings: list[list[float]],
     bucket_type: BucketType,
     embedding_model: Optional[str] = None,
+    *,
+    visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> dict:
     """Score query embeddings against the background bucket by max similarity."""
-    bucket, meta = await _bucket_matrix(user, bucket_type, embedding_model)
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    bucket, meta = await _bucket_matrix(
+        user, bucket_type, embedding_model, visibility=visibility
+    )
     if not embeddings:
         return {"bucket_size": len(meta), "results": []}
     q = np.asarray(embeddings, dtype=np.float32)
@@ -397,6 +457,7 @@ async def match_embeddings(
                 "nearest_exemplar": meta[j] if j >= 0 else None,
             }
         )
+    await visibility.assert_current()
     return {"bucket_size": len(meta), "results": results}
 
 
@@ -434,11 +495,19 @@ def _gap_windows(segments: list[dict], duration: float) -> list[tuple[float, flo
 
 
 async def _score_candidates(
-    user: User, collected: list[dict], model_id: str | None
+    user: User,
+    collected: list[dict],
+    model_id: str | None,
+    *,
+    visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> dict:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    collected = await visibility.filter(collected)
     matrices = {
-        kind: await _bucket_matrix(user, kind, model_id) for kind in BUCKET_TYPES
+        kind: await _bucket_matrix(user, kind, model_id, visibility=visibility)
+        for kind in BUCKET_TYPES
     }
+    await visibility.assert_current()
     sizes = {kind: len(meta) for kind, (_, meta) in matrices.items()}
     if not collected:
         return {"bucket_sizes": sizes, "candidates": []}
@@ -496,6 +565,10 @@ async def suggest_background_candidates(
         return JSONResponse(
             status_code=404, content={"error": "Conversation not found"}
         )
+    visibility = privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     versions = doc.get("transcript_versions") or []
     active_id = doc.get("active_transcript_version")
     active = next(
@@ -524,7 +597,11 @@ async def suggest_background_candidates(
     model_id = None
     for idx, s in unknown:
         m = await _embed_clip(
-            speaker_client, conversation_id, float(s["start"]), float(s["end"])
+            speaker_client,
+            conversation_id,
+            float(s["start"]),
+            float(s["end"]),
+            visibility=visibility,
         )
         if m is None:
             continue
@@ -533,7 +610,10 @@ async def suggest_background_candidates(
     if not embedded:
         return {"conversation_id": conversation_id, "bucket_size": 0, "candidates": []}
 
-    bucket, meta = await _bucket_matrix(user, "background_speech", model_id)
+    bucket, meta = await _bucket_matrix(
+        user, "background_speech", model_id, visibility=visibility
+    )
+    await visibility.assert_current()
     q = np.asarray([m["embedding"] for _, _, m in embedded], dtype=np.float32)
     max_sim, _ = _max_similarity(q, bucket)
     scored: list[tuple[float, dict]] = []
@@ -592,6 +672,7 @@ async def scan_background_candidates(
         )
     }
 
+    visibility = privacy.ConversationPrivacyFilter()
     planned: list[dict] = []
     scanned = 0
     cursor = (
@@ -620,6 +701,9 @@ async def scan_background_candidates(
         if scanned >= max_conversations:
             break
         cid = doc.get("conversation_id")
+        if not await visibility.filter([{"conversation_id": cid}]):
+            continue
+        await visibility.assert_current()
         versions = doc.get("transcript_versions") or []
         active_id = doc.get("active_transcript_version")
         active = next(
@@ -685,6 +769,7 @@ async def scan_background_candidates(
                 candidate["conversation_id"],
                 candidate["start"],
                 candidate["end"],
+                visibility=visibility,
             )
         if result is None:
             return None
@@ -706,7 +791,10 @@ async def scan_background_candidates(
         None,
     )
 
-    scored_result = await _score_candidates(user, collected, model_id)
+    scored_result = await _score_candidates(
+        user, collected, model_id, visibility=visibility
+    )
+    await visibility.assert_current()
     scored = scored_result.get("scored", {kind: [] for kind in BUCKET_TYPES})
     per_bucket_limit = max(1, limit // 2)
     candidates = [
@@ -743,7 +831,10 @@ async def enqueue_background_index(user: User) -> dict:
     )
     await _index_runs_collection().update_one(
         key,
-        {"$set": {"job_id": job.id, "queued_at": datetime.now(timezone.utc)}},
+        {
+            "$set": {"job_id": job.id, "queued_at": datetime.now(timezone.utc)},
+            "$unset": {"source_revision": ""},
+        },
         upsert=True,
     )
     return {"job_id": job.id, "status": "queued", "reused": False}
@@ -771,7 +862,17 @@ async def _corpus_revision(user_id: str) -> str:
             f"{doc['conversation_id']}|{doc.get('active_transcript_version')}|"
             f"{doc.get('audio_chunks_count')}|{doc.get('audio_total_duration')}"
         )
-    return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
+    revisions = await privacy.capture_revisions(user_id)
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "corpus": sorted(parts),
+                "privacy": revisions,
+                "index_version": "capture-references-v2",
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
 
 async def background_index_state(user: User) -> dict:
@@ -986,6 +1087,8 @@ async def get_background_clusters(
     surfaced for review — production suppression is untouched.
     """
     user_id = str(user.user_id)
+    visibility = privacy.ConversationPrivacyFilter()
+    visibility.snapshots[user_id] = await privacy.load_snapshot(user_id)
     profile = SURFACE_PROFILES.get(surface) or SURFACE_PROFILES["default"]
     latest = await _corpus_collection().find_one(
         {"requested_by": user_id}, sort=[("indexed_at", -1)]
@@ -995,83 +1098,76 @@ async def get_background_clusters(
     model = latest["embedding_model"]
     cached = await _cluster_cache_collection().find_one(
         {"requested_by": user_id, "embedding_model": model, "surface": surface},
-        {"_id": 0, "payload": 1},
+        {
+            "_id": 0,
+            "payload": 1,
+            "privacy_revisions": 1,
+            "requested_by": 1,
+            "privacy_reference_receipt": 1,
+        },
     )
-    if cached:
+    if cached and await _current_cache_privacy(cached, visibility):
         return _serve_clusters(cached["payload"], lane, limit)
-    reviewed = {
-        key
+    all_rows = await visibility.filter_embeddings(
+        [
+            doc
+            async for doc in _corpus_collection().find(
+                {"requested_by": user_id, "embedding_model": model}, {"_id": 0}
+            )
+        ]
+    )
+    allowed_keys = {row["clip_key"] for row in all_rows}
+    reviews = [
+        doc
         async for doc in _cluster_reviews_collection().find(
-            {"requested_by": user_id, "embedding_model": model}, {"member_keys": 1}
+            {"requested_by": user_id, "embedding_model": model}
         )
-        for key in doc.get("member_keys", [])
-    }
+        if doc.get("member_keys") and set(doc["member_keys"]) <= allowed_keys
+    ]
+    reviewed = {key for doc in reviews for key in doc["member_keys"]}
+    bucket_rows = await visibility.filter_embeddings(
+        [doc async for doc in _bucket_collection().find({"user_id": user_id})]
+    )
     confirmed = {
         f"{doc['conversation_id']}:{float(doc['segment_start']):.3f}"
-        async for doc in _bucket_collection().find(
-            {"user_id": user_id, "embedding_model": model},
-            {"conversation_id": 1, "segment_start": 1},
-        )
+        for doc in bucket_rows
+        if doc.get("embedding_model") == model
     }
-    foreground_signatures = {
-        doc["content_signature"]
-        async for doc in _foreground_collection().find(
-            {"requested_by": user_id, "embedding_model": model},
-            {"content_signature": 1},
-        )
-    }
-    foreground_exemplars = [
-        doc
-        async for doc in _foreground_collection().find(
-            {"requested_by": user_id, "embedding_model": model},
-            {"embedding": 1},
-        )
-        if doc.get("embedding")
-    ]
+    foreground_rows = await visibility.filter_embeddings(
+        [
+            doc
+            async for doc in _foreground_collection().find(
+                {"requested_by": user_id, "embedding_model": model}
+            )
+        ]
+    )
+    foreground_signatures = {doc["content_signature"] for doc in foreground_rows}
+    foreground_exemplars = [doc for doc in foreground_rows if doc.get("embedding")]
     background_exemplars = [
         doc
-        async for doc in _bucket_collection().find(
-            {
-                "user_id": user_id,
-                "embedding_model": model,
-                "bucket_type": "background_speech",
-            },
-            {"embedding": 1},
-        )
+        for doc in bucket_rows
         if doc.get("embedding")
+        and doc.get("embedding_model") == model
+        and doc.get("bucket_type") == "background_speech"
     ]
-    all_rows = [
-        doc
-        async for doc in _corpus_collection().find(
-            {"requested_by": user_id, "embedding_model": model}, {"_id": 0}
-        )
-    ]
+    await visibility.assert_current()
     reviewed_signatures = {
         _content_signature(row) for row in all_rows if row["clip_key"] in reviewed
     }
     foreground_matches = _foreground_matches(all_rows, foreground_exemplars)
     foreground_scores = _reference_scores(all_rows, foreground_exemplars)
     background_scores = _reference_scores(all_rows, background_exemplars)
-    noise_reference_count = await _bucket_collection().count_documents(
-        {"user_id": user_id, "bucket_type": "noise"}
+    noise_reference_count = sum(
+        doc.get("bucket_type") == "noise" for doc in bucket_rows
     )
-    foreground_review_count = await _cluster_reviews_collection().count_documents(
-        {
-            "requested_by": user_id,
-            "embedding_model": model,
-            "decision": "not_background",
-        }
+    foreground_review_count = sum(
+        doc.get("decision") == "not_background"
+        or (
+            doc.get("decision") == "mixed"
+            and "not_background" in (doc.get("sample_decisions") or {}).values()
+        )
+        for doc in reviews
     )
-    async for review in _cluster_reviews_collection().find(
-        {
-            "requested_by": user_id,
-            "embedding_model": model,
-            "decision": "mixed",
-        },
-        {"sample_decisions": 1},
-    ):
-        if "not_background" in (review.get("sample_decisions") or {}).values():
-            foreground_review_count += 1
     focus_hard_speech = noise_reference_count >= 10
     adaptive_discovery = focus_hard_speech and foreground_review_count >= 10
     rows = [
@@ -1219,9 +1315,7 @@ async def get_background_clusters(
     # Harvest groups are near-certain positives — always review those first.
     clusters.sort(key=lambda item: item.get("mined") != "harvest")
     bucket_sizes = {
-        kind: await _bucket_collection().count_documents(
-            {"user_id": user_id, "bucket_type": kind}
-        )
+        kind: sum(doc.get("bucket_type") == kind for doc in bucket_rows)
         for kind in BUCKET_TYPES
     }
     # Cache the FULL sorted list; lane filter and limit are applied at serve
@@ -1238,11 +1332,22 @@ async def get_background_clusters(
             else "hard_speech" if focus_hard_speech else "bootstrap"
         ),
     }
+    await visibility.assert_current()
     await _cluster_cache_collection().update_one(
         {"requested_by": user_id, "embedding_model": model, "surface": surface},
-        {"$set": {"payload": payload, "created_at": datetime.now(timezone.utc)}},
+        {
+            "$set": {
+                "payload": payload,
+                "privacy_revisions": visibility.revision_receipt(),
+                "privacy_reference_receipt": await visibility.reference_receipt(
+                    user_id
+                ),
+                "created_at": datetime.now(timezone.utc),
+            }
+        },
         upsert=True,
     )
+    await visibility.assert_current()
     return _serve_clusters(payload, lane, limit)
 
 
@@ -1286,17 +1391,28 @@ async def decide_background_cluster(
         return JSONResponse(
             status_code=404, content={"error": "Cluster clips not found"}
         )
+    visibility = privacy.ConversationPrivacyFilter()
+    if {doc["clip_key"] for doc in docs} != set(member_keys) or len(
+        await visibility.filter_embeddings(docs)
+    ) != len(docs):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     model = docs[0].get("embedding_model")
     review_object_id = ObjectId()
     review_id = str(review_object_id)
     if decision not in {"mixed", "dismissed"}:
         signatures = {_content_signature(doc) for doc in docs}
+        allowed_duplicates = await visibility.filter_embeddings(
+            [
+                doc
+                async for doc in _corpus_collection().find(
+                    {"requested_by": user_id, "embedding_model": model}, {"_id": 0}
+                )
+            ]
+        )
+        await visibility.assert_current()
         duplicate_docs = [
-            doc
-            async for doc in _corpus_collection().find(
-                {"requested_by": user_id, "embedding_model": model}, {"_id": 0}
-            )
-            if _content_signature(doc) in signatures
+            doc for doc in allowed_duplicates if _content_signature(doc) in signatures
         ]
         member_keys = list(dict.fromkeys(doc["clip_key"] for doc in duplicate_docs))
     added = 0
@@ -1306,6 +1422,7 @@ async def decide_background_cluster(
         for doc in docs:
             clip_decision = sample_decisions[doc["clip_key"]]
             if clip_decision in {"noise", "background_speech"}:
+                await visibility.assert_current()
                 await _bucket_collection().update_one(
                     {
                         "user_id": user_id,
@@ -1316,6 +1433,9 @@ async def decide_background_cluster(
                     {
                         "$set": {
                             "segment_end": round(float(doc["end"]), 3),
+                            "privacy_reference_receipt": doc[
+                                "privacy_reference_receipt"
+                            ],
                             "embedding": doc["embedding"],
                             "embedding_model": model,
                             "source": "mixed_cluster_review",
@@ -1326,10 +1446,12 @@ async def decide_background_cluster(
                     },
                     upsert=True,
                 )
+                await visibility.assert_current()
                 exemplar_keys.append(doc["clip_key"])
                 added += 1
             else:
                 signature = _content_signature(doc)
+                await visibility.assert_current()
                 await _foreground_collection().update_one(
                     {
                         "requested_by": user_id,
@@ -1338,6 +1460,9 @@ async def decide_background_cluster(
                     },
                     {
                         "$set": {
+                            "privacy_reference_receipt": doc[
+                                "privacy_reference_receipt"
+                            ],
                             "embedding": doc["embedding"],
                             "conversation_id": doc["conversation_id"],
                             "clip_key": doc["clip_key"],
@@ -1347,12 +1472,14 @@ async def decide_background_cluster(
                     },
                     upsert=True,
                 )
+                await visibility.assert_current()
                 foreground_signatures.append(signature)
     elif decision in {"noise", "background_speech"}:
         representatives = _representatives(
             docs, list(range(len(docs))), min(5, len(docs))
         )
         for doc in representatives:
+            await visibility.assert_current()
             await _bucket_collection().update_one(
                 {
                     "user_id": user_id,
@@ -1363,6 +1490,7 @@ async def decide_background_cluster(
                 {
                     "$set": {
                         "segment_end": round(float(doc["end"]), 3),
+                        "privacy_reference_receipt": doc["privacy_reference_receipt"],
                         "embedding": doc["embedding"],
                         "embedding_model": model,
                         "source": "cluster_review",
@@ -1373,11 +1501,13 @@ async def decide_background_cluster(
                 },
                 upsert=True,
             )
+            await visibility.assert_current()
             added += 1
             exemplar_keys.append(doc["clip_key"])
     elif decision == "not_background":
         for doc in _representatives(docs, list(range(len(docs))), min(5, len(docs))):
             signature = _content_signature(doc)
+            await visibility.assert_current()
             await _foreground_collection().update_one(
                 {
                     "requested_by": user_id,
@@ -1386,6 +1516,7 @@ async def decide_background_cluster(
                 },
                 {
                     "$set": {
+                        "privacy_reference_receipt": doc["privacy_reference_receipt"],
                         "embedding": doc["embedding"],
                         "conversation_id": doc["conversation_id"],
                         "clip_key": doc["clip_key"],
@@ -1395,7 +1526,9 @@ async def decide_background_cluster(
                 },
                 upsert=True,
             )
+            await visibility.assert_current()
             foreground_signatures.append(signature)
+    await visibility.assert_current()
     inserted = await _cluster_reviews_collection().insert_one(
         {
             "_id": review_object_id,
@@ -1411,10 +1544,15 @@ async def decide_background_cluster(
             "reviewed_at": datetime.now(timezone.utc),
         }
     )
+    await visibility.assert_current()
+    await visibility.assert_current()
     await _cluster_cache_collection().delete_many({"requested_by": user_id})
+    await visibility.assert_current()
+    await visibility.assert_current()
     await Conversation.get_pymongo_collection().database[
         "background_cleanup_reports"
     ].delete_many({"requested_by": user_id})
+    await visibility.assert_current()
     return {
         "review_id": str(inserted.inserted_id),
         "reviewed": len(member_keys),
@@ -1441,6 +1579,7 @@ async def latest_background_decision(user: User) -> dict:
 
 
 async def list_background_decisions(user: User, limit: int = 50) -> dict:
+    visibility = privacy.ConversationPrivacyFilter()
     decisions = []
     user_id = str(user.user_id)
     cursor = (
@@ -1458,6 +1597,12 @@ async def list_background_decisions(user: User, limit: int = 50) -> dict:
                 {"_id": 0},
             )
         ]
+        allowed_docs = await visibility.filter_embeddings(docs)
+        if len(allowed_docs) != len(docs) or {doc["clip_key"] for doc in docs} != set(
+            member_keys
+        ):
+            continue
+        await visibility.assert_current()
         by_key = {doc["clip_key"]: doc for doc in docs}
         stored_sample_keys = review.get("review_sample_keys") or []
         if stored_sample_keys:
@@ -1496,6 +1641,7 @@ async def list_background_decisions(user: User, limit: int = 50) -> dict:
                 ],
             }
         )
+    await visibility.assert_current()
     return {"decisions": decisions}
 
 
@@ -1607,7 +1753,23 @@ async def edit_background_decision(
         "member_keys": review.get("member_keys") or [],
         "review_sample_keys": review.get("review_sample_keys") or [],
     }
+    visibility = privacy.ConversationPrivacyFilter()
+    members = [
+        doc
+        async for doc in _corpus_collection().find(
+            {
+                "requested_by": str(user.user_id),
+                "clip_key": {"$in": cluster["member_keys"]},
+            }
+        )
+    ]
+    if {doc["clip_key"] for doc in members} != set(cluster["member_keys"]) or len(
+        await visibility.filter_embeddings(members)
+    ) != len(members):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     undone = await undo_background_decision(user, review_id)
+    await visibility.assert_current()
     if isinstance(undone, JSONResponse):
         return undone
     result = await decide_background_cluster(user, cluster, decision)
@@ -1638,6 +1800,8 @@ async def enqueue_background_cleanup(user: User, report_id: str) -> dict:
     )
     if not report:
         return JSONResponse(status_code=404, content={"error": "Report not found"})
+    visibility = await require_cleanup_report(report, str(user.user_id))
+    await visibility.assert_current()
     job = default_queue.enqueue(
         apply_background_cleanup_job,
         requested_by=str(user.user_id),

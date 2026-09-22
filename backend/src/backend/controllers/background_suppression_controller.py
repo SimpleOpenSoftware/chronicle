@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from backend.constants import UNKNOWN_SPEAKER_PREFIX
 from backend.controllers.background_bucket_controller import add_background_clip
 from backend.models.conversation import Conversation
+from backend.services import privacy
 from backend.users import User
 from backend.workers import background_suppression
 
@@ -34,6 +35,7 @@ def _overrides():
 async def get_conversation_suppressions(user: User, conversation_id: str) -> dict:
     """The ledger for one conversation, grouped by cluster for the chip/panel."""
     user_id = str(user.user_id)
+    visibility = await background_suppression.require_recording(conversation_id)
     docs = [
         doc
         async for doc in _ledger()
@@ -43,6 +45,8 @@ async def get_conversation_suppressions(user: User, conversation_id: str) -> dic
         )
         .sort("segment_start", 1)
     ]
+    docs = await visibility.filter(docs)
+    await visibility.assert_current()
     clusters: dict[str, dict] = {}
     for doc in docs:
         signature = doc.get("cluster_signature") or "unclustered"
@@ -56,7 +60,13 @@ async def get_conversation_suppressions(user: User, conversation_id: str) -> dic
                 "max_background_similarity": 0.0,
             },
         )
-        cluster["segments"].append(doc)
+        cluster["segments"].append(
+            {
+                key: value
+                for key, value in doc.items()
+                if key != "privacy_reference_receipt"
+            }
+        )
         cluster["statuses"][doc["status"]] = (
             cluster["statuses"].get(doc["status"], 0) + 1
         )
@@ -75,6 +85,7 @@ async def get_conversation_suppressions(user: User, conversation_id: str) -> dic
     override = await background_suppression.get_subject_override(
         user_id, conversation_id
     )
+    await visibility.assert_current()
     return {
         "conversation_id": conversation_id,
         "total": len(docs),
@@ -101,6 +112,7 @@ async def decide_suppression_cluster(
     a few representative clips join the background bucket as exemplars.
     """
     user_id = str(user.user_id)
+    visibility = await background_suppression.require_recording(conversation_id)
     query = {
         "user_id": user_id,
         "conversation_id": conversation_id,
@@ -108,6 +120,9 @@ async def decide_suppression_cluster(
         "status": {"$nin": sorted(background_suppression.STICKY_STATUSES)},
     }
     docs = [doc async for doc in _ledger().find(query)]
+    if len(await visibility.filter(docs)) != len(docs):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     if not docs:
         return JSONResponse(
             status_code=404, content={"error": "No undecided segments in cluster"}
@@ -117,7 +132,8 @@ async def decide_suppression_cluster(
     if decision == "restore":
         applied = [doc for doc in docs if doc["status"] == "applied"]
         if applied:
-            await _restore_segment_labels(conversation_id, applied)
+            await _restore_segment_labels(conversation_id, applied, visibility)
+        await visibility.assert_current()
         await _overrides().update_one(
             {
                 "user_id": user_id,
@@ -127,6 +143,7 @@ async def decide_suppression_cluster(
             {"$set": {"role": "subject", "set_by": user_id, "created_at": now}},
             upsert=True,
         )
+        await visibility.assert_current()
         new_status = "restored"
     else:
         ranked = sorted(
@@ -134,6 +151,7 @@ async def decide_suppression_cluster(
         )
         added = 0
         for doc in ranked[:EXEMPLARS_PER_CONFIRM]:
+            await visibility.assert_current()
             created = await add_background_clip(
                 conversation_id,
                 float(doc["segment_start"]),
@@ -142,6 +160,7 @@ async def decide_suppression_cluster(
                 source="suppression_review",
                 user=user,
             )
+            await visibility.assert_current()
             if created:
                 added += 1
         logger.info(
@@ -152,10 +171,12 @@ async def decide_suppression_cluster(
         )
         new_status = "confirmed"
 
+    await visibility.assert_current()
     await _ledger().update_many(
         query,
         {"$set": {"status": new_status, "reviewed_at": now, "reviewed_by": user_id}},
     )
+    await visibility.assert_current()
     return {
         "conversation_id": conversation_id,
         "cluster_signature": cluster_signature,
@@ -164,11 +185,17 @@ async def decide_suppression_cluster(
     }
 
 
-async def _restore_segment_labels(conversation_id: str, docs: list[dict]) -> None:
+async def _restore_segment_labels(
+    conversation_id: str, docs: list[dict], visibility=None
+) -> None:
     """Put back the pre-marking identification on relabelled segments."""
+    visibility = await background_suppression.require_recording(
+        conversation_id, visibility
+    )
     conversation = await Conversation.find_one(
         Conversation.conversation_id == conversation_id
     )
+    await visibility.assert_current()
     if not conversation or not conversation.transcript_versions:
         return
     version = conversation.transcript_versions[-1]
@@ -187,7 +214,8 @@ async def _restore_segment_labels(conversation_id: str, docs: list[dict]) -> Non
         segment.confidence = doc.get("previous_confidence")
         changed += 1
     if changed:
-        await conversation.save()
+        async with visibility.publication():
+            await conversation.save()
         logger.info(
             "Restored %d segment labels in conversation %s",
             changed,

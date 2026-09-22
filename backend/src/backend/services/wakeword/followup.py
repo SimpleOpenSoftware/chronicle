@@ -18,10 +18,12 @@ import json
 import logging
 import os
 import re
+import uuid as uuid
 from typing import Optional
 
 import redis.asyncio as redis
 
+import backend.services.dialogue.capture as capture
 from backend.llm_client import async_generate
 from backend.plugins.router import PluginRouter, normalize_text_for_wake_word
 from backend.redis_keys import ClientId, SessionId
@@ -190,6 +192,20 @@ async def maybe_handle_followup(
         logger.debug("Follow-up skip: contains wake word (%r)", text)
         return False
 
+    routed = await capture.accept(
+        redis_client,
+        user_id=user_id,
+        client_id=client_id,
+        capture_id=session_id,
+        input_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL, f"followup:{session_id}:{ctx.get('ts')}:{text}"
+            )
+        ),
+        text=text,
+    )
+    if routed:
+        return True
     resolved = await resolve_followup(last_command, text)
     if not resolved:
         logger.info("Follow-up %r not applicable to %r", text, last_command)

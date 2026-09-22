@@ -39,3 +39,13 @@ uv run --with grpcio-tools==1.71.0 python -m grpc_tools.protoc \
   --es_out="$typescript_out" \
   --es_opt=target=ts \
   "$proto_root/$proto_file"
+
+# protoc-gen-es emits an extra trailing blank line. Keep generated output
+# deterministic and compatible with the repository's whitespace checks.
+python3 - "$typescript_out/backend/audio_contract/v2/audio_pb.ts" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text(path.read_text().rstrip() + "\n")
+PY

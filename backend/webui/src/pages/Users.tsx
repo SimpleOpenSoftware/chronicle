@@ -333,9 +333,7 @@ export default function Users() {
                         </h4>
                       </div>
                       <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-                        Long-lived credentials that authenticate as {user.display_name || user.email}.
-                        Only the public prefix is shown — the secret is stored hashed and is
-                        displayed once, when the key is created.
+                        Keys authenticate as {user.display_name || user.email}.
                       </p>
                       <ApiKeysPanel
                         userId={user._id}

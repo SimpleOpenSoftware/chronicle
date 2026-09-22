@@ -194,3 +194,8 @@ def timeline_publication_lock(user_id: str | UserId) -> str:
 def dirty_range_enqueue_lock(dirty_range_id: str) -> str:
     """Single-flight lock guarding reconciliation-job enqueue for one dirty range."""
     return f"timeline:dirty_range_enqueue_lock:{dirty_range_id}"
+
+
+def voice_processing_owner(interaction_id: str) -> str:
+    """Tiny admitted-effect pointer; changed only with interaction ownership."""
+    return f"interaction:voice:processing:{interaction_id}"

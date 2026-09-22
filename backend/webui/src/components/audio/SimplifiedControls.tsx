@@ -13,9 +13,9 @@ const getStepText = (step: string): string => {
     case 'mic': return 'Getting Microphone Access...'
     case 'display-audio': return 'Requesting Tab Audio Access...'
     case 'websocket': return 'Connecting to Server...'
-    case 'audio-start': return 'Initializing Audio Session...'
-    case 'streaming': return 'Starting Audio Stream...'
-    case 'stopping': return 'Stopping Recording...'
+    case 'audio-start': return 'Preparing Recording...'
+    case 'streaming': return 'Starting Recording...'
+    case 'stopping': return 'Finishing recording…'
     case 'error': return 'Error Occurred'
     default: return 'Processing...'
   }
@@ -27,6 +27,7 @@ const isProcessing = (step: string): boolean => {
 
 export default function SimplifiedControls({ recording, memorySpaceId }: SimplifiedControlsProps) {
   const processing = isProcessing(recording.currentStep)
+  const stopping = recording.currentStep === 'stopping'
   const canStart = recording.canAccessMicrophone && !processing && !recording.isRecording
 
   const handleClick = () => {
@@ -45,7 +46,7 @@ export default function SimplifiedControls({ recording, memorySpaceId }: Simplif
     return 'bg-blue-600 hover:bg-blue-700'
   }
 
-  const isDisabled = recording.isRecording ? false : (processing || !canStart)
+  const isDisabled = stopping || (recording.isRecording ? false : (processing || !canStart))
 
   return (
     <Card raised padded={false} className="p-8 mb-6">
@@ -54,15 +55,18 @@ export default function SimplifiedControls({ recording, memorySpaceId }: Simplif
         <div className="mb-6 flex justify-center">
           <div className="relative">
             {/* Pulsing ring when recording */}
-            {recording.isRecording && (
+            {recording.isRecording && !stopping && (
               <span className="absolute inset-0 rounded-full bg-red-400 opacity-30 animate-ping" />
             )}
             <button
+              aria-label={stopping ? getStepText(recording.currentStep) : recording.isRecording ? 'Stop recording' : processing ? getStepText(recording.currentStep) : 'Start recording'}
               onClick={handleClick}
               disabled={isDisabled}
               className={`relative w-24 h-24 ${getButtonClasses()} text-white rounded-full flex items-center justify-center transition-all duration-200 shadow-lg disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105 active:scale-95`}
             >
-              {recording.isRecording ? (
+              {stopping ? (
+                <Loader2 className="h-10 w-10 animate-spin" />
+              ) : recording.isRecording ? (
                 <Square className="h-10 w-10 fill-current" />
               ) : processing ? (
                 <Loader2 className="h-10 w-10 animate-spin" />
@@ -78,7 +82,7 @@ export default function SimplifiedControls({ recording, memorySpaceId }: Simplif
         {/* Status Text */}
         <div className="space-y-2">
           <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">
-            {recording.isRecording ? 'Recording in Progress' : getStepText(recording.currentStep)}
+            {stopping ? getStepText(recording.currentStep) : recording.isRecording ? 'Recording in Progress' : getStepText(recording.currentStep)}
           </h2>
 
           {/* Recording Duration */}
@@ -90,7 +94,9 @@ export default function SimplifiedControls({ recording, memorySpaceId }: Simplif
 
           {/* Action Text */}
           <p className="text-sm text-gray-600 dark:text-gray-400">
-            {recording.isRecording
+            {stopping
+              ? 'Microphone off. Waiting for the server to finish saving audio…'
+              : recording.isRecording
               ? 'Click to stop recording'
               : recording.currentStep === 'idle'
                 ? 'Click to start recording'

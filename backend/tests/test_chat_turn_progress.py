@@ -9,12 +9,28 @@ LLM-independent: async_chat_with_tools_stream is replaced with scripted rounds.
 """
 
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from backend.chat_service import ChatService
+from backend.services.chat_context import (
+    ChatContext,
+    VaultNoteEvidence,
+    VaultRetrieval,
+    source_id,
+)
 from backend.services.memory.base import VaultSearchUnavailable
+
+
+@pytest.fixture(autouse=True)
+def isolated_chat_claim(monkeypatch):
+    @asynccontextmanager
+    async def unlocked(*args, **kwargs):
+        yield
+
+    monkeypatch.setattr("backend.chat_service.distributed_lock", unlocked)
 
 
 def _tool_round(query, *, prose=None, call_id="call-1"):
@@ -66,7 +82,31 @@ def _service(memories):
     cs.add_message = AsyncMock(return_value=True)
     cs.get_session_messages = AsyncMock(return_value=[])
     cs._get_tool_mode_system_prompt = AsyncMock(return_value="system")
-    cs.get_relevant_memories = AsyncMock(return_value=memories)
+    cs.get_relevant_memories = AsyncMock(
+        return_value=VaultRetrieval(
+            answer=next(
+                (
+                    m.content
+                    for m in memories
+                    if getattr(m, "metadata", {}).get("kind") == "vault_search_answer"
+                ),
+                "",
+            ),
+            notes=[
+                VaultNoteEvidence(
+                    id="Vnote",
+                    path=m.id,
+                    title=m.id,
+                    text=m.content,
+                    revision="r1",
+                    coverage="Full note",
+                )
+                for m in memories
+                if getattr(m, "metadata", {}).get("kind") != "vault_search_answer"
+            ],
+            coverage="Consulted notes",
+        )
+    )
     return cs
 
 
@@ -231,3 +271,116 @@ async def test_broken_search_is_never_presented_as_an_empty_vault():
 
     # The turn still completes rather than hanging or erroring out.
     assert events[-1]["type"] == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_attached", [False, True])
+async def test_tool_budget_finishes_with_a_saved_evidence_based_answer(source_attached):
+    """Reading five times must still produce an answer that survives reload."""
+    from backend.chat_service import MAX_TOOL_ROUNDS
+    from backend.services.chat_sources import (
+        ChatSourceContext,
+        ChatSourceRef,
+        SourcePassage,
+    )
+
+    cs = _service([])
+    source = (
+        ChatSourceContext(
+            ref=ChatSourceRef(kind="recording", key="recording-a"),
+            title="Session",
+            url="/recordings/recording-a",
+            started_at=None,
+            revision="revision-a",
+            coverage="All available source passages included.",
+            total_passages=1,
+            passages=[
+                SourcePassage(
+                    id="S1",
+                    text="I will send the update on Friday.",
+                    url="/recordings/recording-a?t=10",
+                    label="Speaker",
+                    revision="r1",
+                )
+            ],
+        )
+        if source_attached
+        else None
+    )
+    calls = []
+
+    async def stream(messages, **kwargs):
+        calls.append({"messages": list(messages), **kwargs})
+        if kwargs.get("tools"):
+            tool = "read_selected_source" if source_attached else "search_memories"
+            yield {"type": "content", "text": "Let me check again."}
+            yield {
+                "type": "done",
+                "content": "Let me check again.",
+                "tool_calls": [
+                    {
+                        "id": f"read-{len(calls)}",
+                        "type": "function",
+                        "function": {
+                            "name": tool,
+                            "arguments": json.dumps({"query": "update"}),
+                        },
+                    }
+                ],
+            }
+        else:
+            assert any(m["role"] == "tool" for m in messages)
+            answer = (
+                "Send the update on Friday [S1]."
+                if source_attached
+                else "No commitment was found in the available evidence."
+            )
+            for event in _text_round(answer):
+                yield event
+
+    with patch("backend.chat_service.async_chat_with_tools_stream", stream), patch(
+        "backend.chat_service.set_trace_io"
+    ):
+        events = [
+            e
+            async for e in cs._generate_response_tool_mode(
+                session_id="sess-1",
+                user_id="user-1",
+                message_content="What were my action items?",
+                source_context=ChatContext(sources=[source]) if source else None,
+            )
+        ]
+
+    saved = [
+        call.args[0]
+        for call in cs.add_message.await_args_list
+        if call.args[0].role == "assistant"
+    ]
+    assert len(saved) == 1, "Tool budget ran out without saving an assistant answer"
+    assert len(calls) == MAX_TOOL_ROUNDS + 1
+    assert not calls[-1].get("tools"), "Final answer must not start another tool round"
+    assert "Let me check" not in saved[0].content
+    assert events[-1]["data"]["message_id"] == saved[0].message_id
+    if source_attached:
+        assert (
+            saved[0].metadata["evidence"]["conversations"][0]["passages"][0]["id"]
+            == "S1"
+        )
+        assert (
+            saved[0].metadata["evidence"]["conversations"][0]["revision"]
+            == "revision-a"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_round", [_text_round(""), _tool_round("Alex")])
+async def test_invalid_final_answer_is_an_error_not_a_success(final_round):
+    from backend.chat_service import MAX_TOOL_ROUNDS
+
+    cs = _service([])
+    events = await _collect(cs, [_tool_round("Alex")] * MAX_TOOL_ROUNDS + [final_round])
+    assert events[-1]["type"] == "error"
+    assert not any(e["type"] == "complete" for e in events)
+    assert not any(
+        call.args[0].role == "assistant" for call in cs.add_message.await_args_list
+    )

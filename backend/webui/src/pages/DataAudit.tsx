@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Sparkles, Archive as ArchiveIcon, AlertTriangle, AudioLines, Mic, Radio, Target, ArrowRight } from 'lucide-react'
+import { Sparkles, Archive as ArchiveIcon, AlertTriangle } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { dataAuditApi, AuditConversation } from '../services/api'
 import { useJobPolling } from '../hooks/useJobPolling'
 import AuditFilterBar from '../components/dataAudit/AuditFilterBar'
 import {
   AUDIT_FILTERS,
-  SpeakerFilterState,
   defaultFilterValues,
 } from '../components/dataAudit/filters'
 import AuditToolbar from '../components/dataAudit/AuditToolbar'
@@ -21,7 +20,7 @@ import GuidedEnrollment from '../components/dataAudit/GuidedEnrollment'
 import UnknownSpeakerDiscovery from '../components/dataAudit/UnknownSpeakerDiscovery'
 import SpeakerLabelReview from '../components/dataAudit/SpeakerLabelReview'
 import EnrollmentCandidates from '../components/finetuning/EnrollmentCandidates'
-import { Alert, Button, Label, Modal, Select, Tabs } from '../components/ui'
+import { Alert, Button, Tabs } from '../components/ui'
 
 // Data Audit is the single home for curation. A task hub picks the active flow:
 // audit conversations, enroll speakers (queue + guided enhance), or classify
@@ -29,13 +28,6 @@ import { Alert, Button, Label, Modal, Select, Tabs } from '../components/ui'
 // the one hub tile that leaves the page — it's a full sub-view at /wakeword-lab
 // rather than an inline flow, so it links out instead of switching curationView.
 type CurationView = 'conversations' | 'speaker-review' | 'enroll' | 'background'
-
-const HUB_TILE_CLASS =
-  'text-left rounded-xl border p-4 transition-colors border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 hover:border-blue-300'
-const HUB_TILE_ACTIVE_CLASS =
-  'text-left rounded-xl border p-4 transition-colors border-blue-400 bg-blue-50/60 dark:bg-blue-900/15 dark:border-blue-700'
-
-type ArchiveReason = 'near_silent' | 'bad_speaker' | 'manual_cleanup'
 
 // Persist filter inputs across navigation (e.g. opening a conversation detail
 // page and clicking back) so the user doesn't lose their filters.
@@ -80,12 +72,6 @@ function loadArchivedView(datasetId: string | null): boolean {
   }
 }
 
-const REASON_LABELS: Record<ArchiveReason, string> = {
-  near_silent: 'Speech-free',
-  bad_speaker: 'Bad speaker',
-  manual_cleanup: 'Manual cleanup',
-}
-
 export default function DataAudit() {
   const [searchParams, setSearchParams] = useSearchParams()
   const initialDatasetId = searchParams.get('dataset')
@@ -99,7 +85,16 @@ export default function DataAudit() {
     loadArchivedView(initialDatasetId)
   )
   // Which curation flow is active (task hub). Conversation audit is the default.
-  const [curationView, setCurationView] = useState<CurationView>('conversations')
+  const requestedView = searchParams.get('view')
+  const curationView: CurationView = requestedView === 'enroll' || requestedView === 'speaker-review' || requestedView === 'background' ? requestedView : 'conversations'
+  const setCurationView = (view: string) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      if (view === 'conversations') next.delete('view')
+      else next.set('view', view)
+      return next
+    })
+  }
 
   // Data
   const [speakers, setSpeakers] = useState<string[]>([])
@@ -118,7 +113,6 @@ export default function DataAudit() {
   // Status
   const [loading, setLoading] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
-  const [archiving, setArchiving] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -130,10 +124,6 @@ export default function DataAudit() {
   const [splitTarget, setSplitTarget] = useState<AuditConversation | null>(null)
   const [mergeTargets, setMergeTargets] = useState<AuditConversation[] | null>(null)
   const [exportOpen, setExportOpen] = useState(false)
-  // Delete-audio confirmation: holds the reason chosen for the pending archive
-  // (null when the dialog is closed). Pre-seeded with the filter-inferred reason.
-  const [archiveReason, setArchiveReason] = useState<ArchiveReason | null>(null)
-
   const { pollJob } = useJobPolling()
 
   const loadConversations = useCallback(async (overrideFilters?: Record<string, unknown>) => {
@@ -307,38 +297,6 @@ export default function DataAudit() {
     else setSelected(new Set(rows.map((r) => r.conversation_id)))
   }
 
-  // Open the delete-audio confirmation, defaulting the reason to whatever the
-  // current filters imply (the user can still override it in the dialog).
-  const archiveSelected = () => {
-    if (selected.size === 0) return
-    const speakerRules = (filters.speakers || {}) as Record<string, SpeakerFilterState>
-    const speech = (filters.speech || {}) as { max?: number }
-    const hasExcludedSpeakers = Object.values(speakerRules).some((v) => v === 'exclude')
-    const inferred: ArchiveReason = hasExcludedSpeakers
-      ? 'bad_speaker'
-      : (speech.max ?? 100) < 100
-        ? 'near_silent'
-        : 'manual_cleanup'
-    setArchiveReason(inferred)
-  }
-
-  const confirmArchive = async () => {
-    if (selected.size === 0 || archiveReason === null) return
-    const reason = archiveReason
-    setArchiveReason(null)
-    setArchiving(true)
-    setError(null)
-    try {
-      const res = await dataAuditApi.archive(Array.from(selected), reason)
-      setMessage(`Archived audio for ${res.data.archived}/${res.data.total} conversation(s)`)
-      await loadConversations()
-    } catch (e: any) {
-      setError(e?.response?.data?.error || 'Failed to archive')
-    } finally {
-      setArchiving(false)
-    }
-  }
-
   const refreshTriagePending = useCallback(async () => {
     try {
       const res = await dataAuditApi.getTriagePending()
@@ -360,9 +318,7 @@ export default function DataAudit() {
       const res = await dataAuditApi.applyTriage()
       const { applied_count, conversation_count } = res.data
       setMessage(
-        `Applied speaker triage to ${applied_count}/${conversation_count} conversation(s); ` +
-          `transcripts relabeled and memory reprocessing queued. ` +
-          `Voiceprints are unchanged — enroll deliberately from the Finetuning page.`
+        `Updated ${applied_count}/${conversation_count} recordings. Memory processing queued; enrollment is separate.`
       )
       await refreshTriagePending()
       await loadConversations()
@@ -392,51 +348,23 @@ export default function DataAudit() {
         <div className="flex-1 min-w-[240px]">
           <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">Data Audit</h2>
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            Decide what the audio is — audit conversations, enroll speakers, classify
-            background &amp; role, and tune wake words. One home for all curation.
+            Review audio and speaker labels.
           </p>
         </div>
       </div>
 
-      {/* Task hub — pick a curation flow */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-        {([
-          { key: 'conversations', icon: Sparkles, title: 'Audit conversations', metric: total ? `${total}` : '', blurb: 'Find speech-free or mis-attributed audio; split, merge, archive.' },
-          { key: 'speaker-review', icon: AudioLines, title: 'Review speaker labels', metric: '', blurb: 'Verify actual identity claims five at a time across the corpus.' },
-          { key: 'enroll', icon: Mic, title: 'Enroll speakers', metric: triagePending.pending_count ? `${triagePending.pending_count}` : '', blurb: 'Review the relabel queue and strengthen voiceprints — deliberate, gated.' },
-          { key: 'background', icon: Radio, title: 'Background & role', metric: '', blurb: 'Content vs real people vs noise. Feeds background suppression.' },
-        ] as { key: CurationView; icon: any; title: string; metric: string; blurb: string }[]).map((t) => {
-          const active = curationView === t.key
-          const Icon = t.icon
-          return (
-            <button
-              key={t.key}
-              onClick={() => setCurationView(t.key)}
-              className={active ? HUB_TILE_ACTIVE_CLASS : HUB_TILE_CLASS}
-            >
-              <div className="flex items-center justify-between">
-                <Icon className={`h-5 w-5 ${active ? 'text-blue-600' : 'text-gray-400'}`} />
-                {t.metric && <span className="text-lg font-bold text-blue-600">{t.metric}</span>}
-              </div>
-              <div className="mt-2 font-semibold text-gray-900 dark:text-gray-100">{t.title}</div>
-              <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t.blurb}</div>
-              {active && <div className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-blue-600">Active <ArrowRight className="h-3.5 w-3.5" /></div>}
-            </button>
-          )
-        })}
-        {/* Leaves the page: the lab is its own route, reached only from here. */}
-        <Link to="/wakeword-lab" className={`block ${HUB_TILE_CLASS}`}>
-          <div className="flex items-center justify-between">
-            <Target className="h-5 w-5 text-gray-400" />
-          </div>
-          <div className="mt-2 font-semibold text-gray-900 dark:text-gray-100">Wake-Word Lab</div>
-          <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-            Review false positives &amp; capture wake clips; per-word retrain loop.
-          </div>
-          <div className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-blue-600">
-            Open lab <ArrowRight className="h-3.5 w-3.5" />
-          </div>
-        </Link>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Tabs
+          value={curationView}
+          onChange={setCurationView}
+          tabs={[
+            { value: 'conversations', label: 'Recordings' },
+            { value: 'speaker-review', label: 'Speaker labels' },
+            { value: 'enroll', label: 'Enrollment' },
+            { value: 'background', label: 'Background & role' },
+          ]}
+        />
+        <Link to="/wakeword-lab" className="text-sm text-blue-600 dark:text-blue-400 hover:underline">Wake-Word Lab</Link>
       </div>
 
       {/* Messages (shared across flows) */}
@@ -474,7 +402,7 @@ export default function DataAudit() {
         </div>
       )}
 
-      {/* ── Background & role flow ─────────────────────────────────────────── */}
+      {/* Background & role */}
       {curationView === 'background' && <BackgroundReviewPanel />}
 
       {/* ── Conversation audit flow ────────────────────────────────────────── */}
@@ -486,8 +414,8 @@ export default function DataAudit() {
             value={archivedOnly ? 'archived' : 'conversations'}
             onChange={(v) => setArchivedOnly(v === 'archived')}
             tabs={[
-              { value: 'conversations', label: 'Conversations' },
-              { value: 'archived', label: 'Archived stubs', icon: <ArchiveIcon className="h-4 w-4" /> },
+              { value: 'conversations', label: 'Current' },
+              { value: 'archived', label: 'Historical audio stubs', icon: <ArchiveIcon className="h-4 w-4" /> },
             ]}
           />
 
@@ -532,14 +460,12 @@ export default function DataAudit() {
               mergeEligible={mergeEligible}
               unanalyzedCount={unanalyzedCount}
               analyzing={analyzing}
-              archiving={archiving}
               triagePendingCount={triagePending.pending_count}
               triageConversationCount={triagePending.conversation_count}
               applyingTriage={applyingTriage}
               onApplyTriage={applyTriage}
               onAnalyze={runAnalysis}
               onMerge={() => setMergeTargets(selectedRows)}
-              onArchive={archiveSelected}
               onExport={() => setExportOpen(true)}
             />
           )}
@@ -585,45 +511,7 @@ export default function DataAudit() {
       {exportOpen && (
         <ExportModal selected={selectedRows} onClose={() => setExportOpen(false)} />
       )}
-      {archiveReason !== null && (
-        <Modal
-          open
-          onClose={() => setArchiveReason(null)}
-          title={`Permanently delete audio for ${selected.size} conversation(s)?`}
-          icon={<AlertTriangle className="h-5 w-5 text-red-500 flex-shrink-0" />}
-          footer={
-            <>
-              <Button variant="secondary" onClick={() => setArchiveReason(null)} disabled={archiving}>
-                Cancel
-              </Button>
-              <Button variant="danger" onClick={confirmArchive} disabled={archiving}>
-                Delete audio
-              </Button>
-            </>
-          }
-        >
-          <div className="space-y-4">
-            <p className="text-gray-500 dark:text-gray-400">
-              The audio bytes will be deleted to reclaim storage. A metadata stub
-              (date, duration, reason) is kept so you know something was recorded.
-              This cannot be undone.
-            </p>
-            <div>
-              <Label className="mb-1">Reason</Label>
-              <Select
-                value={archiveReason}
-                onChange={(e) => setArchiveReason(e.target.value as ArchiveReason)}
-              >
-                {(Object.keys(REASON_LABELS) as ArchiveReason[]).map((r) => (
-                  <option key={r} value={r}>
-                    {REASON_LABELS[r]}
-                  </option>
-                ))}
-              </Select>
-            </div>
-          </div>
-        </Modal>
-      )}
+
     </div>
   )
 }

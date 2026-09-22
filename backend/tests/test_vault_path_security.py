@@ -79,6 +79,38 @@ def test_read_note_rejects_symlink_leaf(tmp_path):
 
 
 @pytest.mark.usefixtures("unlocked")
+def test_read_existing_base_definition_through_registered_tool(tmp_path):
+    vault = tmp_path / "vault"
+    path = vault / "Templates" / "Bases" / "Projects.base"
+    path.parent.mkdir(parents=True)
+    content = "views:\n  - type: table\n    name: Projects\n"
+    path.write_text(content)
+    tools = VaultTools(vault)
+    assert (
+        tools.dispatch("read_note", {"path": "Templates/Bases/Projects.base"})
+        == content
+    )
+    assert "views:" in tools.read_note("Templates/Bases/Projects.base", limit=1)
+    with pytest.raises(VaultToolError):
+        tools.write_note("Templates/Bases/Projects.base", "changed", overwrite=True)
+    assert path.read_text() == content
+    assert not tools.touched
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["../outside.base", "/tmp/outside.base", "Templates/Linked.base"]
+)
+def test_base_definition_reads_preserve_confinement(tmp_path, unsafe):
+    vault = tmp_path / "vault"
+    (vault / "Templates").mkdir(parents=True)
+    outside = tmp_path / "outside.base"
+    outside.write_text("private")
+    (vault / "Templates" / "Linked.base").symlink_to(outside)
+    with pytest.raises(VaultToolError):
+        VaultTools(vault).dispatch("read_note", {"path": unsafe})
+
+
+@pytest.mark.usefixtures("unlocked")
 def test_edit_and_overwrite_reject_symlink_leaf(tmp_path):
     vault = tmp_path / "vault"
     (vault / "Topics").mkdir(parents=True)

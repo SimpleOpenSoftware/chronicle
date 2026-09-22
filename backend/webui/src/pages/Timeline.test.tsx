@@ -99,7 +99,7 @@ const reviewableDay = {
     status: 'settled' as const,
     confirmed_at: null,
     confirmed_fields: [],
-    memory_policy: 'auto' as const,
+    requires_activity_review: true, memory_eligible: true, memory_policy: 'auto' as const,
     salience: 'routine' as const,
     confidence: 0.91,
     activity_mode: 'foreground' as const,
@@ -183,6 +183,7 @@ function renderTimeline(
 }
 
 beforeEach(() => {
+  vi.spyOn(timelineApi, 'getSessions').mockResolvedValue({ data: { sessions: [] } } as never)
   vi.spyOn(timelineApi, 'getMemorySelections').mockResolvedValue({ data: { proposals: [], outcomes: {} } } as never)
 })
 
@@ -212,6 +213,21 @@ describe('Timeline next action', () => {
     expect(await screen.findByText(/Reconciliation completed through/)).toBeVisible()
     expect(await screen.findByText(/Evidence still needs reconciliation/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Reconcile available evidence' }))
+    await waitFor(() => expect(reconcile).toHaveBeenCalledWith(TEST_DAY, 'Asia/Calcutta'))
+  })
+
+  it('offers one reconciliation action when a completed empty day receives new evidence', async () => {
+    const reconcile = renderTimeline({ state: 'complete' } as never, {
+      ...emptyDay,
+      reconciliation: { ranges: [{
+        dirty_range_id: 'new-evidence', started_at: '2026-08-28T07:03:00Z', ended_at: '2026-08-28T08:15:00Z',
+        state: 'pending', trigger_reasons: ['transcript_revision'], attempts: 0, error: null, resolution_history: [],
+      }] },
+    })
+    expect(await screen.findByText('Captured evidence is awaiting reconciliation.')).toBeVisible()
+    expect(screen.queryByText('Individual episodes & structure tools')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reconcile available evidence' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Reconcile this day' }))
     await waitFor(() => expect(reconcile).toHaveBeenCalledWith(TEST_DAY, 'Asia/Calcutta'))
   })
 
@@ -306,6 +322,7 @@ describe('Timeline next action', () => {
     const finalize = vi.spyOn(timelineApi, 'finalizeEpisodes').mockResolvedValue({ data: { ...reviewableDay.review!, state: 'memory_queued' } } as never)
     renderTimeline(null, reviewableDay)
 
+    if (!(await screen.findByText('Individual episodes & structure tools')).closest('details')?.open) fireEvent.click(screen.getByText('Individual episodes & structure tools'))
     expect(await screen.findByRole('heading', { name: 'Finish the episode account' })).toBeVisible()
     expect(screen.getByText('memory-eligible').parentElement).toHaveTextContent('1 memory-eligible')
     expect(screen.queryByRole('link', { name: /Memory queued|Extracting potential memory/i })).not.toBeInTheDocument()
@@ -359,6 +376,7 @@ describe('Timeline next action', () => {
     fireEvent.click(dismissButton)
 
     await waitFor(() => expect(dismiss).toHaveBeenCalledWith('range-one', 'Reviewed the transcript gap'))
+    if (!(await screen.findByText('Individual episodes & structure tools')).closest('details')?.open) fireEvent.click(screen.getByText('Individual episodes & structure tools'))
     expect(await screen.findByRole('heading', { name: 'Finish the episode account' })).toBeVisible()
     await waitFor(() => expect(timelineApi.getReviewQueue).toHaveBeenCalledTimes(queueCallsBeforeDismissal + 1))
 
@@ -426,6 +444,18 @@ describe('Timeline next action', () => {
     await waitFor(() => expect(timelineApi.getReviewQueue).toHaveBeenCalledTimes(queueCallsBeforeDismissal + 1))
   })
 
+  it('does not ask for structure confirmation of API-classified reference evidence', async () => {
+    const day: TimelineDay = {
+      ...reviewableDay,
+      episodes: [{ ...reviewableDay.episodes[0], status: 'provisional',
+        requires_activity_review: false, memory_eligible: false }],
+    }
+    renderTimeline(null, day)
+    if (!(await screen.findByText('Individual episodes & structure tools')).closest('details')?.open) fireEvent.click(screen.getByText('Individual episodes & structure tools'))
+    expect(await screen.findByRole('heading', { name: 'Finish the episode account' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: /Confirm session/ })).not.toBeInTheDocument()
+  })
+
   it('confirms an exact provisional revision, follows its successor snapshot, then finalizes', async () => {
     const provisionalDay: TimelineDay = {
       ...reviewableDay,
@@ -452,6 +482,7 @@ describe('Timeline next action', () => {
     const finalize = vi.spyOn(timelineApi, 'finalizeEpisodes').mockResolvedValue({ data: { ...reviewableDay.review!, state: 'memory_queued' } } as never)
     renderTimeline(null, provisionalDay, successorDay, () => confirm.mock.calls.length > 0)
 
+    if (!(await screen.findByText('Individual episodes & structure tools')).closest('details')?.open) fireEvent.click(screen.getByText('Individual episodes & structure tools'))
     expect(await screen.findByRole('heading', { name: 'Review your sessions' })).toBeVisible()
     const queueCallsBeforeConfirmation = vi.mocked(timelineApi.getReviewQueue).mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Confirm session (1)' }))
@@ -462,6 +493,7 @@ describe('Timeline next action', () => {
       TEST_SNAPSHOT,
       [{ episode_key: 'episode-key-1', revision: 3 }],
     ))
+    if (!(await screen.findByText('Individual episodes & structure tools')).closest('details')?.open) fireEvent.click(screen.getByText('Individual episodes & structure tools'))
     expect(await screen.findByRole('heading', { name: 'Finish the episode account' })).toBeVisible()
     await waitFor(() => expect(timelineApi.getReviewQueue).toHaveBeenCalledTimes(queueCallsBeforeConfirmation + 1))
 

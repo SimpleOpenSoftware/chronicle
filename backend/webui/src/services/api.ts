@@ -335,6 +335,9 @@ export interface DeviceInputSource {
   health: Record<string, unknown>
   last_seen_at: string | null
   capabilities: string[]
+  privacy_enabled_from?: string | null
+  privacy_waiting_from?: string | null
+  privacy_revision?: number
 }
 
 export interface DeviceInputItem {
@@ -357,6 +360,11 @@ export interface DeviceInputItem {
 }
 
 export const deviceInputApi = {
+  overridePrivacy: (interval: PrivacyInterval, decision: 'allowed' | 'excluded') =>
+    api.post('/api/device-input/privacy/override', {
+      source_id: interval.source_id, started_at: interval.started_at,
+      ended_at: interval.ended_at, revision: interval.revision, decision,
+    }),
   getSources: () => api.get<{ sources: DeviceInputSource[] }>('/api/device-input/sources'),
   createPairingCode: () => api.post<{ code: string; expires_at: string }>('/api/device-input/pairing-codes'),
   getTimeline: (startAt: string, endAt: string) =>
@@ -463,6 +471,8 @@ export interface TimelineEpisode {
   /** Fields a person has edited; later runs must not regenerate them. */
   confirmed_fields: string[]
   memory_policy: 'auto' | 'reference' | 'remember'
+  requires_activity_review: boolean
+  memory_eligible: boolean
   salience: 'background' | 'routine' | 'notable' | 'highlight'
   confidence: number
   activity_mode: 'foreground' | 'background' | 'ambient' | 'idle'
@@ -511,6 +521,17 @@ export interface TimelineAnalysis {
   completed_at: string | null
 }
 
+export interface PrivacyInterval {
+  source_id: string
+  source_name: string
+  started_at: string
+  ended_at: string
+  revision: number
+  state: 'pending' | 'excluded' | 'needs_review'
+  label: string
+  reason?: string
+}
+
 export interface TimelineDay {
   latest_reconciliation?: TimelineReconciliationRequest | null
   date: string
@@ -520,6 +541,7 @@ export interface TimelineDay {
   applied_snapshot_id: string | null
   snapshot_state: 'dirty' | 'ready' | 'reviewed' | 'applied' | 'correction_required'
   coverage: {
+    privacy_intervals?: PrivacyInterval[]
     started_at?: string
     ended_at?: string
     window_count?: number
@@ -681,6 +703,7 @@ export interface PotentialMemoryChange {
   after_text: string | null
   summary: string
   source_episode_keys: string[]
+  source_evidence_keys?: string[]
 }
 
 export interface EpisodeRevisionRef { episode_key: string; revision: number }
@@ -696,7 +719,7 @@ export interface MemoryReviewProposal {
   replacement_proposal_id: string | null
   supersedes_proposal_id: string | null
   freshness: { verdict: 'unaffected' | 'affected' | 'uncertain'; reason: string; relevant_paths: string[] } | null
-  state: 'queued' | 'generating' | 'pending' | 'checking' | 'applying' | 'applied' | 'rejected' | 'no_changes' | 'excluded' | 'stale' | 'failed' | 'regenerating' | 'correction_required' | 'corrected'
+  state: 'queued' | 'generating' | 'paused' | 'pending' | 'checking' | 'applying' | 'applied' | 'rejected' | 'no_changes' | 'excluded' | 'stale' | 'failed' | 'regenerating' | 'correction_required' | 'corrected' | 'needs_attention' | 'deferred'
   snapshot_id: string
   change_count: number
   accepted_change_ids: string[]
@@ -706,6 +729,7 @@ export interface MemoryReviewProposal {
   generated_at: string | null
   resolved_at: string | null
   changes?: PotentialMemoryChange[]
+  account?: { claims: { text: string; source_keys: string[]; citations: { source_key: string; quote: string }[] }[] } | null
 }
 
 export interface EpisodeMemoryOutcome {
@@ -791,7 +815,34 @@ export interface TimelineReconciliationRequest {
   updated_at: string
 }
 
+export interface SessionSource {
+  key: string; evidence_id: string; content_hash: string | null
+  locator: TimelineEvidenceLocator; started_at: string; ended_at: string
+  kind: string; role: string; direction: string; excerpt: string
+  episode_keys: string[]; participation: 'supporting' | 'background' | 'excluded' | 'uncertain'
+  disposition: string
+  metadata?: { text_source?: string }
+}
+export interface MemorySession {
+  refresh_assessment?: { verdict: string; reason: string } | null
+  session_key: string; revision: number; owner_local_date: string
+  origin: 'human' | 'automatic'; title: string; summary: string
+  started_at: string; ended_at: string; episodes: EpisodeRevisionRef[]; episode_ids: string[]
+  source_keys: string[]; sources: SessionSource[]; scope_hash: string; state: string; questions: string[]; waiting_reason?: string
+  proposal_id: string | null; change_count: number; stage: string | null
+  completed_sources: number; total_sources: number; error: string | null
+  failure_kind?: string | null
+  investigation_activity?: { event: string; tool?: string | null; store?: string | null; source?: string | null; tool_calls: number; rounds: number; checkpoint_saved: boolean; resumed: boolean; updated_at: string; runtime_version: string; policy: string }
+}
+
 export const timelineApi = {
+  getSessions: (day: string, timezone: string) => api.get<{ sessions: MemorySession[]; preparation?: { state: string; attempts: number; job_id: string | null; error: string | null; waiting_sessions: Record<string, string>; completed_queries: number } | null }>(`/api/timeline/sessions/${day}`, { params: { timezone } }),
+  getSessionOrganizationExchanges: (day: string, timezone: string) => api.get<{ runs: { request: unknown; stdout: string; stderr: string; metadata?: { model_input?: unknown; tool_calls?: unknown[] } }[] }>(`/api/timeline/sessions/${day}/organization-exchanges`, { params: { timezone } }),
+  getSessionSources: (day: string, timezone: string, session: MemorySession) => api.get<{ sources: SessionSource[]; scope_hash: string }>(`/api/timeline/sessions/${day}/${session.session_key}/sources`, { params: { timezone, revision: session.revision } }),
+  prepareSessions: (day: string, timezone: string, snapshot_id: string) => api.post(`/api/timeline/sessions/${day}/prepare`, { timezone, snapshot_id }),
+  generateSessionMemory: (day: string, timezone: string, session: MemorySession, excluded_source_keys: string[] = []) => api.post(`/api/timeline/sessions/${day}/memory`, { timezone, session_key: session.session_key, revision: session.revision, excluded_source_keys }),
+  decideSessionMemory: (day: string, timezone: string, session: MemorySession, action: 'exclude' | 'defer' | 'resume' | 'include' | 'attribute' | 'clarify', source_keys: string[], role?: 'user_statement' | 'third_party' | 'media_content', clarification?: string) => api.post<{ correction_required: boolean }>(`/api/timeline/sessions/${day}/disposition`, { timezone, session_key: session.session_key, revision: session.revision, scope_hash: session.scope_hash, action, source_keys, role, clarification }),
+
   getPhotoExploration: (requestId: string) => api.get<PhotoExplorationDetails>(`/api/timeline/reconciliation/${requestId}/photos`),
   getPhotoExplorationGrid: (requestId: string, round: number) => api.get<Blob>(`/api/timeline/reconciliation/${requestId}/photos/${round}/grid`, { responseType: 'blob' }),
 
@@ -869,6 +920,7 @@ export const timelineApi = {
       accepted_suggestion_ids: acceptedSuggestionIds,
       finalize,
     }),
+  getMemoryExchanges: (proposalId: string) => api.get<{ accepted_context?: { notes?: { path: string; hash: string; passage: string }[]; consulted_notes?: { path: string; hash: string }[]; unresolved_lookups?: string[]; review?: { verdict: string; reason: string }; review_context?: { notes?: { path: string; hash: string; passage: string }[] } }; source_digest: string; source_scope: SessionSource[]; writer_exchanges: { operation: string; request: unknown; stdout: string; stderr: string }[]; inference_runs: { operation: string; request: unknown; exchanges?: unknown; model_input?: unknown; tool_calls?: unknown[]; context?: unknown; output: string; result?: unknown; error?: string; cached?: boolean }[] }>(`/api/timeline/review/proposals/${proposalId}/exchanges`),
   getMemorySelections: (date: string, timezone: string) =>
     api.get<{ proposals: MemoryReviewProposal[]; outcomes: Record<string, EpisodeMemoryOutcome> }>(`/api/timeline/review/day/${date}/selections`, { params: { timezone } }),
   createMemorySelection: (date: string, timezone: string, snapshotId: string, episodes: EpisodeRevisionRef[]) =>
@@ -1439,19 +1491,53 @@ export const uploadApi = {
 
 
 
+export interface ChatSourceRef {
+  kind: 'recording' | 'session' | 'episode'
+  key: string
+  local_date?: string | null
+  timezone?: string
+}
+export interface SourcePassage {
+  id: string
+  text: string
+  url: string
+  label: string
+  revision: string
+}
+export interface ChatSourceContext {
+  ref: ChatSourceRef
+  title: string
+  url: string
+  started_at: string | null
+  revision: string
+  passages: SourcePassage[]
+  coverage: string
+  total_passages: number
+}
+
 export const chatApi = {
+  getDialogue: (sessionId: string) => api.get(`/api/chat/sessions/${sessionId}/dialogue`),
+  commandDialogueTask: (sessionId: string, taskId: string, command: {
+    id: string; revision: number; action: 'reply' | 'pause' | 'resume' | 'cancel'; text?: string; choice_id?: string;
+  }) => api.post(`/api/chat/sessions/${sessionId}/dialogue/tasks/${taskId}/commands`, command),
+  getRuns: (sessionId: string) => api.get(`/api/chat/sessions/${sessionId}/runs`),
+  getRun: (sessionId: string, runId: string) => api.get(`/api/chat/sessions/${sessionId}/runs/${runId}`),
+  deleteRuns: (sessionId: string) => api.delete(`/api/chat/sessions/${sessionId}/runs`),
+  getSources: (sessionId: string) => api.get<{ sources: ChatSourceContext[] }>(`/api/chat/sessions/${sessionId}/sources`),
+  setSources: (sessionId: string, sources: ChatSourceRef[]) => api.put(`/api/chat/sessions/${sessionId}`, { sources }),
+  createSaveProposal: (sessionId: string) => api.post(`/api/chat/sessions/${sessionId}/save-proposals`),
+  getSaveProposal: (sessionId: string) => api.get(`/api/chat/sessions/${sessionId}/save-proposals/latest`),
+  decideSaveProposal: (sessionId: string, proposalId: string, generation: string, selected: string[], action: 'approve' | 'discard' | 'retry') => api.post(`/api/chat/sessions/${sessionId}/save-proposals/${proposalId}/${action}`, { generation, selected_change_ids: selected }),
   // Session management
-  createSession: (title?: string) => api.post('/api/chat/sessions', { title }),
-  getSessions: (limit = 50) => api.get('/api/chat/sessions', { params: { limit } }),
+  createSession: (title?: string, sources: ChatSourceRef[] = [], memorySpaceId?: string) => api.post('/api/chat/sessions', { title, sources, memory_space_id: memorySpaceId }),
+  getSource: (sessionId: string) => api.get<ChatSourceContext>(`/api/chat/sessions/${sessionId}/source`),
+  getSessions: (limit = 50, memorySpaceId?: string, signal?: AbortSignal) => api.get('/api/chat/sessions', { params: { limit, memory_space_id: memorySpaceId }, signal }),
   getSession: (sessionId: string) => api.get(`/api/chat/sessions/${sessionId}`),
   updateSession: (sessionId: string, title: string) => api.put(`/api/chat/sessions/${sessionId}`, { title }),
   deleteSession: (sessionId: string) => api.delete(`/api/chat/sessions/${sessionId}`),
 
   // Messages
-  getMessages: (sessionId: string, limit = 100) => api.get(`/api/chat/sessions/${sessionId}/messages`, { params: { limit } }),
-
-  // Memory extraction
-  extractMemories: (sessionId: string) => api.post(`/api/chat/sessions/${sessionId}/extract-memories`),
+  getMessages: (sessionId: string, limit = 100, offset = 0) => api.get(`/api/chat/sessions/${sessionId}/messages`, { params: { limit, offset } }),
 
   // Statistics
   getStatistics: () => api.get('/api/chat/statistics'),
@@ -1462,7 +1548,7 @@ export const chatApi = {
   // Streaming chat — OpenAI-compatible completions endpoint.
   // Memory is always agentic: the backend's chat agent calls the search_memories
   // tool (which runs the agentic vault search) when a question needs context.
-  sendMessage: (message: string, sessionId?: string, memoryLimit?: number) => {
+  sendMessage: (message: string, sessionId?: string, signal?: AbortSignal) => {
     const requestBody: Record<string, unknown> = {
       messages: [{ role: 'user', content: message }],
       stream: true,
@@ -1470,12 +1556,11 @@ export const chatApi = {
     if (sessionId) {
       requestBody.session_id = sessionId
     }
-    if (memoryLimit !== undefined) {
-      requestBody.memory_limit = memoryLimit
-    }
+
 
     return fetch(`${BACKEND_URL}/api/chat/completions`, {
       method: 'POST',
+      signal,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${localStorage.getItem(getStorageKey('token'))}`
@@ -2300,7 +2385,7 @@ export const dataAuditApi = {
       ),
     }),
 
-  // Archive (hard-delete audio, keep metadata stub)
+  // Capture archival is disabled by the backend until a retention policy is available (409).
   archive: (conversationIds: string[], reason: string) =>
     api.post('/api/data-audit/archive', {
       conversation_ids: conversationIds,

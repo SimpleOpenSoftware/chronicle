@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -11,12 +12,13 @@ from rq import get_current_job
 from backend.constants import BACKGROUND_SPEECH_LABEL, NOISE_LABEL
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 
 HIGH_THRESHOLD = 0.62
 MARGIN = 0.05
 AMBIGUOUS_THRESHOLD = 0.52
 AMBIGUOUS_BAND = 0.12
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 
 
 def _normalise(values: list[list[float]]) -> np.ndarray:
@@ -87,6 +89,8 @@ def _score_rows(
 
 
 async def build_background_cleanup_report(requested_by: str) -> dict:
+    visibility = privacy.ConversationPrivacyFilter()
+    visibility.snapshots[requested_by] = await privacy.load_snapshot(requested_by)
     database = Conversation.get_pymongo_collection().database
     corpus = database["background_corpus_embeddings"]
     latest = await corpus.find_one(
@@ -101,12 +105,14 @@ async def build_background_cleanup_report(requested_by: str) -> dict:
             {"requested_by": requested_by, "embedding_model": model}, {"_id": 0}
         )
     ]
+    rows = await visibility.filter_embeddings(rows)
     bucket_docs = [
         row
         async for row in database["background_clips"].find(
             {"user_id": requested_by, "embedding_model": model}, {"_id": 0}
         )
     ]
+    bucket_docs = await visibility.filter_embeddings(bucket_docs)
     buckets = {
         kind: [row for row in bucket_docs if row.get("bucket_type") == kind]
         for kind in ("noise", "background_speech")
@@ -117,6 +123,8 @@ async def build_background_cleanup_report(requested_by: str) -> dict:
             {"requested_by": requested_by, "embedding_model": model}, {"_id": 0}
         )
     ]
+    foreground = await visibility.filter_embeddings(foreground)
+    await visibility.assert_current()
     if not buckets["noise"] and not buckets["background_speech"]:
         return {"ready": False, "reason": "No confirmed background samples yet"}
     scored = _score_rows(rows, buckets, foreground)
@@ -125,7 +133,7 @@ async def build_background_cleanup_report(requested_by: str) -> dict:
     high.sort(key=lambda item: item["margin"], reverse=True)
     ambiguous.sort(key=lambda item: abs(item["margin"]))
     material = "|".join(
-        [model]
+        [model, json.dumps(visibility.revision_receipt(), sort_keys=True)]
         + sorted(
             f"{row.get('conversation_id')}:{row.get('segment_start')}:{row.get('bucket_type')}"
             for row in bucket_docs
@@ -164,11 +172,19 @@ async def build_background_cleanup_report(requested_by: str) -> dict:
             else "Spot-check the proposed changes before applying them."
         ),
     }
+    await visibility.assert_current()
     await database["background_cleanup_reports"].update_one(
         {"requested_by": requested_by, "report_id": report_id},
         {
             "$set": {
                 **report,
+                "privacy_revisions": visibility.revision_receipt(),
+                "privacy_reference_receipt": await visibility.reference_receipt(
+                    requested_by
+                ),
+                "evidence_conversation_ids": sorted(
+                    {row["conversation_id"] for row in rows + bucket_docs + foreground}
+                ),
                 "high_changes": [
                     {
                         key: item[key]
@@ -186,7 +202,28 @@ async def build_background_cleanup_report(requested_by: str) -> dict:
         },
         upsert=True,
     )
+    await visibility.assert_current()
     return report
+
+
+async def require_cleanup_report(report, requested_by):
+    """A proposal keeps the policy and all reference evidence used to score it."""
+    if report.get("report_version") != REPORT_VERSION:
+        raise privacy.PrivacyHeld()
+    visibility = privacy.ConversationPrivacyFilter()
+    visibility.snapshots[str(requested_by)] = await privacy.load_snapshot(requested_by)
+    await visibility.require_receipt(report.get("privacy_revisions"))
+    await visibility.require_reference_receipt(
+        requested_by, report.get("privacy_reference_receipt")
+    )
+    identifiers = report.get("evidence_conversation_ids")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise privacy.PrivacyHeld()
+    records = [{"conversation_id": identifier} for identifier in identifiers]
+    if len(await visibility.filter(records)) != len(records):
+        raise privacy.PrivacyHeld()
+    await visibility.require_receipt(report.get("privacy_revisions"))
+    return visibility
 
 
 def _progress(current: int, total: int, message: str) -> None:
@@ -211,8 +248,7 @@ async def apply_background_cleanup_job(requested_by: str, report_id: str) -> dic
     )
     if not report:
         raise ValueError("Background cleanup report not found")
-    if report.get("report_version") != REPORT_VERSION:
-        raise ValueError("Background cleanup report is stale; generate a new report")
+    visibility = await require_cleanup_report(report, requested_by)
     grouped: dict[str, list[dict]] = {}
     for change in report.get("high_changes") or []:
         grouped.setdefault(change["conversation_id"], []).append(change)
@@ -224,6 +260,9 @@ async def apply_background_cleanup_job(requested_by: str, report_id: str) -> dic
         if not doc:
             skipped += 1
             continue
+        if not await visibility.filter([doc]):
+            raise privacy.PrivacyHeld()
+        await visibility.assert_current()
         versions = doc.get("transcript_versions") or []
         active_id = doc.get("active_transcript_version")
         active = next(
@@ -264,16 +303,23 @@ async def apply_background_cleanup_job(requested_by: str, report_id: str) -> dic
         if not changed_here:
             skipped += 1
             continue
-        await Conversation.get_pymongo_collection().update_one(
-            {"_id": doc["_id"], "active_transcript_version": active_id},
-            {
-                "$push": {"transcript_versions": new_version},
-                "$set": {"active_transcript_version": new_version_id},
-            },
-        )
+        async with visibility.publication():
+            await visibility.assert_current()
+            result = await Conversation.get_pymongo_collection().update_one(
+                {"_id": doc["_id"], "active_transcript_version": active_id},
+                {
+                    "$push": {"transcript_versions": new_version},
+                    "$set": {"active_transcript_version": new_version_id},
+                },
+            )
+            await visibility.assert_current()
+        if not result.matched_count:
+            skipped += 1
+            continue
         updated += 1
         segments_changed += changed_here
         _progress(current, len(grouped), f"Applying cleanup {current}/{len(grouped)}")
+    await visibility.assert_current()
     return {
         "report_id": report_id,
         "conversations_updated": updated,

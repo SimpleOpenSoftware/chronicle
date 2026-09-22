@@ -6,6 +6,8 @@ import json
 from dataclasses import asdict, dataclass
 from uuid import UUID
 
+from redis.exceptions import WatchError
+
 from backend.services.interaction_modes.contracts import AudioInterval
 
 RETENTION_SECONDS = 5 * 60
@@ -62,8 +64,12 @@ class WakeActivationStore:
         await self.redis.zadd(key, {activation.encode(): activation.command_start_ms})
         await self.redis.expire(key, RETENTION_SECONDS)
 
-    async def claim(self, interval: AudioInterval) -> WakeActivation | None:
+    async def claim(
+        self, interval: AudioInterval, *, owner_id: str | None = None
+    ) -> WakeActivation | None:
         key = self._key(interval.audio_session_id, interval.capture_epoch)
+        if owner_id is not None:
+            return await self._claim_owned(interval, key, owner_id)
         candidates = await self.redis.zrangebyscore(key, "-inf", interval.end_ms)
         for encoded in candidates:
             activation = WakeActivation.decode(encoded)
@@ -77,3 +83,31 @@ class WakeActivationStore:
             ):
                 return activation
         return None
+
+    async def _claim_owned(self, interval, key, owner_id):
+        """Reserve and journal an acoustic activation atomically for retried work."""
+        owner_key = f"{key}:owner:{owner_id}"
+        while True:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key, owner_key)
+                    cached = await pipe.get(owner_key)
+                    if cached is not None:
+                        await pipe.unwatch()
+                        return WakeActivation.decode(cached)
+                    candidates = await pipe.zrangebyscore(key, "-inf", interval.end_ms)
+                    for encoded in candidates:
+                        activation = WakeActivation.decode(encoded)
+                        if (
+                            activation.command_start_ms >= interval.start_ms
+                            and activation.command_end_ms <= interval.end_ms
+                        ):
+                            pipe.multi()
+                            pipe.zrem(key, encoded)
+                            pipe.set(owner_key, encoded, ex=RETENTION_SECONDS)
+                            await pipe.execute()
+                            return activation
+                    await pipe.unwatch()
+                    return None
+                except WatchError:
+                    continue

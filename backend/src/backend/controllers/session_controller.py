@@ -9,7 +9,9 @@ This module manages Redis-based audio streaming sessions, including:
 
 import asyncio
 import logging
+import math
 import time
+from datetime import datetime, timezone
 
 from fastapi.responses import JSONResponse
 
@@ -20,6 +22,7 @@ from backend.controllers.queue_controller import (
     pending_work_owners,
     transcription_queue,
 )
+from backend.services import privacy
 from backend.services.audio_stream.durability import (
     AUDIO_PERSISTENCE_GROUP,
     delete_stream_if_durable,
@@ -90,6 +93,8 @@ def _jobs_drained(
 def _session_info_dict(view: SessionView, conversation_count: int) -> dict:
     """Shape a SessionView into the session-info response dict used by the API."""
     now = time.time()
+    started = view.started_at if math.isfinite(view.started_at) else None
+    last_chunk = view.last_chunk_at if math.isfinite(view.last_chunk_at) else None
     return {
         "session_id": view.session_id,
         "user_id": view.user_id,
@@ -100,10 +105,10 @@ def _session_info_dict(view: SessionView, conversation_count: int) -> dict:
         "websocket_connected": view.websocket_connected,
         "completion_reason": view.completion_reason,
         "chunks_published": view.chunks_published,
-        "started_at": view.started_at,
-        "last_chunk_at": view.last_chunk_at,
-        "age_seconds": now - view.started_at,
-        "idle_seconds": now - view.last_chunk_at,
+        "started_at": started,
+        "last_chunk_at": last_chunk,
+        "age_seconds": now - started if started is not None else None,
+        "idle_seconds": now - last_chunk if last_chunk is not None else None,
         "conversation_count": conversation_count,
         # Speech detection events
         "last_event": view.last_event,
@@ -115,7 +120,87 @@ def _session_info_dict(view: SessionView, conversation_count: int) -> dict:
     }
 
 
-async def get_streaming_status(request):
+def _redis_text(value):
+    return (
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    )
+
+
+async def stream_diagnostics(redis_client, stream_name):
+    """Read Redis metadata without returning first/last message payloads."""
+    info = await redis_client.xinfo_stream(stream_name)
+    groups = []
+    for group in await redis_client.xinfo_groups(stream_name):
+        name = _redis_text(group["name"])
+        consumers = [
+            {
+                "name": _redis_text(row["name"]),
+                "pending": int(row["pending"]),
+                "idle_ms": int(row["idle"]),
+            }
+            for row in await redis_client.xinfo_consumers(stream_name, name)
+        ]
+        groups.append(
+            {
+                "name": name,
+                "consumers": consumers,
+                "pending": max(
+                    int(group["pending"]), sum(row["pending"] for row in consumers)
+                ),
+                "last_delivered_id": _redis_text(group["last-delivered-id"]),
+            }
+        )
+    return {
+        "stream_length": int(info["length"]),
+        "first_entry_id": (
+            _redis_text(info["first-entry"][0]) if info["first-entry"] else None
+        ),
+        "last_entry_id": (
+            _redis_text(info["last-entry"][0]) if info["last-entry"] else None
+        ),
+        "consumer_groups": groups,
+        "total_pending": sum(group["pending"] for group in groups),
+    }
+
+
+async def _allowed_session_details(views, visibility):
+    """Check session diagnostics under the capture owner and canonical recording."""
+    references = {
+        view.active_conversation_id for view in views if view.active_conversation_id
+    }
+    allowed_recordings = {
+        row["conversation_id"]
+        for row in await visibility.filter(
+            [{"conversation_id": identifier} for identifier in references]
+        )
+    }
+    allowed = set()
+    for view in views:
+        if not view.user_id or not view.client_id or not view.started_at:
+            continue
+        if (
+            view.active_conversation_id
+            and view.active_conversation_id not in allowed_recordings
+        ):
+            continue
+        owner = str(view.user_id)
+        if owner not in visibility.snapshots:
+            visibility.snapshots[owner] = await privacy.load_snapshot(owner)
+        end = view.completed_at or max(view.last_chunk_at, time.time())
+        try:
+            permitted = visibility.snapshots[owner].permits(
+                view.client_id,
+                datetime.fromtimestamp(view.started_at, timezone.utc),
+                datetime.fromtimestamp(end, timezone.utc),
+            )
+        except (ValueError, TypeError, OverflowError):
+            permitted = False
+        if permitted:
+            allowed.add(view.session_id)
+    return allowed
+
+
+async def get_streaming_status(request, current_user, *, visibility=None):
     """Get status of active streaming sessions and Redis Streams health."""
     try:
         # Get Redis client from request.app.state (initialized during startup)
@@ -132,7 +217,14 @@ async def get_streaming_status(request):
         active_sessions = []
         completed_sessions_from_redis = []
 
-        views = [v async for v in store.iter_views() if not _is_uninitialized(v)]
+        visibility = visibility or privacy.ConversationPrivacyFilter()
+        views = [
+            v
+            async for v in store.iter_views()
+            if not _is_uninitialized(v)
+            and (current_user.is_superuser or v.user_id == str(current_user.user_id))
+        ]
+        allowed_details = await _allowed_session_details(views, visibility)
         newest_by_client = _newest_session_per_client(views)
 
         # One scan for the whole response, off the event loop. The registries do not
@@ -150,6 +242,14 @@ async def get_streaming_status(request):
         for view in views:
             conversation_count = await store.get_conversation_count(view.session_id)
             session_obj = _session_info_dict(view, conversation_count)
+            if view.session_id not in allowed_details:
+                session_obj.update(
+                    completion_reason="",
+                    last_event="",
+                    identified_speakers="",
+                    privacy_held=True,
+                    privacy_reason="Private or unscreened session details held",
+                )
 
             # Separate active and completed sessions
             # Check if all jobs are complete (including failed jobs)
@@ -205,196 +305,45 @@ async def get_streaming_status(request):
             stream_name = (
                 stream_key.decode() if isinstance(stream_key, bytes) else stream_key
             )
+            if (
+                not current_user.is_superuser
+                and stream_name.removeprefix("audio:stream:") not in session_by_id
+            ):
+                continue
             try:
-                # Check if stream exists
-                stream_info = await redis_client.execute_command(
-                    "XINFO", "STREAM", stream_name
+                stream_data = await stream_diagnostics(redis_client, stream_name)
+                last_entry_id = stream_data["last_entry_id"]
+                stream_age_seconds = (
+                    current_time - int(last_entry_id.split("-", 1)[0]) / 1000
+                    if last_entry_id
+                    else 0
                 )
-
-                # Parse stream info (returns flat list of key-value pairs)
-                info_dict = {}
-                for i in range(0, len(stream_info), 2):
-                    key = (
-                        stream_info[i].decode()
-                        if isinstance(stream_info[i], bytes)
-                        else str(stream_info[i])
-                    )
-                    value = stream_info[i + 1]
-
-                    # Skip complex binary structures like first-entry and last-entry
-                    # which contain message data that can't be JSON serialized
-                    if key in ["first-entry", "last-entry"]:
-                        # Just extract the message ID (first element)
-                        if isinstance(value, list) and len(value) > 0:
-                            msg_id = value[0]
-                            if isinstance(msg_id, bytes):
-                                msg_id = msg_id.decode()
-                            value = msg_id
-                        else:
-                            value = None
-                    elif isinstance(value, bytes):
-                        try:
-                            value = value.decode()
-                        except UnicodeDecodeError:
-                            # Binary data that can't be decoded, skip it
-                            value = "<binary>"
-
-                    info_dict[key] = value
-
-                # Calculate stream age from last entry (for determining if stream is stale)
-                stream_age_seconds = 0
-                last_entry_id = info_dict.get("last-entry")
-                if last_entry_id:
-                    try:
-                        # Redis Stream IDs format: "milliseconds-sequence"
-                        last_timestamp_ms = int(last_entry_id.split("-")[0])
-                        last_timestamp_s = last_timestamp_ms / 1000
-                        stream_age_seconds = current_time - last_timestamp_s
-                    except (ValueError, IndexError, AttributeError):
-                        stream_age_seconds = 0
-
-                # Stream suffix is the immutable recording session id.
                 session_id = stream_name.removeprefix("audio:stream:")
                 session_data = session_by_id.get(session_id, {})
-                client_id = session_data.get("client_id", "")
-
-                # Get session age from associated session (more meaningful than stream age)
-                session_age_seconds = 0
-                session_idle_seconds = 0
-                if session_data:
-                    session_age_seconds = session_data.get("age_seconds", 0)
-                    session_idle_seconds = session_data.get("idle_seconds", 0)
-
-                # Get consumer groups
-                groups = await redis_client.execute_command(
-                    "XINFO", "GROUPS", stream_name
+                stream_data.update(
+                    session_id=session_id,
+                    client_id=session_data.get("client_id", ""),
+                    session_age_seconds=session_data.get("age_seconds", 0),
+                    session_idle_seconds=session_data.get("idle_seconds", 0),
                 )
-
-                stream_data = {
-                    "stream_length": info_dict.get("length", 0),
-                    "first_entry_id": info_dict.get("first-entry"),
-                    "last_entry_id": last_entry_id,
-                    "session_age_seconds": session_age_seconds,  # Age since session started
-                    "session_idle_seconds": session_idle_seconds,  # Time since last audio chunk
-                    "session_id": session_id,
-                    "client_id": client_id,  # Include client_id for reference
-                    "consumer_groups": [],
-                }
-
-                # Track if stream has any active consumers
-                has_active_consumer = False
-                min_consumer_idle_ms = float("inf")
-
-                # Parse consumer groups
-                for group in groups:
-                    group_dict = {}
-                    for i in range(0, len(group), 2):
-                        key = (
-                            group[i].decode()
-                            if isinstance(group[i], bytes)
-                            else str(group[i])
-                        )
-                        value = group[i + 1]
-                        if isinstance(value, bytes):
-                            try:
-                                value = value.decode()
-                            except UnicodeDecodeError:
-                                value = "<binary>"
-                        group_dict[key] = value
-
-                    group_name = group_dict.get("name", "unknown")
-                    if isinstance(group_name, bytes):
-                        group_name = group_name.decode()
-
-                    # Get consumers for this group
-                    consumers = await redis_client.execute_command(
-                        "XINFO", "CONSUMERS", stream_name, group_name
-                    )
-                    consumer_list = []
-                    consumer_pending_total = 0
-
-                    for consumer in consumers:
-                        consumer_dict = {}
-                        for i in range(0, len(consumer), 2):
-                            key = (
-                                consumer[i].decode()
-                                if isinstance(consumer[i], bytes)
-                                else str(consumer[i])
-                            )
-                            value = consumer[i + 1]
-                            if isinstance(value, bytes):
-                                try:
-                                    value = value.decode()
-                                except UnicodeDecodeError:
-                                    value = "<binary>"
-                            consumer_dict[key] = value
-
-                        consumer_name = consumer_dict.get("name", "unknown")
-                        if isinstance(consumer_name, bytes):
-                            consumer_name = consumer_name.decode()
-
-                        consumer_pending = int(consumer_dict.get("pending", 0))
-                        consumer_idle_ms = int(consumer_dict.get("idle", 0))
-                        consumer_pending_total += consumer_pending
-
-                        # Track minimum idle time
-                        min_consumer_idle_ms = min(
-                            min_consumer_idle_ms, consumer_idle_ms
-                        )
-
-                        # Consumer is active if idle < 5 minutes (300000ms)
-                        if consumer_idle_ms < 300000:
-                            has_active_consumer = True
-
-                        consumer_list.append(
-                            {
-                                "name": consumer_name,
-                                "pending": consumer_pending,
-                                "idle_ms": consumer_idle_ms,
-                            }
-                        )
-
-                    # Get group-level pending count (may be 0 even if consumers have pending)
-                    try:
-                        pending = await redis_client.xpending(stream_name, group_name)
-                        group_pending_count = int(pending[0]) if pending else 0
-                    except Exception:
-                        group_pending_count = 0
-
-                    # Use the maximum of group-level pending or sum of consumer pending
-                    # (Sometimes group pending is 0 but consumers still have pending messages)
-                    effective_pending = max(group_pending_count, consumer_pending_total)
-
-                    stream_data["consumer_groups"].append(
-                        {
-                            "name": str(group_name),
-                            "consumers": consumer_list,
-                            "pending": int(effective_pending),
-                        }
-                    )
-
-                # Determine if stream is active or completed
-                # Active: has active consumers OR pending messages OR recent activity (< 5 min)
-                # Completed: no active consumers and idle > 5 minutes but < 1 hour
-                total_pending = sum(
-                    group["pending"] for group in stream_data["consumer_groups"]
+                has_active_consumer = any(
+                    consumer["idle_ms"] < 300000
+                    for group in stream_data["consumer_groups"]
+                    for consumer in group["consumers"]
                 )
-                is_active = (
+                if (
                     has_active_consumer
-                    or total_pending > 0
-                    or stream_age_seconds < 300  # Less than 5 minutes old
-                )
-
-                if is_active:
+                    or stream_data["total_pending"] > 0
+                    or stream_age_seconds < 300
+                ):
                     active_streams[stream_name] = stream_data
                 else:
-                    # Mark as completed (will be cleaned up when > 1 hour old)
                     stream_data["idle_seconds"] = stream_age_seconds
                     completed_streams[stream_name] = stream_data
 
             except Exception as e:
                 # Stream doesn't exist or error getting info
-                logger.debug(f"Error processing stream {stream_name}: {e}")
+                logger.debug("Error processing stream: %s", type(e).__name__)
                 continue
 
         # Get RQ queue stats - include all registries
@@ -425,6 +374,8 @@ async def get_streaming_status(request):
             },
         }
 
+        if any(session["session_id"] in allowed_details for session in active_sessions):
+            await visibility.assert_current()
         return {
             "active_sessions": active_sessions,
             "completed_sessions": completed_sessions_from_redis,
@@ -435,9 +386,11 @@ async def get_streaming_status(request):
             "timestamp": time.time(),
         }
 
+    except privacy.PrivacyHeld:
+        raise
     except Exception as e:
-        logger.error(f"Error getting streaming status: {e}", exc_info=True)
+        logger.error("Error getting streaming status: %s", type(e).__name__)
         return JSONResponse(
             status_code=500,
-            content={"error": f"Failed to get streaming status: {str(e)}"},
+            content={"error": "Failed to get streaming status"},
         )

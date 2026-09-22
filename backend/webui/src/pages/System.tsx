@@ -45,6 +45,8 @@ interface ServiceStatus {
   healthy: boolean
   message?: string
   status?: string
+  provider?: string
+  model?: string
 }
 
 export default function System() {
@@ -107,7 +109,8 @@ export default function System() {
   const readinessData = systemData?.readinessData ?? null
   const metricsData = systemData?.metricsData ?? null
   const configDiagnostics = systemData?.configDiagnostics ?? null
-  const activeClients = systemData?.activeClients ?? []
+  const activeClientCount = systemData?.activeClientCount ?? null
+  const unhealthyServices = Object.entries((healthData?.services ?? {}) as Record<string, ServiceStatus>).filter(([, status]) => !status.healthy)
   const error = systemError?.message ?? null
   const lastUpdated = dataUpdatedAt ? new Date(dataUpdatedAt) : null
 
@@ -204,24 +207,24 @@ export default function System() {
   const getStatusColor = (status: string) => {
     switch (status) {
       case 'healthy': return 'text-green-600'
-      case 'partial': return 'text-yellow-600'
+      case 'degraded': return 'text-yellow-600'
       default: return 'text-red-600'
     }
   }
 
   const getServiceDisplayName = (service: string) => {
     const displayNames: Record<string, string> = {
-      'mongodb': 'MONGODB',
-      'redis': 'REDIS & RQ WORKERS',
+      'mongodb': 'MongoDB',
+      'redis': 'Redis & RQ workers',
       'llm': 'LLM',
       'fast_llm': 'LLM (FAST)',
       'mem0': 'MEM0',
-      'memory_service': 'MEMORY SERVICE',
-      'speech_to_text': 'SPEECH TO TEXT (BATCH)',
-      'speech_to_text_streaming': 'SPEECH TO TEXT (STREAMING)',
-      'speaker_recognition': 'SPEAKER RECOGNITION'
+      'memory_service': 'Memory',
+      'speech_to_text': 'Batch transcription',
+      'speech_to_text_streaming': 'Streaming transcription',
+      'speaker_recognition': 'Speaker recognition'
     }
-    return displayNames[service] || service.replace('_', ' ').toUpperCase()
+    return displayNames[service] || service.replace(/_/g, ' ')
   }
 
 
@@ -296,7 +299,7 @@ export default function System() {
           )}
           {lastUpdated && (
             <span className="text-sm text-gray-600 dark:text-gray-400">
-              Last updated: {lastUpdated.toLocaleTimeString()}
+              Last updated: {lastUpdated.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
             </span>
           )}
           <Button
@@ -433,15 +436,23 @@ export default function System() {
             </div>
             <div className="flex items-center space-x-2">
               {healthData.status === 'healthy' && <CheckCircle className="h-6 w-6 text-green-500" />}
-              {healthData.status === 'partial' && <AlertCircle className="h-6 w-6 text-yellow-500" />}
-              {healthData.status === 'unhealthy' && <XCircle className="h-6 w-6 text-red-500" />}
+              {healthData.status === 'degraded' && <AlertCircle className="h-6 w-6 text-yellow-500" />}
+              {healthData.status === 'critical' && <XCircle className="h-6 w-6 text-red-500" />}
               <span className={`font-semibold ${getStatusColor(healthData.status)}`}>
                 {healthData.status.toUpperCase()}
               </span>
             </div>
           </div>
+          {unhealthyServices.length > 0 && (
+            <ul className="mt-3 space-y-1 text-sm text-gray-700 dark:text-gray-300">
+              {unhealthyServices.map(([service]) => (
+                <li key={service}><span className="font-medium">{getServiceDisplayName(service)}</span> is unavailable.</li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
+      {!loading && !healthData && <Alert tone="warning" className="mb-6">System health is unavailable. Refresh to retry.</Alert>}
 
       {/* Configuration Diagnostics (collapsible) */}
       {configDiagnostics && totalDiagnostics > 0 && (
@@ -547,17 +558,6 @@ export default function System() {
         </div>
       )}
 
-      {/* External Services (host service-manager agent) — lifecycle only.
-          Provider config + ASR context now live on the Settings page. */}
-      <div className="mb-6">
-        <ExternalServices isAdmin={isAdmin} mode="lifecycle" />
-      </div>
-
-      {/* Claude remote-control session (spawn Claude Code sessions from the phone) */}
-      <div className="mb-6">
-        <RemoteControl isAdmin={isAdmin} />
-      </div>
-
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Services Status */}
         {healthData?.services && (
@@ -576,25 +576,19 @@ export default function System() {
                     </span>
                   </div>
                   <div className="text-right">
-                    {status.message && (
-                      <span className="text-sm text-gray-600 dark:text-gray-400 block">
-                        {status.message}
-                      </span>
-                    )}
-                    {(status as any).status && (
-                      <span className="text-xs text-gray-500 dark:text-gray-500">
-                        {(status as any).status}
-                      </span>
-                    )}
-                    {(status as any).provider && (
-                      <span className="text-xs text-gray-500 dark:text-gray-400">
-                        ({(status as any).provider})
-                      </span>
-                    )}
-                    {(status as any).model && (
-                      <span className="text-xs text-gray-500 dark:text-gray-500 block">
-                        {(status as any).model}
-                      </span>
+                    <span className="block text-sm text-gray-600 dark:text-gray-400">
+                      {status.healthy ? 'Available' : 'Unavailable'}
+                    </span>
+                    {(status.message || status.status || status.provider || status.model) && (
+                      <details className="mt-1 text-xs text-gray-600 dark:text-gray-400">
+                        <summary className="cursor-pointer">Technical details</summary>
+                        <div className="mt-2 max-w-md space-y-1 break-words text-left">
+                          {status.message && <div>{status.message}</div>}
+                          {status.status && <div>Status: {status.status}</div>}
+                          {status.provider && <div>Provider: {status.provider}</div>}
+                          {status.model && <div>Model: {status.model}</div>}
+                        </div>
+                      </details>
                     )}
                     {service === 'redis' && (status as any).worker_count !== undefined && (
                       <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
@@ -615,12 +609,12 @@ export default function System() {
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4 flex items-center">
             <Users className="h-5 w-5 mr-2 text-blue-600" />
-            Active Clients ({activeClients.length})
+            Active Clients{activeClientCount !== null ? ` (${activeClientCount})` : ''}
           </h3>
           <p className="text-sm text-gray-600 dark:text-gray-400">
-            {activeClients.length > 0
-              ? `${activeClients.length} client${activeClients.length !== 1 ? 's' : ''} currently connected.`
-              : 'No clients currently connected.'}{' '}
+            {activeClientCount === null
+              ? (loading ? 'Checking connected clients…' : 'Connected-client count unavailable.')
+              : `${activeClientCount} client${activeClientCount !== 1 ? 's' : ''} currently connected.`}{' '}
             <Link to="/network" className="text-blue-600 dark:text-blue-400 hover:underline">
               Manage all devices on the Network page →
             </Link>
@@ -655,6 +649,17 @@ export default function System() {
             </div>
           </div>
         )}
+      </div>
+
+      {/* External Services (host service-manager agent) — lifecycle only.
+          Provider config + ASR context now live on the Settings page. */}
+      <div className="mb-6">
+        <ExternalServices isAdmin={isAdmin} mode="lifecycle" />
+      </div>
+
+      {/* Claude remote-control session (spawn Claude Code sessions from the phone) */}
+      <div className="mb-6">
+        <RemoteControl isAdmin={isAdmin} />
       </div>
 
       {/* Connect App */}

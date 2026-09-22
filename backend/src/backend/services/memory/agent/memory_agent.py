@@ -11,6 +11,7 @@ Runtime: reuses Chronicle's existing provider-agnostic tool-calling primitive
 The loop mirrors the one already in ``chat_service`` tool mode.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -22,9 +23,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import backend.services.chat_runs as chat_runs
+import backend.services.inference_artifacts as inference_artifacts_module
+import backend.services.privacy as privacy
 from backend.llm_client import async_chat_with_tools
 from backend.prompt_registry import get_prompt_registry
 
+from ..session_write import WriteSourcePermissions
 from ..telemetry import (
     current_memory_attempt,
     memory_span,
@@ -33,6 +38,7 @@ from ..telemetry import (
     text_payload,
 )
 from ..vault_templates import CONVERSATION_TEMPLATE, PERSON_TEMPLATE, TOPIC_TEMPLATE
+from .inspection_evidence import INSPECTION_TOOLS, InspectionEvidence
 from .vault_tools import (
     VAULT_SEARCH_TOOL_SCHEMAS,
     VAULT_TOOL_SCHEMAS,
@@ -91,13 +97,14 @@ question, find the notes that answer it and return their relevant content.
 - <Category>/<Name>.md — other kinds of things (Places, Projects, Books…); notes carry a
   `categories: ["[[<Category>]]"]` property. (Ignore the Templates/ folder — it's scaffolding.)
 
-# How to search (you have read-only tools: grep, glob, read_note)
+# How to search (you have read-only tools: grep, glob, read_note, read_slice)
 1. Turn the question into one or more `grep` regex patterns over note CONTENTS. Names,
    places, and facts appear verbatim, so search for the salient keyword(s) — e.g. for
    "what 3D printer does Partham use?" grep `3D|printer|Dosink`. Use alternation `a|b`
    and character classes `[Hh]` rather than one long literal phrase, which rarely matches.
 2. Use `glob` (e.g. `People/*.md`) to find a person/topic note by name.
-3. `read_note` the most relevant notes to confirm and gather context.
+3. `read_note` the most relevant notes to confirm and gather context. Use `read_slice`
+   for character ranges inside very long lines; its offsets start at the whole note.
 4. When you have the answer, STOP calling tools and reply with a concise answer that
    quotes the key facts verbatim and names the notes you used. Do not invent facts.
 {{vault_summary}}"""
@@ -237,6 +244,50 @@ Be precise and conservative: capture what was actually said, link things, avoid 
 )
 
 
+SESSION_SYSTEM_PROMPT_ID = "memory.session_system"
+DEFAULT_SESSION_SYSTEM_PROMPT = (
+    """You are Chronicle's session memory editor. Your task is to propose the
+smallest useful changes to a personal Markdown vault from a verified session account.
+Timeline is the activity record. There is NO required diary or source note.
+Never create or edit Conversations/ notes during session processing.
+
+Search relevant People/ and Topics/ notes first and read them before editing.
+Compare facts semantically: a repeated fact with new wording is not new knowledge.
+Use edit_note or edit_section for surgical changes. Create a Person or Topic only
+when durable new information warrants it. Routine playback, app usage, greetings,
+and generic work logs do not warrant notes. Do not create categories for a session.
+A dated Daily entry is optional only for a meaningful event worth retaining.
+Do not add episode indexes or lists of every source appearance.
+
+Every mutation MUST supply source_claim_ids from the supplied account and its
+source_episode_keys. Preserve attribution, uncertainty and approximate timing.
+Media dialogue is never the user's life. Unknown Speaker N is local to a capture,
+not a person identity. A question in the account is unresolved and cannot be saved
+as a fact. Use source event dates, never processing time, for historical statements.
+
+People and Topic notes accumulate durable information in ## About. Never add a
+dated activity log to About or Mentions. One fact belongs in one canonical note;
+link related notes rather than copying the fact into several places. Preserve
+existing frontmatter, created dates and later facts. Link names with [[wikilinks]].
+New notes must preserve these exact templates, including all sections and embeds:
+Person template:\n"""
+    + _for_prompt(PERSON_TEMPLATE)
+    + "\nTopic template:\n"
+    + _for_prompt(TOPIC_TEMPLATE)
+    + """\nCall verify_vault before finishing. It is correct to finish with no
+changes when the vault already knows the useful facts. Return a concise outcome.
+{{vault_summary}}"""
+)
+
+
+def write_system_prompt(record):
+    return (
+        (SESSION_SYSTEM_PROMPT_ID, DEFAULT_SESSION_SYSTEM_PROMPT)
+        if record == "session"
+        else (AGENT_SYSTEM_PROMPT_ID, DEFAULT_AGENT_SYSTEM_PROMPT)
+    )
+
+
 def day_note_path(local_date: str) -> str:
     """Vault-relative path of the note a ``record="day"`` write must produce."""
 
@@ -271,7 +322,7 @@ def forbidden_folders(record: str) -> tuple[str, ...]:
     which matches no conversation and shadows the note the conversation path writes.
     """
 
-    return ("Conversations",) if record == "day" else ()
+    return ("Conversations",) if record in {"day", "session"} else ()
 
 
 def immutable_sections(record: str) -> tuple[tuple[str, str], ...]:
@@ -282,7 +333,7 @@ def immutable_sections(record: str) -> tuple[tuple[str, str], ...]:
     never a second dated activity log under ``Mentions``.
     """
 
-    return (("People", "Mentions"),) if record == "day" else ()
+    return (("People", "Mentions"),) if record in {"day", "session"} else ()
 
 
 def allow_new_categories(record: str) -> bool:
@@ -293,7 +344,7 @@ def allow_new_categories(record: str) -> bool:
     single mentioned company or tool can reshape the whole vault stochastically.
     """
 
-    return record != "day"
+    return record not in {"day", "session"}
 
 
 _DAY_RECORD_REQUIREMENT = """\
@@ -309,7 +360,7 @@ the bounded episode summaries, entities, attributes, and role-labelled assertion
 - Update only the People, Topics, and other category notes the day touches, exactly as
   you would for a conversation: smallest edits, link profusely, never duplicate a fact
   the note already holds.
-- Every edit_note, edit_section, or write_note call MUST include source_episode_keys:
+- When episode_key values are supplied, every edit_note, edit_section, or write_note call MUST include source_episode_keys:
   the exact episode_key value(s) that support that mutation. Cite only episodes that
   support the durable fact being added. Chronicle records these links separately; do
   not write episode keys or provenance links into the Markdown note.
@@ -384,6 +435,24 @@ def build_write_task(
     """
 
     guidance_block = f"\n\n{_TEMPORAL_MEMORY_RULES}\n{guidance}"
+    if record == "session":
+        return (
+            f"Draft useful memory changes from this attributed session account.\n"
+            f"Event local date: {source_id}\nSource date: {date}\n"
+            "If the event date is unknown or undated, retain that uncertainty. Storage/upload timestamps are not event dates. Use processing time only for note creation/update metadata; qualify time-sensitive facts as reported in an undated recording, never as current or as of its upload date.\n"
+            "Inspect relevant accepted notes first. Do not repeat known facts.\n"
+            "There is no required Daily note or episode index. Keep routine activity "
+            "in Timeline. Write a concise Daily entry only for a meaningful event; "
+            "otherwise update supported durable facts or deliberately make no changes. "
+            "Do not modify existing Daily episode indexes or unrelated entries. "
+            "Each mutation must cite source_claim_ids (the account's claim_id values) "
+            "and source_episode_keys. A source withdrawal with no remaining claims "
+            "uses the correction instructions and source_episode_keys instead. Do not put evidence "
+            "IDs in note prose. Media and third-party claims retain their attribution. "
+            "Never invent an exact time from approximate session bounds. "
+            "Call verify_vault and finish explicitly, including when no change is useful.\n"
+            f"Session account:\n{transcript}{guidance_block}"
+        )
     if record == "day":
         return (
             f"Selected reviewed episodes to record; other episodes remain undecided.\n"
@@ -441,6 +510,22 @@ class MemoryAgentResult:
     # this — narrate the next tool call as prose instead of emitting it, ending the run.
     verified: bool = False
     source_episode_keys_by_path: Dict[str, List[str]] = field(default_factory=dict)
+    source_evidence_keys_by_path: Dict[str, List[str]] = field(default_factory=dict)
+    inference_artifacts: List[dict] = field(default_factory=list)
+
+
+def write_source_permissions(
+    record: str, transcript: str, permissions: WriteSourcePermissions | None
+) -> WriteSourcePermissions:
+    """Session provenance is supplied as data, never recovered from prompt prose."""
+    if record == "session":
+        if permissions is None:
+            raise ValueError("Session writing requires explicit source permissions")
+        return permissions
+    if permissions is not None:
+        raise ValueError("Explicit source permissions require a session write")
+    episode_keys = tuple(re.findall(r"(?m)^episode_key:\s*([^\s]+)\s*$", transcript))
+    return WriteSourcePermissions(episode_keys=episode_keys, claim_sources={})
 
 
 def _accumulate_response_usage(total: Dict[str, int], response: Any) -> None:
@@ -491,11 +576,57 @@ async def _get_prompt(prompt_id: str, default: str, vault_summary: str = "") -> 
     return f"{prompt.rstrip()}\n\n{UNTRUSTED_MEMORY_DATA_INVARIANT}"
 
 
+async def _retain_direct_session(
+    agent, transcript, conversation_id, *, permissions, error=""
+):
+
+    request_hash, artifact_hash = await asyncio.to_thread(
+        inference_artifacts_module.persist_inference_run,
+        operation="direct_session_memory",
+        request={
+            "conversation_id": conversation_id,
+            "transcript": transcript,
+            "source_permissions": (
+                {
+                    "episode_keys": list(permissions.episode_keys),
+                    "claim_sources": permissions.claim_sources,
+                }
+                if permissions is not None
+                else None
+            ),
+        },
+        stdout=json.dumps(agent._inference_exchanges, ensure_ascii=False),
+        stderr=error,
+        result=None if error else {"complete": True},
+        reusable=False,
+    )
+    return {
+        "operation": "direct_session_memory",
+        "request_hash": request_hash,
+        "artifact_hash": artifact_hash,
+    }
+
+
 def _trace_direct_write(func):
     """Wrap Direct's complete tool loop while native OpenAI spans remain children."""
 
     @wraps(func)
     async def wrapper(self, transcript: str, conversation_id: str, **kwargs):
+
+        owner = privacy.processing_owner(self.tools.root.name)
+        permissions = kwargs.get("source_permissions")
+        snapshot = await privacy.guard_payload(
+            owner,
+            {
+                "conversation_id": conversation_id,
+                "episode_keys": list(permissions.episode_keys) if permissions else [],
+            },
+        )
+        self.tools.privacy_excluded_paths = await privacy.quarantined_vault_paths(owner)
+        self._privacy_owner, self._privacy_snapshot = owner, snapshot
+        if self.tools.privacy_excluded_paths:
+            kwargs["vault_summary"] = ""
+        self._inference_exchanges = [] if kwargs.get("record") == "session" else None
         with memory_span(
             "direct_memory_agent",
             attributes={
@@ -520,7 +651,29 @@ def _trace_direct_write(func):
                     "guidance": text_payload(kwargs.get("guidance")),
                 },
             )
-            result = await func(self, transcript, conversation_id, **kwargs)
+            try:
+                result = await func(self, transcript, conversation_id, **kwargs)
+            except Exception as exc:
+                await privacy.assert_current(owner, snapshot)
+                if self._inference_exchanges is not None:
+                    await _retain_direct_session(
+                        self,
+                        transcript,
+                        conversation_id,
+                        permissions=kwargs.get("source_permissions"),
+                        error=str(exc),
+                    )
+                raise
+            await privacy.assert_current(owner, snapshot)
+            if self._inference_exchanges is not None:
+                result.inference_artifacts.append(
+                    await _retain_direct_session(
+                        self,
+                        transcript,
+                        conversation_id,
+                        permissions=kwargs.get("source_permissions"),
+                    )
+                )
             set_safe_span_attributes(
                 span,
                 {
@@ -589,6 +742,7 @@ class MemoryAgent:
         vault_summary: str = "",
         guidance: str = "",
         record: str = "conversation",
+        source_permissions: WriteSourcePermissions | None = None,
         images: Optional[List[Tuple[str, bytes]]] = None,
     ) -> MemoryAgentResult:
         date = date or datetime.now(timezone.utc).isoformat()
@@ -596,12 +750,13 @@ class MemoryAgent:
         self.tools.forbidden_folders = forbidden_folders(record)
         self.tools.immutable_sections = immutable_sections(record)
         self.tools.allow_new_categories = allow_new_categories(record)
-        episode_keys = set(re.findall(r"(?m)^episode_key:\s*([^\s]+)\s*$", transcript))
-        self.tools.allowed_source_episode_keys = episode_keys
-        self.tools.require_source_episode_keys = record == "day" and bool(episode_keys)
-        system_prompt = await _get_prompt(
-            AGENT_SYSTEM_PROMPT_ID, DEFAULT_AGENT_SYSTEM_PROMPT, vault_summary
+        permissions = write_source_permissions(record, transcript, source_permissions)
+        self.tools.allowed_source_episode_keys = set(permissions.episode_keys)
+        self.tools.source_claims = permissions.claim_sources
+        self.tools.require_source_episode_keys = record in {"day", "session"} and bool(
+            permissions.episode_keys
         )
+        system_prompt = await _get_prompt(*write_system_prompt(record), vault_summary)
 
         task = build_write_task(
             transcript,
@@ -638,12 +793,20 @@ class MemoryAgent:
         stalled_rounds = 0  # consecutive rounds that erred but landed no new edit
 
         for round_idx in range(MAX_TOOL_ROUNDS):
+
+            await privacy.guard_payload(
+                self._privacy_owner,
+                {"episode_keys": list(self.tools.allowed_source_episode_keys)},
+            )
+            await privacy.assert_current(self._privacy_owner, self._privacy_snapshot)
             response = await async_chat_with_tools(
                 messages,
                 tools=VAULT_TOOL_SCHEMAS,
                 operation=self.operation,
                 force_fallback=self.force_fallback,
+                request_trace=self._inference_exchanges,
             )
+            await privacy.assert_current(self._privacy_owner, self._privacy_snapshot)
             _accumulate_response_usage(usage, response)
             choice = response.choices[0]
             msg = choice.message
@@ -684,6 +847,10 @@ class MemoryAgent:
                         removed=list(self.tools.removed),
                         errors=errors,
                         usage=usage,
+                        source_evidence_keys_by_path={
+                            path: sorted(keys)
+                            for path, keys in self.tools.source_evidence_keys_by_path.items()
+                        },
                         source_episode_keys_by_path={
                             path: sorted(keys)
                             for path, keys in self.tools.source_episode_keys_by_path.items()
@@ -707,6 +874,10 @@ class MemoryAgent:
                     removed=list(self.tools.removed),
                     errors=errors,
                     usage=usage,
+                    source_evidence_keys_by_path={
+                        path: sorted(keys)
+                        for path, keys in self.tools.source_evidence_keys_by_path.items()
+                    },
                     source_episode_keys_by_path={
                         path: sorted(keys)
                         for path, keys in self.tools.source_episode_keys_by_path.items()
@@ -764,6 +935,10 @@ class MemoryAgent:
                         removed=list(self.tools.removed),
                         errors=errors,
                         usage=usage,
+                        source_evidence_keys_by_path={
+                            path: sorted(keys)
+                            for path, keys in self.tools.source_evidence_keys_by_path.items()
+                        },
                         source_episode_keys_by_path={
                             path: sorted(keys)
                             for path, keys in self.tools.source_episode_keys_by_path.items()
@@ -788,6 +963,10 @@ class MemoryAgent:
             removed=list(self.tools.removed),
             errors=errors,
             usage=usage,
+            source_evidence_keys_by_path={
+                path: sorted(keys)
+                for path, keys in self.tools.source_evidence_keys_by_path.items()
+            },
             source_episode_keys_by_path={
                 path: sorted(keys)
                 for path, keys in self.tools.source_episode_keys_by_path.items()
@@ -933,6 +1112,12 @@ async def _search_vault_impl(
     ):
         raise ValueError("memory search max_rounds must be a positive integer")
     tools = VaultTools(vault_root, user_id=user_id)
+
+    owner = privacy.processing_owner(user_id or Path(vault_root).name)
+    snapshot = await privacy.load_snapshot(owner)
+    tools.privacy_excluded_paths = await privacy.quarantined_vault_paths(owner)
+    if tools.privacy_excluded_paths:
+        vault_summary = ""
     system_prompt = await _get_prompt(
         "memory.search_system", SEARCH_SYSTEM_PROMPT, vault_summary
     )
@@ -940,7 +1125,8 @@ async def _search_vault_impl(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": query},
     ]
-    read_notes: Dict[str, str] = {}  # path -> content, in read order
+    inspection_evidence = InspectionEvidence()
+    read_notes = inspection_evidence.notes
     usage: Dict[str, int] = {}
     errors: List[str] = []
     warnings: List[str] = []
@@ -950,9 +1136,11 @@ async def _search_vault_impl(
 
     for round_idx in range(max_rounds):
         rounds_used = round_idx + 1
+        await privacy.assert_current(owner, snapshot)
         response = await async_chat_with_tools(
             messages, tools=VAULT_SEARCH_TOOL_SCHEMAS, operation=operation
         )
+        await privacy.assert_current(owner, snapshot)
         _accumulate_response_usage(usage, response)
         choice = response.choices[0]
         msg = choice.message
@@ -981,25 +1169,38 @@ async def _search_vault_impl(
         messages.append(msg.model_dump())
         remaining_tool_calls = max_tool_calls - tool_calls
         admitted_tool_calls = list(msg.tool_calls[:remaining_tool_calls])
+
         for tc in admitted_tool_calls:
-            tool_calls += 1
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            try:
-                result = tools.dispatch(name, args)
-                if name == "read_note" and not result.startswith("Error:"):
-                    read_notes[args.get("path", "?")] = result
-            except VaultToolError as e:
-                result = f"Error: {e}"
-                errors.append(f"{name}: {e}")
-            except Exception as e:  # noqa: BLE001
-                result = f"Error: {type(e).__name__}: {e}"
-                errors.append(f"{name}: {type(e).__name__}: {e}")
-                logger.exception("vault search tool %s crashed", name)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            async with chat_runs.run_step(
+                "tool",
+                tc.function.name,
+                {"id": tc.id, "arguments": tc.function.arguments},
+            ) as tool_step:
+                tool_calls += 1
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                try:
+                    result = tools.dispatch(name, args)
+                    if name in INSPECTION_TOOLS:
+                        inspection_evidence.record(
+                            name, args, result, path=tools.inspection_path(args["path"])
+                        )
+                except VaultToolError as e:
+                    result = f"Error: {e}"
+                    errors.append(f"{name}: {e}")
+                except Exception as e:  # noqa: BLE001
+                    result = f"Error: {type(e).__name__}: {e}"
+                    errors.append(f"{name}: {type(e).__name__}: {e}")
+                    logger.exception("vault search tool %s crashed", name)
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+                tool_step.output = {"effective_arguments": args, "result": result}
+                if result.startswith("Error:"):
+                    tool_step.status = "failed"
 
         if tool_calls >= max_tool_calls:
             warnings.append(
@@ -1024,11 +1225,13 @@ async def _search_vault_impl(
         },
     ]
     try:
+        await privacy.assert_current(owner, snapshot)
         response = await async_chat_with_tools(
             final_messages,
             tools=None,
             operation=operation,
         )
+        await privacy.assert_current(owner, snapshot)
         _accumulate_response_usage(usage, response)
         choice = response.choices[0]
         answer = (choice.message.content or "").strip()
@@ -1059,6 +1262,7 @@ async def _search_vault_impl(
         else:
             errors.append("final search synthesis returned no answer")
     except Exception as e:  # noqa: BLE001 - return an auditable search failure
+        await privacy.assert_current(owner, snapshot)
         # Provider exceptions may contain credential-bearing endpoint URLs or headers.
         # Preserve the failure type without copying arbitrary exception text into logs
         # or the retrieval manifest.

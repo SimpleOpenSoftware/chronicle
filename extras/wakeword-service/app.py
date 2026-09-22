@@ -34,6 +34,7 @@ from consumer import DETECTIONS_STREAM, GROUP_NAME, STREAM_PATTERN, WakeWordCons
 from detector import HermesDetector
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
+from loop_monitor import LoopMonitor
 from pydantic import BaseModel
 from samples import BUCKETS, PENDING, SampleStore
 
@@ -85,6 +86,8 @@ MAX_ARM_SECS = float(os.getenv("WAKEWORD_MAX_ARM_SECS", "15.0"))
 # transcription so self-diarizing ASR can't hallucinate a phantom command.
 MIN_COMMAND_SPEECH_SECS = float(os.getenv("WAKEWORD_MIN_COMMAND_SPEECH_SECS", "0.3"))
 SERVICE_PORT = int(os.getenv("WAKEWORD_SERVICE_PORT", "8770"))
+EVENT_LOOP_STALL_SECONDS = float(os.getenv("EVENT_LOOP_STALL_SECONDS", "1.0"))
+EVENT_LOOP_HEALTH_LAG_MS = float(os.getenv("EVENT_LOOP_HEALTH_LAG_MS", "100"))
 # Root for the data-collection clip store (mounted volume in docker-compose).
 DATA_DIR = os.getenv("WAKEWORD_DATA_DIR", "/app/data/samples")
 # "Prime + say it" capture tuning (data collection). Hard upper bound of 10 s
@@ -321,6 +324,14 @@ async def lifespan(app: FastAPI):
     app.state.active_turn_consumer = active_turn_consumer
     active_turn_task = asyncio.create_task(active_turn_consumer.start())
     app.state.active_turn_task = active_turn_task
+    loop_monitor = LoopMonitor(
+        "wakeword-service",
+        redis_url=REDIS_URL,
+        stall_seconds=EVENT_LOOP_STALL_SECONDS,
+    )
+    app.state.loop_monitor = loop_monitor
+    loop_monitor_task = asyncio.create_task(loop_monitor.run())
+    app.state.loop_monitor_task = loop_monitor_task
     logger.info(
         f"Wake-word service ready (words={', '.join(WAKEWORDS)}, group={GROUP_NAME})"
     )
@@ -332,12 +343,17 @@ async def lifespan(app: FastAPI):
         await active_turn_consumer.stop()
         consumer_task.cancel()
         active_turn_task.cancel()
+        loop_monitor_task.cancel()
         try:
             await consumer_task
         except asyncio.CancelledError:
             pass
         try:
             await active_turn_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await loop_monitor_task
         except asyncio.CancelledError:
             pass
 
@@ -392,7 +408,7 @@ def _wakeword_summaries() -> list[dict]:
 
 @app.get("/health")
 async def health(response: Response):
-    """Liveness of the actual work loop, not just the HTTP server.
+    """Liveness, scheduling delay, and real-time consumer progress.
 
     The consumer runs as a background task. If it dies (e.g. an unrecoverable
     error in the discovery loop), uvicorn keeps serving requests — so reporting
@@ -418,16 +434,47 @@ async def health(response: Response):
         and active_turn_task is not None
         and not active_turn_task.done()
     )
-    status_str = "ok" if consumer_alive and active_turn_alive else "unhealthy"
+    wake_consumer_health = consumer.health() if consumer is not None else None
+    active_turn_health = (
+        active_turn_consumer.health() if active_turn_consumer is not None else None
+    )
+    loop_monitor: LoopMonitor | None = getattr(app.state, "loop_monitor", None)
+    loop_monitor_task: asyncio.Task | None = getattr(
+        app.state, "loop_monitor_task", None
+    )
+    loop_monitor_alive = bool(
+        loop_monitor is not None
+        and loop_monitor_task is not None
+        and not loop_monitor_task.done()
+    )
+    loop_health = loop_monitor.stats() if loop_monitor is not None else None
+    loop_p95_ms = loop_health.get("lag_p95_ms") if loop_health else None
+    loop_responsive = bool(
+        loop_monitor_alive
+        and (loop_p95_ms is None or loop_p95_ms <= EVENT_LOOP_HEALTH_LAG_MS)
+    )
+    healthy = bool(
+        consumer_alive
+        and wake_consumer_health
+        and wake_consumer_health.get("healthy", False)
+        and active_turn_alive
+        and active_turn_health
+        and active_turn_health.get("healthy", False)
+        and loop_responsive
+    )
+    status_str = "ok" if healthy else "unhealthy"
     if status_str != "ok":
         response.status_code = 503
     return {
         "status": status_str,
         "consumer_alive": consumer_alive,
+        "wake_consumer": wake_consumer_health,
         "active_turn_consumer_alive": active_turn_alive,
-        "active_turn_consumer": (
-            active_turn_consumer.health() if active_turn_consumer else None
-        ),
+        "active_turn_consumer": active_turn_health,
+        "loop_monitor_alive": loop_monitor_alive,
+        "loop_responsive": loop_responsive,
+        "loop_health_lag_threshold_ms": EVENT_LOOP_HEALTH_LAG_MS,
+        "event_loop": loop_health,
         "wakewords": _wakeword_summaries(),
         "redis_url": REDIS_URL,
         "consumer_group": GROUP_NAME,

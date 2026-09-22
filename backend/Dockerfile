@@ -1,4 +1,4 @@
-# Pi 0.83 requires Node >=22.19. Keep the runtime version explicit instead of
+# Pi 0.85 requires Node >=22.19. Keep the runtime version explicit instead of
 # inheriting whichever Node happens to be present in a Python base image.
 ARG NODE_VERSION=22.19.0
 
@@ -74,10 +74,10 @@ RUN case "${TARGETARCH:-amd64}" in \
 # Pi CLI fetcher - local/OpenAI-compatible memory-agent backend
 # ============================================
 # Install once, then copy only Node and the self-contained global package into both
-# final stages. Pi 0.83.0 declares Node >=22.19.0. It does not need an auth volume for
+# final stages. Pi 0.85.1 declares Node >=22.19.0. It does not need an auth volume for
 # Chronicle: the runtime writes an ephemeral models.json for the resolved model.
 FROM node:${NODE_VERSION}-bookworm-slim AS pi-fetcher
-ARG PI_VERSION=0.83.0
+ARG PI_VERSION=0.85.1
 RUN npm install --global --prefix /opt/pi --omit=dev --ignore-scripts --no-audit --no-fund \
       "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force

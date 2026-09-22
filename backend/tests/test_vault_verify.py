@@ -580,7 +580,7 @@ def test_read_note_windows_a_long_note_instead_of_returning_all_of_it(tmp_path):
     first = tools.read_note("Daily/2026-08-06.md")
 
     assert "line 0" in first and "line 4999" not in first
-    assert "of 5000]" in first
+    assert "of 5000" in first
     assert len(first) < 8_000 + 500
 
     later = tools.read_note("Daily/2026-08-06.md", offset=4990)
@@ -598,8 +598,8 @@ def test_read_note_can_page_through_one_very_long_line(tmp_path):
     tools = VaultTools(tmp_path)
 
     first = tools.read_note("Topics/Long Line.md")
-    second = tools.read_note("Topics/Long Line.md", char_offset=8_000)
-    final = tools.read_note("Topics/Long Line.md", char_offset=16_000)
+    second = tools.read_slice("Topics/Long Line.md", char_offset=8_000, max_chars=8_000)
+    final = tools.read_slice("Topics/Long Line.md", char_offset=16_000, max_chars=8_000)
 
     assert "char_offset=8000" in first
     assert "char_offset=16000" in second

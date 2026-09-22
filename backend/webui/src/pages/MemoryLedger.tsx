@@ -138,31 +138,18 @@ function LedgerRow({ entry }: { entry: MemoryAuditEntry }) {
           <span className="flex-shrink-0 hidden md:inline text-xs text-gray-400 dark:text-gray-500">{formatBytes(entry.after_bytes)}</span>
         )}
 
-        {entry.conversation_id && (
-          <Link
-            to={`/recordings/${entry.conversation_id}`}
-            onClick={e => e.stopPropagation()}
-            className="flex-shrink-0 hidden md:inline-flex items-center gap-0.5 text-xs text-blue-600 hover:underline dark:text-blue-400"
-            title="Open source conversation"
-          >
-            conversation <ExternalLink className="h-3 w-3" />
-          </Link>
-        )}
-
-        {sourceEpisodeKeys.length > 0 && (
-          <Link
-            to={`/timeline/key/${encodeURIComponent(sourceEpisodeKeys[0])}`}
-            onClick={e => e.stopPropagation()}
-            className="flex-shrink-0 hidden md:inline-flex items-center gap-0.5 text-xs text-blue-600 hover:underline dark:text-blue-400"
-            title={sourceEpisodeKeys.length === 1 ? 'Open source episode' : `Open first of ${sourceEpisodeKeys.length} source episodes`}
-          >
-            {sourceEpisodeKeys.length === 1 ? 'episode' : `${sourceEpisodeKeys.length} episodes`} <ExternalLink className="h-3 w-3" />
-          </Link>
-        )}
-
         <span className="flex-shrink-0 w-40 text-right text-xs text-gray-500 dark:text-gray-400">{formatTime(entry.created_at)}</span>
       </button>
 
+      {(entry.conversation_id || sourceEpisodeKeys.length > 0) && (
+        <details className="px-3 pb-2 text-xs text-gray-600 dark:text-gray-300">
+          <summary className="cursor-pointer">Sources · {[entry.conversation_id ? '1 recording' : '', sourceEpisodeKeys.length ? `${sourceEpisodeKeys.length} episode${sourceEpisodeKeys.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</summary>
+          <div className="mt-2 flex flex-wrap gap-3">
+            {entry.conversation_id && <Link to={`/recordings/${entry.conversation_id}`} className="inline-flex items-center gap-1 text-[var(--tape-focus)] hover:underline">Recording <ExternalLink className="h-3 w-3" /></Link>}
+            {sourceEpisodeKeys.map((key, index) => <Link key={key} to={`/timeline/key/${encodeURIComponent(key)}`} className="inline-flex items-center gap-1 text-[var(--tape-focus)] hover:underline">Episode {index + 1} <ExternalLink className="h-3 w-3" /></Link>)}
+          </div>
+        </details>
+      )}
       {open && expandable && <DiffView entryId={entry.id} />}
     </div>
   )
@@ -178,7 +165,7 @@ function SummaryStrip({ entries }: { entries: MemoryAuditEntry[] }) {
   }, [entries])
 
   const cards: { label: string; value: number }[] = [
-    { label: 'Total changes', value: entries.length },
+    { label: 'Loaded changes', value: entries.length },
     { label: 'AI extraction', value: counts.extraction },
     { label: 'Memory agent', value: counts.agent },
     { label: 'Reprocess', value: counts.reprocess },
@@ -218,7 +205,7 @@ export default function MemoryLedger() {
         </div>
         <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
           {view === 'review'
-            ? 'Review each day in order before selected memory changes reach the vault.'
+            ? 'Review proposed changes before they reach your memory vault.'
             : 'Inspect the durable history of changes to the memory vault.'}
         </p>
       </header>
@@ -315,12 +302,13 @@ function ChangeHistory() {
                   : 'bg-white text-gray-600 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
               }`}
             >
-              {m === 'timeline' ? 'Timeline' : 'By note'}
+              {m === 'timeline' ? 'Chronological' : 'By note'}
             </button>
           ))}
         </div>
 
         <select
+          aria-label="Change source"
           value={sourceFilter}
           onChange={e => setSourceFilter(e.target.value as SourceKind | 'all')}
           className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
@@ -329,6 +317,7 @@ function ChangeHistory() {
         </select>
 
         <select
+          aria-label="Change operation"
           value={operationFilter}
           onChange={e => setOperationFilter(e.target.value)}
           className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
@@ -347,6 +336,7 @@ function ChangeHistory() {
         />
 
         <select
+          aria-label="History window"
           value={limit}
           onChange={e => setLimit(Number(e.target.value))}
           className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
@@ -365,14 +355,15 @@ function ChangeHistory() {
         )}
       </div>
 
+      {!isLoading && !error && <p className="mb-3 text-xs text-gray-500 dark:text-gray-400">Showing {filtered.length} of {entries.length} loaded changes. Filters apply to the latest {limit} changes.</p>}
       {/* List */}
       {isLoading ? (
         <div className="flex items-center justify-center h-40">
           <div className="h-8 w-8 animate-spin rounded-full border-b-2 border-blue-600" />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : error ? null : filtered.length === 0 ? (
         <div className="rounded-lg border border-dashed border-gray-300 p-10 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
-          No vault changes recorded {entries.length > 0 ? 'for the current filters' : 'yet'}.
+          {entries.length > 0 ? 'No loaded changes match these filters.' : 'No vault changes were returned.'}
         </div>
       ) : viewMode === 'timeline' ? (
         <div className="space-y-2">

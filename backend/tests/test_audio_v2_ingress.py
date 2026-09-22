@@ -30,6 +30,7 @@ def _packet(delivery_class=audio_pb2.DELIVERY_CLASS_LIVE):
         sequence=12,
         captured_at=captured_at,
         monotonic_offset_us=240_000,
+        device_monotonic_timestamp_us=900_240_000,
         delivery_class=delivery_class,
         opus_payload=b"raw-opus",
     )
@@ -119,6 +120,10 @@ async def test_v2_opus_decodes_once_then_crosses_realtime_and_durable_seams(
         canonical_sequence=7,
     )
 
+    assert (
+        streams.publish_frame.await_args.args[0].frame.device_monotonic_timestamp_us
+        == 900_240_000
+    )
     assert next_sequence == 8
     assert streams.publish_frame.await_args.args[0].WhichOneof("event") == "frame"
     assert streams.publish_frame.await_args.args[0].frame.sequence == 7
@@ -140,12 +145,15 @@ async def test_recovered_packet_enters_only_typed_durable_stream(monkeypatch):
     )
 
     streams = SimpleNamespace(publish_frame=AsyncMock())
+    recovered = _packet(audio_pb2.DELIVERY_CLASS_RECOVERED)
+    recovered.monotonic_offset_us = 0
     await audio_v2_controller.ingest_capture_packet(
-        packet=_packet(audio_pb2.DELIVERY_CLASS_RECOVERED),
+        packet=recovered,
         client_state=state,
         normalizer=Decoder(),
         v2_streams=streams,
-        canonical_sequence=0,
+        canonical_sequence=1,
+        previous_monotonic_offset_us=0,
     )
 
     streams.publish_frame.assert_awaited_once()
@@ -210,6 +218,41 @@ async def test_v2_60_ms_packet_publishes_three_contiguous_canonical_frames(
         280_000,
     ]
     assert [frame.captured_at.nanos for frame in frames] == [0, 20_000_000, 40_000_000]
+
+
+async def test_live_ingress_rejects_a_clock_collapsed_after_the_first_frame(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        audio_v2_controller,
+        "_decode_opus_frames",
+        AsyncMock(return_value=(b"\x00\x00" * 320,)),
+    )
+    state = SimpleNamespace(
+        stream_session_id="capture-1",
+        voice_session_id="voice-1",
+        capture_epoch=9,
+        data_purpose="normal_capture",
+        client_id="client-1",
+    )
+    streams = SimpleNamespace(publish_frame=AsyncMock())
+    collapsed = _packet()
+    collapsed.sequence = 1
+    collapsed.monotonic_offset_us = 0
+
+    with pytest.raises(
+        AudioProtocolV2Error, match="live capture clock did not advance"
+    ):
+        await audio_v2_controller.ingest_capture_packet(
+            packet=collapsed,
+            client_state=state,
+            normalizer=Decoder(),
+            v2_streams=streams,
+            canonical_sequence=1,
+            previous_monotonic_offset_us=0,
+        )
+
+    streams.publish_frame.assert_not_awaited()
 
 
 async def test_protocol_rejection_marks_the_capture_failed(monkeypatch):

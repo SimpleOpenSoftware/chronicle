@@ -6,6 +6,7 @@ import pytest
 
 from backend.controllers import data_audit_controller
 from backend.models.conversation import Conversation
+from backend.services import privacy
 
 
 class _Cursor:
@@ -33,14 +34,30 @@ class _Collection:
         if call == 2:
             return _Cursor(
                 [
-                    {"external_source_id": "dataset-new:clip-2"},
-                    {"external_source_id": "dataset-new:clip-1"},
-                    {"external_source_id": "dataset-old:clip-1"},
+                    {
+                        "external_source_id": "dataset-new:clip-2",
+                        "conversation_id": "dataset-2",
+                    },
+                    {
+                        "external_source_id": "dataset-new:clip-1",
+                        "conversation_id": "dataset-1",
+                    },
+                    {
+                        "external_source_id": "dataset-old:clip-1",
+                        "conversation_id": "dataset-3",
+                    },
                 ]
             )
         if call == 1:
             return _Cursor(self.listing_docs)
         return _Cursor([])
+
+
+async def _seed_canonical(collection):
+    rows = collection.listing_docs + [
+        {"conversation_id": f"dataset-{i}", "user_id": "user-1"} for i in range(1, 4)
+    ]
+    await privacy.database().conversations.insert_many(rows)
 
 
 def _conversation(conversation_id, labels):
@@ -71,6 +88,7 @@ def _conversation(conversation_id, labels):
 async def test_list_for_audit_scopes_and_lists_annotation_datasets(monkeypatch):
     collection = _Collection()
     monkeypatch.setattr(Conversation, "get_pymongo_collection", lambda: collection)
+    await _seed_canonical(collection)
     user = SimpleNamespace(is_superuser=False, user_id="user-1")
 
     result = await data_audit_controller.list_for_audit(
@@ -98,6 +116,7 @@ async def test_unknown_placeholders_are_one_filter_facet_not_global_identities(
         ]
     )
     monkeypatch.setattr(Conversation, "get_pymongo_collection", lambda: collection)
+    await _seed_canonical(collection)
     user = SimpleNamespace(is_superuser=False, user_id="user-1")
 
     result = await data_audit_controller.list_for_audit(user)
@@ -119,6 +138,7 @@ async def test_unknown_filter_includes_all_local_placeholders_and_combines_with_
         ]
     )
     monkeypatch.setattr(Conversation, "get_pymongo_collection", lambda: collection)
+    await _seed_canonical(collection)
     user = SimpleNamespace(is_superuser=False, user_id="user-1")
 
     result = await data_audit_controller.list_for_audit(
@@ -141,6 +161,7 @@ async def test_unknown_filter_excludes_every_placeholder_variant(monkeypatch):
         ]
     )
     monkeypatch.setattr(Conversation, "get_pymongo_collection", lambda: collection)
+    await _seed_canonical(collection)
     user = SimpleNamespace(is_superuser=False, user_id="user-1")
 
     result = await data_audit_controller.list_for_audit(

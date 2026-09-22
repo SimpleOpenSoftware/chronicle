@@ -12,6 +12,7 @@ does not support custom headers.
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -20,6 +21,8 @@ from fastapi.responses import StreamingResponse
 from backend.auth import get_user_from_token_param
 from backend.redis_factory import create_async_redis
 from backend.server import shutdown_requested
+from backend.services import privacy
+from backend.services.queue_privacy import QueuePrivacyFilter
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +54,32 @@ async def _sse_generator(user_id: str):
                 if message and message["type"] == "message":
                     payload = json.loads(message["data"])
                     event_type = payload.get("event", "message")
-                    event_data = json.dumps(payload.get("data", {}))
+                    if not isinstance(event_type, str) or not re.fullmatch(
+                        r"[A-Za-z0-9_.:-]{1,100}", event_type
+                    ):
+                        event_type = "message"
+                    try:
+                        row = (
+                            await QueuePrivacyFilter().project(
+                                [
+                                    {
+                                        "user_id": user_id,
+                                        "event": event_type,
+                                        "data": payload.get("data", {}),
+                                    }
+                                ],
+                                default_owner=user_id,
+                                event=True,
+                            )
+                        )[0]
+                        data = row["data"]
+                        if row.get("privacy_held"):
+                            data = {"privacy_held": True}
+                    except privacy.PrivacyHeld:
+                        # A changed policy cannot expose this payload or terminate
+                        # the notification stream. The next message gets a fresh snapshot.
+                        data = {"privacy_held": True}
+                    event_data = json.dumps(data)
                     yield f"event: {event_type}\ndata: {event_data}\n\n"
 
             except asyncio.TimeoutError:
@@ -60,8 +88,8 @@ async def _sse_generator(user_id: str):
 
     except asyncio.CancelledError:
         logger.info("SSE stream cancelled for user %s", user_id[:12])
-    except Exception:
-        logger.warning("SSE stream error for user %s", user_id[:12], exc_info=True)
+    except Exception as exc:
+        logger.warning("SSE stream error: %s", type(exc).__name__)
     finally:
         await pubsub.unsubscribe(channel)
         await pubsub.aclose()

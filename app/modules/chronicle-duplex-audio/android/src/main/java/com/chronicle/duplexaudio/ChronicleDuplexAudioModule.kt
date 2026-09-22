@@ -3,7 +3,7 @@ package com.chronicle.duplexaudio
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AcousticEchoCanceler
+import android.media.audiofx.AcousticEchoCanceler
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -15,7 +15,7 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaRecorder
-import android.media.NoiseSuppressor
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.SystemClock
 import android.util.Base64
@@ -25,6 +25,10 @@ import androidx.core.os.bundleOf
 import expo.modules.kotlin.exception.CodedException
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -48,6 +52,15 @@ class ChronicleDuplexAudioModule : Module() {
 
   @Volatile
   private var currentResponse: EpochResponse? = null
+  private class PlaybackStream(val binding: EpochResponse, var skip: Int) {
+    val packets = ArrayBlockingQueue<ByteArray>(100)
+    val total = AtomicLong(-1)
+    var sequence = 0
+    @Volatile var rendered = 0L
+    @Volatile var decoded = 0L
+  }
+  @Volatile private var currentStream: PlaybackStream? = null
+
 
   override fun definition() = ModuleDefinition {
     Name("ChronicleDuplexAudio")
@@ -69,9 +82,9 @@ class ChronicleDuplexAudioModule : Module() {
       capabilities()
     }
 
-    AsyncFunction("scheduleResponse") { response: Map<String, Any> ->
-      schedule(response)
-    }
+    AsyncFunction("beginResponse") { response: Map<String, Any> -> beginResponse(response) }
+    AsyncFunction("appendResponse") { packet: Map<String, Any> -> appendResponse(packet) }
+    AsyncFunction("finishResponse") { response: Map<String, Any> -> finishResponse(response) }
 
     AsyncFunction("cancelResponse") { responseId: String, generation: Int ->
       val current = currentResponse
@@ -193,11 +206,12 @@ class ChronicleDuplexAudioModule : Module() {
       val count = activeRecorder.read(frame, 0, frame.size, AudioRecord.READ_BLOCKING)
       if (count <= 0 || captureSuppressed) continue
       val durationMs = count.toDouble() / (16_000 * 2) * 1_000
+      val capturedUs = SystemClock.elapsedRealtimeNanos() / 1_000 - (durationMs * 1_000).toLong()
       val inputIndex = encoder.dequeueInputBuffer(10_000)
       if (inputIndex >= 0) {
         encoder.getInputBuffer(inputIndex)?.apply { clear(); put(frame, 0, count) }
         encoder.queueInputBuffer(
-          inputIndex, 0, count, SystemClock.elapsedRealtimeNanos() / 1_000, 0
+          inputIndex, 0, count, capturedUs, 0
         )
       }
       while (true) {
@@ -214,11 +228,13 @@ class ChronicleDuplexAudioModule : Module() {
             "onOpusFrame",
             bundleOf(
               "captureEpoch" to epoch,
-              "capturedAtMs" to System.currentTimeMillis().toDouble() - durationMs,
-              "monotonicTimestampMs" to SystemClock.elapsedRealtime().toDouble() - durationMs,
+              "capturedAtMs" to System.currentTimeMillis().toDouble()
+                - (SystemClock.elapsedRealtime().toDouble() - outputInfo.presentationTimeUs / 1_000.0),
+              "monotonicTimestampMs" to outputInfo.presentationTimeUs / 1_000.0,
               "sampleRate" to 16_000,
               "channels" to 1,
               "frameDurationMs" to durationMs,
+              "audioLevel" to DuplexAudioPolicy.audioLevel(frame, count),
               "opusBase64" to Base64.encodeToString(packet, Base64.NO_WRAP),
             ),
           )
@@ -228,121 +244,201 @@ class ChronicleDuplexAudioModule : Module() {
     }
   }
 
-  private fun schedule(response: Map<String, Any>) {
-    val responseId = response["responseId"] as? String
-      ?: throw CodedException("decode_failed", "responseId is required", null)
-    val generation = (response["generation"] as? Number)?.toInt()
-      ?: throw CodedException("decode_failed", "generation is required", null)
-    val epoch = (response["captureEpoch"] as? Number)?.toInt()
-    if (epoch != captureEpoch) {
-      throw CodedException("decode_failed", "stale capture epoch", null)
-    }
-    val encoded = response["opusPacketsBase64"] as? List<*>
-      ?: throw CodedException("decode_failed", "opusPacketsBase64 is required", null)
-    val packets = encoded.map {
-      val value = it as? String
-        ?: throw CodedException("decode_failed", "Opus packet must be base64", null)
-      Base64.decode(value, Base64.DEFAULT)
-    }
-    if (packets.isEmpty() || packets.any { it.isEmpty() }) {
-      throw CodedException("decode_failed", "Opus response is empty", null)
-    }
-    val activePlayer = player
-      ?: throw CodedException("playback_unavailable", "AudioTrack unavailable", null)
+  @Synchronized private fun beginResponse(response: Map<String, Any>) {
+    val id = response["responseId"] as? String ?: error("Missing response identity")
+    val generation = (response["generation"] as? Number)?.toInt() ?: error("Missing generation")
+    val epoch = (response["captureEpoch"] as? Number)?.toInt() ?: error("Missing epoch")
+    val skip = (response["preSkipSamples"] as? Number)?.toInt() ?: error("Missing pre-skip")
+    require(id.isNotEmpty() && epoch == captureEpoch && skip in 0..48_000)
+    val activePlayer = player ?: error("AudioTrack unavailable")
     cancelCurrent(null)
-    val binding = EpochResponse(responseId, generation, epoch)
-    currentResponse = binding
+    val stream = PlaybackStream(EpochResponse(id, generation, epoch), skip)
+    currentResponse = stream.binding
+    currentStream = stream
     captureSuppressed = capabilities()["mode"] == "duplex_half"
+    activePlayer.pause()
+    activePlayer.flush()
     activePlayer.play()
-    emitPlayback(responseId, generation, "started", null)
-    playbackExecutor.execute {
-      playOpusPackets(packets, activePlayer, binding)
-    }
+    playbackExecutor.execute { playOpusStream(stream, activePlayer) }
   }
 
-  private fun playOpusPackets(packets: List<ByteArray>, activePlayer: AudioTrack, binding: EpochResponse) {
-    val decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+  private fun requireStream(value: Map<String, Any>): PlaybackStream {
+    val stream = currentStream ?: error("No active playback")
+    require(value["responseId"] == stream.binding.id &&
+      (value["generation"] as? Number)?.toInt() == stream.binding.generation &&
+      (value["captureEpoch"] as? Number)?.toInt() == stream.binding.captureEpoch)
+    return stream
+  }
+
+  @Synchronized private fun appendResponse(packet: Map<String, Any>) {
+    val stream = requireStream(packet)
+    require(stream.total.get() < 0 && (packet["sequence"] as? Number)?.toInt() == stream.sequence)
+    val bytes = Base64.decode(packet["opusBase64"] as? String ?: error("Missing Opus packet"), Base64.DEFAULT)
+    require(bytes.size in 1..4096)
+    require(stream.packets.offer(bytes)) { "Playback queue exceeded two seconds" }
+    stream.sequence += 1
+  }
+
+  @Synchronized private fun finishResponse(response: Map<String, Any>) {
+    val stream = requireStream(response)
+    val total = (response["totalSamples"] as? Number)?.toLong() ?: error("Missing playback total")
+    require(total >= 0 && stream.total.compareAndSet(-1, total))
+  }
+
+  private fun playOpusStream(stream: PlaybackStream, activePlayer: AudioTrack) {
+    val binding = stream.binding
+    var ownedDecoder: MediaCodec? = null
     try {
-      decoder.configure(
-        MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 24_000, 1),
-        null,
-        null,
-        0,
-      )
+      val decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+      ownedDecoder = decoder
+      val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 24_000, 1)
+      format.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+      val head = ByteBuffer.allocate(19).order(ByteOrder.LITTLE_ENDIAN)
+      head.put("OpusHead".toByteArray(Charsets.US_ASCII)).put(1.toByte()).put(1.toByte())
+      head.putShort(0.toShort()).putInt(24_000).putShort(0.toShort()).put(0.toByte()).flip()
+      format.setByteBuffer("csd-0", head)
+      format.setByteBuffer("csd-1", ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(0).apply { flip() })
+      format.setByteBuffer("csd-2", ByteBuffer.allocate(8).order(ByteOrder.nativeOrder()).putLong(0).apply { flip() })
+      decoder.configure(format, null, null, 0)
       decoder.start()
       val info = MediaCodec.BufferInfo()
-      var inputSequence = 0
+      var inputSequence = 0L
+      var endedInput = false
       var outputEnded = false
-      while (!outputEnded && currentResponse == binding) {
-        if (inputSequence <= packets.size) {
-          val inputIndex = decoder.dequeueInputBuffer(10_000)
-          if (inputIndex >= 0) {
-            val end = inputSequence == packets.size
-            val packet = if (end) ByteArray(0) else packets[inputSequence]
-            decoder.getInputBuffer(inputIndex)?.apply { clear(); put(packet) }
-            decoder.queueInputBuffer(
-              inputIndex,
-              0,
-              packet.size,
-              inputSequence * 20_000L,
-              if (end) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0,
-            )
-            inputSequence += 1
+      var writtenFrames = 0L
+      var started = false
+      var lastReport = 0L
+      var outputRate = 24_000
+      var tail = ByteArray(0)
+      var next: ByteArray? = null
+      val initialHead = activePlayer.playbackHeadPosition.toLong() and 0xffffffffL
+      fun observe() {
+        val played = minOf(writtenFrames, ((activePlayer.playbackHeadPosition.toLong() and 0xffffffffL) - initialHead) and 0xffffffffL)
+        stream.rendered = played
+        if (!started && played > 0) {
+          started = true
+          lastReport = played
+          emitPlayback(binding.id, binding.generation, "started", null,
+            SystemClock.elapsedRealtime().toDouble() - played * 1_000.0 / 24_000)
+        } else if (started && played - lastReport >= 2400) {
+          lastReport = played
+          emitPlayback(binding.id, binding.generation, "progress", null)
+        }
+      }
+      fun write(pcm: ByteArray) {
+        var offset = 0
+        while (offset < pcm.size && currentStream === stream) {
+          val written = synchronized(this@ChronicleDuplexAudioModule) {
+            if (currentStream !== stream) return
+            activePlayer.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_NON_BLOCKING)
+          }
+          check(written >= 0) { "AudioTrack write failed" }
+          if (written == 0) { observe(); Thread.sleep(5); continue }
+          offset += written
+          writtenFrames += written / 2
+          observe()
+        }
+      }
+      while (!outputEnded && currentStream === stream) {
+        observe()
+        if (!endedInput) {
+          if (next == null) next = stream.packets.poll()
+          if (next != null || stream.total.get() >= 0) {
+            val index = decoder.dequeueInputBuffer(5_000)
+            if (index >= 0) {
+              val packet = next ?: ByteArray(0)
+              decoder.getInputBuffer(index)!!.apply { clear(); put(packet) }
+              endedInput = next == null
+              decoder.queueInputBuffer(index, 0, packet.size, inputSequence * 20_000,
+                if (endedInput) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
+              if (!endedInput) inputSequence += 1
+              next = null
+            }
           }
         }
-        val outputIndex = decoder.dequeueOutputBuffer(info, 10_000)
-        if (outputIndex >= 0) {
+        val index = decoder.dequeueOutputBuffer(info, 5_000)
+        if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+          outputRate = decoder.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+          check(outputRate in setOf(24_000, 48_000) && decoder.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT) == 1)
+        } else if (index >= 0) {
           if (info.size > 0) {
-            val pcm = ByteArray(info.size)
-            decoder.getOutputBuffer(outputIndex)?.apply {
-              position(info.offset)
-              limit(info.offset + info.size)
-              get(pcm)
+            val raw = ByteArray(info.size)
+            decoder.getOutputBuffer(index)!!.apply { position(info.offset); limit(info.offset + info.size); get(raw) }
+            val pcm = if (outputRate == 24_000) raw else {
+              check(raw.size % 4 == 0)
+              ByteArray(raw.size / 2).also { out ->
+                for (i in 0 until raw.size / 4) { out[i * 2] = raw[i * 4]; out[i * 2 + 1] = raw[i * 4 + 1] }
+              }
             }
-            if (activePlayer.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING) <= 0) {
-              throw IllegalStateException("AudioTrack write failed")
+            check(pcm.size % 960 == 0) { "Unexpected decoded packet duration" }
+            for (offset in pcm.indices step 960) {
+              val skip = minOf(stream.skip, 480)
+              stream.skip -= skip
+              val values = pcm.copyOfRange(offset + skip * 2, offset + 960)
+              stream.decoded += values.size / 2
+              check(stream.decoded - stream.rendered <= 48_000) { "Playback reservoir exceeded two seconds" }
+              if (values.isNotEmpty()) { write(tail); tail = values }
             }
           }
           outputEnded = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-          decoder.releaseOutputBuffer(outputIndex, false)
+          decoder.releaseOutputBuffer(index, false)
         }
       }
-      if (currentResponse == binding) {
-        currentResponse = null
-        captureSuppressed = false
+      if (currentStream !== stream) return
+      val total = stream.total.get()
+      check(stream.skip == 0 && total >= writtenFrames && total <= stream.decoded && stream.decoded - total < 480)
+      write(tail.copyOfRange(0, ((total - writtenFrames) * 2).toInt()))
+      val deadline = SystemClock.elapsedRealtime() + 5_000
+      while (currentStream === stream && stream.rendered < total) {
+        observe()
+        check(SystemClock.elapsedRealtime() < deadline) { "Playback drain timed out" }
+        Thread.sleep(5)
+      }
+      synchronized(this) { if (currentStream === stream) {
         emitPlayback(binding.id, binding.generation, "done", null)
-      }
-    } catch (_: Exception) {
-      if (currentResponse == binding) {
+        currentStream = null
         currentResponse = null
         captureSuppressed = false
+      } }
+    } catch (_: Exception) {
+      synchronized(this) { if (currentStream === stream) {
         emitPlayback(binding.id, binding.generation, "failed", "decode_failed")
-      }
+        currentStream = null
+        currentResponse = null
+        captureSuppressed = false
+        activePlayer.pause()
+        activePlayer.flush()
+      } }
     } finally {
-      runCatching { decoder.stop() }
-      decoder.release()
+      runCatching { ownedDecoder?.stop() }
+      runCatching { ownedDecoder?.release() }
     }
   }
 
-  private fun cancelCurrent(errorCode: String?) {
+  @Synchronized private fun cancelCurrent(errorCode: String?) {
     val current = currentResponse ?: return
+    val stream = currentStream
     currentResponse = null
+    currentStream = null
     captureSuppressed = false
     player?.pause()
     player?.flush()
-    emitPlayback(current.id, current.generation, "cancelled", errorCode)
+    emitPlayback(current.id, current.generation, "cancelled", errorCode, stream = stream)
   }
 
-  private fun emitPlayback(responseId: String, generation: Int, state: String, errorCode: String?) {
+  private fun emitPlayback(responseId: String, generation: Int, state: String, errorCode: String?,
+                           timestampMs: Double = SystemClock.elapsedRealtime().toDouble(), stream: PlaybackStream? = currentStream) {
     sendEvent(
       "onPlaybackState",
       bundleOf(
         "responseId" to responseId,
         "generation" to generation,
-        "captureEpoch" to captureEpoch,
+        "captureEpoch" to (stream?.binding?.captureEpoch ?: captureEpoch),
         "state" to state,
-        "monotonicTimestampMs" to SystemClock.elapsedRealtime().toDouble(),
+        "monotonicTimestampMs" to timestampMs,
         "errorCode" to errorCode,
+        "renderedSamples" to (stream?.rendered ?: 0L),
+        "bufferedSamples" to if (state in setOf("done", "cancelled", "failed")) 0L else maxOf(0L, (stream?.decoded ?: 0L) - (stream?.rendered ?: 0L)),
       ),
     )
   }
@@ -369,6 +465,7 @@ class ChronicleDuplexAudioModule : Module() {
       "input_route" to inputRoute(device),
       "output_route" to outputRoute(device),
       "native_sample_rate" to 16_000,
+      "incremental_playback" to true,
       "aec" to mapOf(
         "requested" to speaker,
         "available" to AcousticEchoCanceler.isAvailable(),

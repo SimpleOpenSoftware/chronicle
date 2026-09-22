@@ -12,6 +12,7 @@ from rq import get_current_job
 from backend.constants import is_unknown_speaker_label
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
 from backend.workers.speaker_discovery_jobs import _active_segments
@@ -71,7 +72,10 @@ def cluster_local_identities(
     return discovered, outliers
 
 
-async def _unknown_identities(user_id: str) -> list[dict]:
+async def _unknown_identities(
+    user_id: str, *, visibility=None, stats=None
+) -> list[dict]:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
     query = {
         "user_id": user_id,
         "deleted": {"$ne": True},
@@ -88,6 +92,10 @@ async def _unknown_identities(user_id: str) -> list[dict]:
     }
     identities: dict[str, dict] = {}
     async for doc in Conversation.get_pymongo_collection().find(query, projection):
+        if not await visibility.filter([doc]):
+            if stats is not None:
+                stats["privacy_held_recordings"] += 1
+            continue
         duration = float(doc.get("audio_total_duration") or 0.0)
         active_segments = _active_segments(doc)
         for index, segment in enumerate(active_segments):
@@ -129,41 +137,60 @@ async def _unknown_identities(user_id: str) -> list[dict]:
                     "text": (segment.get("text") or "")[:300],
                 }
             )
+    await visibility.assert_current()
     return list(identities.values())
 
 
 @async_job(redis=False, beanie=True, timeout=14400)
 async def discover_unknown_speakers_job(requested_by: str) -> dict:
+    visibility = privacy.ConversationPrivacyFilter()
+    stats = {"privacy_held_recordings": 0}
     client = SpeakerRecognitionClient()
     info = await client.get_embedding_info()
     model = info.get("embedding_model")
     if not model:
-        raise RuntimeError(f"Could not resolve speaker embedding model: {info}")
-    identities = await _unknown_identities(requested_by)
+        raise RuntimeError("Could not resolve speaker embedding model")
+    identities = await _unknown_identities(
+        requested_by, visibility=visibility, stats=stats
+    )
     semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
 
     async def embed(identity: dict) -> dict | None:
         vectors = []
         async with semaphore:
             for segment in identity["segments"]:
+                await visibility.assert_current()
                 wav = await reconstruct_audio_segment(
                     identity["conversation_id"], segment["start"], segment["end"]
                 )
+                await visibility.assert_current()
                 result = await client.extract_speaker_embedding(wav)
+                await visibility.assert_current()
                 if result.get("embedding"):
                     vectors.append(result["embedding"])
         if not vectors:
             return None
         return {**identity, "centroid": _centroid(vectors)}
 
-    embedded = [
-        item for item in await asyncio.gather(*(embed(i) for i in identities)) if item
-    ]
-    clusters, outliers = cluster_local_identities(embedded)
+    results = await asyncio.gather(
+        *(embed(i) for i in identities), return_exceptions=True
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    embedded = [item for item in results if item]
+    await visibility.assert_current()
+    clusters, outliers = await asyncio.to_thread(cluster_local_identities, embedded)
+    await visibility.assert_current()
+    evidence_conversation_ids = sorted({item["conversation_id"] for item in embedded})
     now = datetime.now(timezone.utc)
     fingerprint = hashlib.sha256(
         json.dumps(
-            [model, [(item["identity_key"], item["segments"]) for item in embedded]],
+            [
+                model,
+                visibility.revision_receipt(),
+                [(item["identity_key"], item["segments"]) for item in embedded],
+            ],
             sort_keys=True,
             default=str,
         ).encode()
@@ -176,6 +203,8 @@ async def discover_unknown_speakers_job(requested_by: str) -> dict:
         rows.append(
             {
                 "requested_by": requested_by,
+                "evidence_conversation_ids": evidence_conversation_ids,
+                "privacy_revisions": visibility.revision_receipt(),
                 "run_fingerprint": fingerprint,
                 "cluster_id": cluster_id,
                 "members": [
@@ -191,11 +220,15 @@ async def discover_unknown_speakers_job(requested_by: str) -> dict:
     collection = Conversation.get_pymongo_collection().database[
         "unknown_speaker_clusters"
     ]
-    await collection.delete_many({"requested_by": requested_by, "status": "pending"})
-    if rows:
-        await collection.insert_many(rows)
+    async with visibility.publication():
+        await collection.delete_many(
+            {"requested_by": requested_by, "status": "pending"}
+        )
+        if rows:
+            await collection.insert_many(rows)
     job = get_current_job()
     return {
+        **stats,
         "job_id": job.id if job else None,
         "run_fingerprint": fingerprint,
         "embedding_model": model,

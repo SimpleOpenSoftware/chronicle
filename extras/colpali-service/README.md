@@ -83,7 +83,7 @@ instead of silently mixing incomparable vector spaces.
 
 ## Notes
 
-- Registered in `services.py`, so `./start.sh` / `./status.sh` and the WebUI System
+- Registered in `services.py`, so `./services start --all` / `./services status` and the WebUI System
   page control it, and the node agent advertises it as `chronicle-colpali`.
 - On a node without the agent, the advertise-only sidecar works:
   `docker compose --profile edge up -d`.

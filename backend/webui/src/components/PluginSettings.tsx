@@ -3,6 +3,7 @@ import { Puzzle, RefreshCw, CheckCircle, Save, RotateCcw, AlertCircle } from 'lu
 import { systemApi } from '../services/api'
 import { useAuth } from '../contexts/AuthContext'
 import { Alert, Button, Card, Textarea } from './ui'
+import { pluginSaveFeedback } from './plugins/saveFeedback'
 
 interface PluginSettingsProps {
   className?: string
@@ -14,6 +15,7 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
   const [validating, setValidating] = useState(false)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
+  const [messageTone, setMessageTone] = useState<'success' | 'warning'>('success')
   const [error, setError] = useState('')
   const { isAdmin } = useAuth()
 
@@ -29,8 +31,6 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
     try {
       const response = await systemApi.getPluginsConfigRaw()
       setConfigYaml(response.data.config_yaml || response.data)
-      setMessage('Configuration loaded successfully')
-      setTimeout(() => setMessage(''), 3000)
     } catch (err: any) {
       const status = err.response?.status
       if (status === 401) {
@@ -56,7 +56,8 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
     try {
       const response = await systemApi.validatePluginsConfig(configYaml)
       if (response.data.valid) {
-        setMessage('✅ Configuration is valid')
+        setMessageTone('success')
+        setMessage('Configuration is valid')
       } else {
         setError(response.data.error || 'Validation failed')
       }
@@ -79,9 +80,10 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
     setMessage('')
 
     try {
-      await systemApi.updatePluginsConfigRaw(configYaml)
-      setMessage('✅ Configuration saved successfully. Restart backend for changes to take effect.')
-      setTimeout(() => setMessage(''), 5000)
+      const response = await systemApi.updatePluginsConfigRaw(configYaml)
+      const feedback = pluginSaveFeedback(response.data)
+      setMessageTone(feedback.tone)
+      setMessage(feedback.message)
     } catch (err: any) {
       setError(err.response?.data?.error || 'Failed to save configuration')
     } finally {
@@ -132,7 +134,7 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
 
         {/* Messages */}
         {message && (
-          <Alert tone="success" icon={<CheckCircle className="h-5 w-5" />} className="mb-4">
+          <Alert tone={messageTone} icon={<CheckCircle className="h-5 w-5" />} className="mb-4">
             {message}
           </Alert>
         )}
@@ -178,18 +180,9 @@ export default function PluginSettings({ className }: PluginSettingsProps) {
           </Button>
         </div>
 
-        {/* Help text */}
-        <div className="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md">
-          <h4 className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-2">
-            Configuration Help
-          </h4>
-          <ul className="text-sm text-blue-700 dark:text-blue-300 space-y-1 list-disc list-inside">
-            <li>Define enabled plugins and their trigger types</li>
-            <li>Configure wake words for command-based plugins</li>
-            <li>Set plugin URLs and authentication tokens</li>
-            <li>Changes require backend restart to take effect</li>
-          </ul>
-        </div>
+        <p className="mt-4 text-xs text-gray-600 dark:text-gray-400">
+          Saving reloads backend plugins and requests a worker restart.
+        </p>
       </Card>
     </div>
   )

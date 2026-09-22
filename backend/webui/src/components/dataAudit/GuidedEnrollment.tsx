@@ -35,6 +35,7 @@ import { useJobPolling } from '../../hooks/useJobPolling'
 import { Button, StateBadge } from '../ui'
 
 type EnrolledSpeaker = { speaker_id: string; name: string }
+const PRIVATE_BENCHMARK_MESSAGE = 'This benchmark is held because its source privacy needs review. Rebuild it from allowed recordings.'
 
 type Decision = {
   kind: 'accept' | 'reject' | 'skip' | 'bad_clip' | 'multiple_speakers' | 'another_speaker'
@@ -125,7 +126,7 @@ function EnrollmentTrend({ sessions }: { sessions: GuidedEnrollmentSession[] }) 
   )
 }
 
-function BenchmarkPanel({ speakerName }: { speakerName: string }) {
+export function BenchmarkPanel({ speakerName }: { speakerName: string }) {
   const [report, setReport] = useState<SpeakerBenchmarkReport | null>(null)
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState('')
@@ -134,12 +135,21 @@ function BenchmarkPanel({ speakerName }: { speakerName: string }) {
   const { pollJob } = useJobPolling()
 
   const loadLatest = useCallback(async () => {
-    const response = await dataAuditApi.getLatestSpeakerBenchmark()
-    setReport(response.data.report)
+    try {
+      const response = await dataAuditApi.getLatestSpeakerBenchmark()
+      setReport(response.data.report)
+      setBenchmarkError(null)
+    } catch (error: any) {
+      setReport(null)
+      setBenchmarkError(error?.response?.status === 423
+        ? PRIVATE_BENCHMARK_MESSAGE
+        : 'Failed to load the latest benchmark')
+      throw error
+    }
   }, [])
 
   useEffect(() => {
-    loadLatest().catch(() => setBenchmarkError('Failed to load the latest benchmark'))
+    loadLatest().catch(() => undefined)
     dataAuditApi.getSpeakerGalleryBaseline().then((response) => setBaseline(response.data)).catch(() => undefined)
   }, [loadLatest])
 
@@ -156,9 +166,13 @@ function BenchmarkPanel({ speakerName }: { speakerName: string }) {
       await loadLatest()
       setProgress('')
     } catch (error: any) {
-      setBenchmarkError(submissionErrorMessage(error))
+      if (error?.response?.status === 423) {
+        setReport(null)
+        setBenchmarkError(PRIVATE_BENCHMARK_MESSAGE)
+      } else setBenchmarkError(submissionErrorMessage(error))
     } finally {
       setRunning(false)
+      setProgress('')
     }
   }
 
@@ -187,7 +201,7 @@ function BenchmarkPanel({ speakerName }: { speakerName: string }) {
 
       <details className="border-t border-gray-200 dark:border-gray-700 pt-3">
         <summary className="cursor-pointer text-xs font-medium text-gray-700 dark:text-gray-200">
-          Overall recognition benchmark{latest?.top1_accuracy_mean != null ? ` · Top-1 ${Math.round(latest.top1_accuracy_mean * 100)}%` : ''}{latest?.eer_mean != null ? ` · EER ${(latest.eer_mean * 100).toFixed(1)}%` : ''}
+          Overall recognition benchmark{benchmarkError === PRIVATE_BENCHMARK_MESSAGE ? ' · Held for privacy review' : ''}{latest?.top1_accuracy_mean != null ? ` · Top-1 ${Math.round(latest.top1_accuracy_mean * 100)}%` : ''}{latest?.eer_mean != null ? ` · EER ${(latest.eer_mean * 100).toFixed(1)}%` : ''}
         </summary>
         <div className="space-y-3 pt-3">
           <div className="flex flex-wrap items-center justify-between gap-3">

@@ -8,6 +8,8 @@ from typing import Optional
 
 import redis.asyncio as redis
 
+import backend.services.dialogue.capture as capture
+import backend.services.dialogue.service as service_module
 from backend.observability.tracing import (
     chronicle_span,
     set_span_attributes,
@@ -15,6 +17,7 @@ from backend.observability.tracing import (
 )
 from backend.plugins.router import PluginRouter
 from backend.services.response_coordinator import ResponseCoordinator, StaleResponse
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import VoiceSessionCoordinator
 
 from .contracts import (
@@ -90,7 +93,22 @@ class InteractionProcessor:
                         "activation_phrase": item.activation_phrase,
                     },
                 )
-                dispatch = await self._process_active(item, session)
+                trace = VoiceTrace(
+                    self.redis,
+                    TimingIdentity(
+                        item.user_id,
+                        item.client_id,
+                        item.audio_session_id,
+                        item.audio_interval.capture_epoch,
+                        item.audio_interval.turn_id or item.input_id,
+                        item.audio_interval.turn_revision,
+                    ),
+                )
+                with trace.bind():
+                    async with trace.span(
+                        "mode_handler", detail=session.owner_plugin_id
+                    ):
+                        dispatch = await self._process_active(item, session)
                 set_span_attributes(
                     span,
                     {
@@ -142,6 +160,31 @@ class InteractionProcessor:
                 reply=None,
                 lifecycle="superseded",
                 event_data={"response_suppressed": True},
+            )
+
+        if session.owner_plugin_id == "swiggy_instamart":
+
+            thread = await capture.accept(
+                self.redis,
+                user_id=session.user_id,
+                client_id=session.client_id,
+                capture_id=item.audio_session_id,
+                input_id=item.input_id,
+                text=item.text or "Start an Instamart order",
+                kind="instamart" if item.kind == "start" else None,
+                generation=item.response_generation,
+                interval=item.audio_interval,
+            )
+            session.phase = "dialogue"
+            session.plugin_state = {"thread_id": thread.id} if thread else {}
+            session.turn_number += 1
+            session.last_activity_at = max(session.last_activity_at, item.received_at)
+            await self.store.save(session, processed_input_id=item.input_id)
+            return InteractionDispatch(
+                session=session,
+                reply=None,
+                lifecycle="started" if item.kind == "start" else "updated",
+                event_data={"thread_id": thread.id if thread else None},
             )
 
         effect_fenced = False
@@ -245,6 +288,8 @@ class InteractionProcessor:
                 continue
             try:
                 session = await self.store.get(interaction_id)
+                if session is not None and session.mode_id == "voice_conversation":
+                    continue  # Its independent voice runtime owns these deadlines.
                 if session is None or session.status != "active":
                     await self.redis.zrem("interaction:deadlines", interaction_id)
                     continue
@@ -292,6 +337,18 @@ class InteractionProcessor:
     async def _notify_end(
         self, session: InteractionSession, reason: str
     ) -> Optional[InteractionResult]:
+        if session.owner_plugin_id == "swiggy_instamart":
+
+            service = await service_module.get_dialogue_service()
+            thread_id = session.plugin_state.get("thread_id")
+            if thread_id:
+                thread = await service.thread(
+                    thread_id, session.user_id, writable=False
+                )
+                await service.store.release_audio(
+                    thread, "wake:" + session.audio_session_id
+                )
+            return None
         plugin = self.router.plugins.get(session.owner_plugin_id)
         if plugin is None:
             return None

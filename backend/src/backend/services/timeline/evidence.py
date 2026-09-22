@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import backend.services.privacy as privacy
 from backend.models.conversation import Conversation
 from backend.models.device_input import DeviceInputItem
 from backend.models.manual_memory import ManualMemory
@@ -20,6 +21,7 @@ from backend.services.memory.visibility import (
     conversation_scope_filter,
     main_only_filter,
 )
+from backend.services.recording_purpose import personal_recording_filter
 from backend.services.transcript_time import AnchorMap, load_anchor_map, place_segments
 
 from . import activity_policy
@@ -746,7 +748,7 @@ async def _conversation_audio_bounds(
             "$and": [conversation_scope_filter()],
             "user_id": user_id,
             "deleted": {"$ne": True},
-            "data_purpose": {"$ne": "annotation"},
+            **personal_recording_filter(),
             "audio_ranges": {
                 "$elemMatch": {
                     "started_at": {"$lt": range_end},
@@ -1068,6 +1070,8 @@ async def _device_input_rows(
             "$or": [{"ended_at": None}, {"ended_at": {"$gte": day_start}}],
         }
     ).to_list(length=None)
+
+    raw_rows = await privacy.filter_records(raw_rows, user_id)
     return await asyncio.to_thread(_parse_device_input_rows, raw_rows)
 
 
@@ -1138,9 +1142,11 @@ async def _assemble_range_manifest(
         {"deleted": {"$ne": True}},
         # Mining/audit clips are dataset material, not something that happened to
         # the user on this day. They are also the one corpus with no capture time.
-        {"data_purpose": {"$ne": "annotation"}},
+        personal_recording_filter(),
     ).to_list()
 
+    spans = await privacy.filter_records(spans, user_id)
+    conversations = await privacy.filter_records(conversations, user_id)
     application_evidence, images = await asyncio.to_thread(
         _build_application_evidence, rows
     )

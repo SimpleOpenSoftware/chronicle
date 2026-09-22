@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import backend.services.privacy as privacy
 from backend.models.timeline import (
     EpisodeRevisionRef,
     TimelineDay,
@@ -123,6 +124,8 @@ async def active_day_episodes(
     }
 
     episodes = await TimelineEpisode.find(query).to_list()
+
+    episodes = await privacy.filter_records(episodes, user_id)
     episodes.sort(key=lambda item: (_utc(item.started_at), _utc(item.ended_at)))
     return episodes
 

@@ -73,6 +73,11 @@ async def _ensure_beanie_initialized():
                 NotificationIntent,
                 PushDevice,
             )
+            from backend.models.session_memory import (
+                MemorySourceDecision,
+                SessionPreparation,
+                UndatedSession,
+            )
             from backend.models.timeline import (
                 AudioEvidenceSpan,
                 DirtyEvidenceRange,
@@ -133,6 +138,9 @@ async def _ensure_beanie_initialized():
                     DirtyEvidenceRange,
                     EpisodeDispatchLatch,
                     MemoryReviewProposal,
+                    MemorySourceDecision,
+                    SessionPreparation,
+                    UndatedSession,
                     PushDevice,
                     NotificationIntent,
                     NotificationDelivery,

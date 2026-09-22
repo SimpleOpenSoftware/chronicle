@@ -31,6 +31,11 @@ class CaptureSource(Document):
     status: Literal["pairing", "online", "offline", "error"] = "pairing"
     health: dict[str, Any] = Field(default_factory=dict)
     last_seen_at: Optional[datetime] = None
+    privacy_enabled_from: Optional[datetime] = None
+    privacy_revision: int = 0
+    privacy_tracks: list[str] = Field(default_factory=list)
+    privacy_operation: Optional[str] = None
+    privacy_updating: bool = False
     created_at: datetime = Field(default_factory=utcnow)
 
     class Settings:
@@ -137,6 +142,7 @@ class DeviceInputJob(Document):
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
     purpose: str
+    priority: int = Field(default=0, ge=0, le=100)
     payload: dict[str, Any] = Field(default_factory=dict)
     context_request_id: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -153,6 +159,7 @@ class DeviceInputJob(Document):
                 [
                     ("source_id", ASCENDING),
                     ("status", ASCENDING),
+                    ("priority", DESCENDING),
                     ("created_at", ASCENDING),
                 ]
             ),

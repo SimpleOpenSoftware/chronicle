@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
-from typing import TYPE_CHECKING, Awaitable, Callable
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
 
 import redis.asyncio as redis
 
 from backend.redis_keys import ClientId, SessionId
 from backend.services.audio_stream.session_store import SessionStore
-from backend.services.playback_audio import encode_wav_for_playback
+from backend.services.playback_audio import (
+    DOWNLINK_FRAME_BYTES,
+    DOWNLINK_SAMPLE_RATE_HZ,
+    StreamingPlaybackEncoder,
+    encode_wav_for_playback,
+    normalize_wav_for_playback,
+)
 from backend.services.response_coordinator import (
+    STREAM_FIRST_AUDIO_SECONDS,
+    STREAM_PRODUCER_STALL_SECONDS,
     ResponseCoordinator,
     ResponseRecord,
     StaleResponse,
 )
 from backend.services.tts_client import synthesize_speech
+from backend.services.voice_diagnostics import cadence_span, current_recorder
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import (
     ClientUpgradeRequired,
     VoiceSessionCoordinator,
@@ -75,6 +87,34 @@ async def deliver_wav_response(
     voice = await voice_sessions.get(view.voice_session_id)
     if voice is None:
         raise StaleResponse("audio-v2 response has no voice session")
+    if (voice.capabilities or {}).get("incremental_playback"):
+
+        async def pcm():
+            started = time.perf_counter()
+            wav = await operation()
+            if timer is not None:
+                timer.tts_ms = (time.perf_counter() - started) * 1000
+            normalized = await asyncio.to_thread(normalize_wav_for_playback, wav)
+            if timer is not None:
+                timer.est_play_secs = len(normalized) / (DOWNLINK_SAMPLE_RATE_HZ * 2)
+            for offset in range(0, len(normalized), DOWNLINK_SAMPLE_RATE_HZ * 2):
+                yield normalized[offset : offset + DOWNLINK_SAMPLE_RATE_HZ * 2]
+
+        delivered = await deliver_pcm_response(
+            redis_client,
+            client_id,
+            session_id,
+            pcm(),
+            generation=generation,
+            turn_id=response_turn_id,
+            turn_revision=turn_revision,
+            barge_in_allowed=barge_in_allowed if kind == "speech" else False,
+            kind=kind,
+            wake_trace_id=wake_trace_id,
+        )
+        if timer is not None:
+            timer.mark_downlink()
+        return delivered
     response = await coordinator.queue(
         user_id=view.user_id,
         client_id=view.client_id,
@@ -92,12 +132,22 @@ async def deliver_wav_response(
         wake_trace_id=wake_trace_id,
     )
 
+    trace = VoiceTrace(
+        redis_client,
+        TimingIdentity.from_response(response),
+        response_id=response.response_id,
+        generation=response.generation,
+    )
+    if kind != "speech":
+        trace = None
     started = time.perf_counter()
     try:
-        wav = await coordinator.synthesize(response.response_id, operation)
+        async with trace.span("tts") if trace else nullcontext():
+            wav = await coordinator.synthesize(response.response_id, operation)
         if timer is not None:
             timer.tts_ms = (time.perf_counter() - started) * 1000
-        playback = encode_wav_for_playback(wav)
+        async with trace.span("encoding") if trace else nullcontext():
+            playback = await asyncio.to_thread(encode_wav_for_playback, wav)
         duration_ms = playback.duration_ms
         await coordinator.mark_ready(
             response.response_id,
@@ -105,7 +155,8 @@ async def deliver_wav_response(
             duration_ms=duration_ms,
             sample_rate=24_000,
         )
-        delivered = await coordinator.offer(response.response_id, playback.packets)
+        async with trace.span("downlink") if trace else nullcontext():
+            delivered = await coordinator.offer(response.response_id, playback.packets)
         if timer is not None:
             timer.est_play_secs = duration_ms / 1000
             timer.mark_downlink()
@@ -149,3 +200,148 @@ async def deliver_text_response(
         timer=timer,
         wake_trace_id=wake_trace_id,
     )
+
+
+async def deliver_pcm_response(
+    redis_client: redis.Redis,
+    client_id: ClientId,
+    session_id: SessionId,
+    producer: AsyncIterator[bytes],
+    *,
+    generation: int | None = None,
+    turn_id: str | None = None,
+    turn_revision: int = 0,
+    barge_in_allowed: bool = True,
+    on_queued: Callable[[ResponseRecord], Awaitable[None]] | None = None,
+    kind: str = "speech",
+    wake_trace_id: str | None = None,
+) -> ResponseRecord:
+    """Stream PCM16LE mono24k from one cancellable producer to incremental playback.
+
+    A single producer chunk is bounded to two seconds. Encoding retains only one
+    partial frame, and coordinator credit bounds sent-but-unrendered output to
+    two seconds. Producer ownership ends here, including cancellation/timeout.
+    """
+    if not isinstance(client_id, ClientId) or not isinstance(session_id, SessionId):
+        raise TypeError("deliver_pcm_response requires typed client and session IDs")
+    view = await SessionStore(redis_client).read(str(session_id))
+    if (
+        not view
+        or view.client_id != str(client_id)
+        or not view.user_id
+        or not view.connection_id
+    ):
+        raise StaleResponse("response target is not an authenticated audio session")
+    if not view.voice_session_id:
+        raise ClientUpgradeRequired(
+            "incremental playback requires an audio-v2 voice binding"
+        )
+    voices = VoiceSessionCoordinator(redis_client)
+    coordinator = ResponseCoordinator(redis_client, voices)
+    if generation is None:
+        generation = await coordinator.begin_turn(
+            view.user_id, view.client_id, reason="replacement"
+        )
+    response_turn_id = turn_id or str(uuid.uuid4())
+    response = await coordinator.queue(
+        user_id=view.user_id,
+        client_id=view.client_id,
+        audio_session_id=view.session_id,
+        voice_session_id=view.voice_session_id,
+        capture_epoch=view.capture_epoch,
+        socket_id=view.connection_id,
+        turn_id=response_turn_id,
+        turn_revision=turn_revision,
+        generation=generation,
+        kind=kind,
+        barge_in_allowed=barge_in_allowed,
+        trace_id=str(uuid.uuid4()),
+        causation_id=wake_trace_id or response_turn_id,
+        wake_trace_id=wake_trace_id,
+    )
+    diagnostic = current_recorder()
+    if diagnostic is not None:
+        diagnostic.set_response(response.response_id)
+    encoder = StreamingPlaybackEncoder()
+    if diagnostic is not None:
+        diagnostic.pre_skip_samples = encoder.pre_skip_samples
+    iterator = aiter(producer)
+    pending = None
+    try:
+        if on_queued is not None:
+            await on_queued(response)
+        await coordinator.open_stream(
+            response.response_id, pre_skip_samples=encoder.pre_skip_samples
+        )
+        first = True
+        while True:
+            timeout = (
+                STREAM_FIRST_AUDIO_SECONDS if first else STREAM_PRODUCER_STALL_SECONDS
+            )
+            deadline = time.monotonic() + timeout
+            with cadence_span("producer_wait", sample_start=encoder.total_samples):
+                pending = asyncio.ensure_future(anext(iterator))
+                while not pending.done():
+                    # Ready PCM needs no producer watchdog read. Publication
+                    # still validates generation, binding and credit per packet.
+                    # Poll a genuinely waiting provider at the existing bound.
+                    await asyncio.wait({pending}, timeout=0.02)
+                    if pending.done():
+                        break
+                    await coordinator.assert_current(response)
+                    observed = await coordinator.expire_stalled(response.response_id)
+                    if observed.state == "failed":
+                        raise TimeoutError(observed.terminal_reason)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "first_audio_timeout" if first else "producer_stall_timeout"
+                        )
+                try:
+                    pcm = pending.result()
+                except StopAsyncIteration:
+                    break
+                finally:
+                    pending = None
+            if not isinstance(pcm, bytes) or len(pcm) > DOWNLINK_SAMPLE_RATE_HZ * 2 * 2:
+                raise ValueError(
+                    "producer must yield bounded PCM byte chunks (at most two seconds)"
+                )
+            if not pcm:
+                raise ValueError("producer yielded an empty PCM chunk")
+            for offset in range(0, len(pcm), DOWNLINK_FRAME_BYTES):
+                with cadence_span("encoding", sample_start=encoder.total_samples):
+                    packets = await asyncio.to_thread(
+                        encoder.append, pcm[offset : offset + DOWNLINK_FRAME_BYTES]
+                    )
+                for packet in packets:
+                    await coordinator.append_stream(response.response_id, packet)
+                    first = False
+        for packet in await asyncio.to_thread(encoder.finish):
+            await coordinator.append_stream(response.response_id, packet)
+        await coordinator.finish_stream(
+            response.response_id, total_samples=encoder.total_samples
+        )
+        return await coordinator.wait_stream_done(response.response_id)
+    except BaseException as error:
+        try:
+            if isinstance(error, asyncio.CancelledError):
+                await coordinator.fail(response.response_id, "producer_cancelled")
+            else:
+                await coordinator.fail(
+                    response.response_id,
+                    (
+                        str(error)
+                        if isinstance(error, TimeoutError)
+                        else type(error).__name__
+                    ),
+                )
+        except StaleResponse:
+            pass
+        raise
+    finally:
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()

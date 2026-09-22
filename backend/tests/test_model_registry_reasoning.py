@@ -110,11 +110,12 @@ def test_detailed_summary_disables_local_model_thinking():
     assert defaults.llm_operations.detailed_summary.reasoning_effort == "none"
 
 
-def test_timeline_merge_emits_json_without_hidden_reasoning():
+@pytest.mark.parametrize("name", ["timeline_merge", "timeline_session_account"])
+def test_timeline_operations_emit_json_without_hidden_reasoning(name):
     defaults = OmegaConf.load(
         Path(__file__).resolve().parents[2] / "config" / "defaults.yml"
     )
-    config = defaults.llm_operations.timeline_merge
+    config = defaults.llm_operations[name]
     operation = ResolvedLLMOperation(
         model_def=ModelDef(
             name="qwen",
@@ -134,6 +135,11 @@ def test_timeline_merge_emits_json_without_hidden_reasoning():
         ]
         is False
     )
+    if name == "timeline_session_account":
+        from backend.model_registry import LLM_OPERATION_DEFAULT_ROLES
+
+        assert LLM_OPERATION_DEFAULT_ROLES[name] == "fast_llm"
+        assert operation.to_api_params()["max_tokens"] > 4096
 
 
 @pytest.mark.parametrize("effort", [None, "none", "low", "high"])

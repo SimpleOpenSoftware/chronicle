@@ -14,6 +14,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 
+import backend.service_deployment as service_deployment
 from backend import __version__ as package_version
 from backend.client_manager import get_client_manager
 from backend.controllers.queue_controller import get_queue_health, redis_conn
@@ -174,6 +175,17 @@ async def health_check():
     memory_provider = (mem_settings.get("provider") or "chronicle").lower()
 
     speaker_service_url = os.getenv("SPEAKER_SERVICE_URL")
+    speaker_gateway_headers = {}
+    speaker_registry = get_models_registry()
+    speaker_config = speaker_registry.speaker_recognition if speaker_registry else {}
+    if speaker_config.get("deployment"):
+
+        speaker_service_url = service_deployment.gateway_url(
+            speaker_config["deployment"], "speaker"
+        )
+        speaker_gateway_headers = {
+            "X-Chronicle-Service-Token": service_deployment.gateway_token()
+        }
     wakeword_service_url = os.getenv("WAKEWORD_SERVICE_URL")
 
     # Check MongoDB (critical service)
@@ -450,6 +462,7 @@ async def health_check():
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{speaker_service_url}/health",
+                    headers=speaker_gateway_headers,
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as response:
                     if response.status == 200:

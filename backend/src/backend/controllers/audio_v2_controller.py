@@ -10,13 +10,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import partial
 
 from fastapi import WebSocket, WebSocketDisconnect
 from google.protobuf import timestamp_pb2
 
+import backend.services.interaction_modes.voice.runtime as runtime
 from backend.audio_contract.v2 import audio_pb2
 from backend.audio_contract.v2.codec import (
     AudioProtocolV2Error,
@@ -52,7 +55,8 @@ from backend.services.response_coordinator import (
     ResponseCoordinator,
     ResponseCoordinatorError,
 )
-from backend.services.voice_sessions import VoiceSessionCoordinator
+from backend.services.voice_diagnostics import VoiceCadenceRecorder, cadence_span
+from backend.services.voice_sessions import VoiceSessionCoordinator, VoiceSessionError
 
 AUDIO_SUBPROTOCOL = "chronicle.audio.v2"
 logger = logging.getLogger(__name__)
@@ -93,6 +97,131 @@ async def _send_control(websocket: WebSocket, **event) -> None:
     await websocket.send_text(serialize_server_control_json(message))
 
 
+async def _handle_playback_acknowledgement(
+    websocket, control, *, responses, user_id, client_id, socket_id
+) -> None:
+    acknowledgement = control.playback_acknowledgement
+    binding = acknowledgement.binding
+    state = {
+        audio_pb2.PLAYBACK_STATE_STARTED: "started",
+        audio_pb2.PLAYBACK_STATE_DONE: "done",
+        audio_pb2.PLAYBACK_STATE_CANCELLED: "cancelled",
+        audio_pb2.PLAYBACK_STATE_FAILED: "failed",
+        audio_pb2.PLAYBACK_STATE_PROGRESS: "progress",
+    }.get(acknowledgement.state)
+    if state is None:
+        raise AudioProtocolV2Error("unsupported playback state")
+    try:
+        await responses.playback(
+            response_id=acknowledgement.response_id.value,
+            generation=acknowledgement.generation,
+            state=state,
+            rendered_samples=acknowledgement.rendered_samples,
+            buffered_samples=acknowledgement.buffered_samples,
+            user_id=user_id,
+            client_id=client_id,
+            audio_session_id=binding.capture_session_id.value,
+            voice_session_id=binding.voice_session_id.value,
+            capture_epoch=binding.capture_epoch,
+            socket_id=socket_id,
+            monotonic_timestamp_ms=(acknowledgement.monotonic_timestamp_us // 1_000),
+        )
+    except ResponseCoordinatorError as error:
+        # A progress ACK may already be in flight when onset or
+        # End advances the response generation. The coordinator
+        # has rejected it without changing playback state; this
+        # response race must never stop canonical audio capture.
+        await _send_control(
+            websocket,
+            error=audio_pb2.ProtocolError(
+                code=audio_pb2.PROTOCOL_ERROR_CODE_INVALID_TRANSITION,
+                detail=str(error),
+                rejected_event_id=control.event_id,
+            ),
+        )
+
+
+# One bounded receive queue per socket: about ten seconds of 20 ms media.
+# The byte cap also bounds queued control messages (whose wire limit is larger).
+CAPTURE_INPUT_MAX_MESSAGES = 512
+CAPTURE_INPUT_MAX_BYTES = 2 * 1024 * 1024
+
+
+class _CaptureInput:
+    """Read ACKs promptly while one ordered consumer persists capture messages.
+
+    There is one reader task, never a task per packet. Overflow ends admission
+    explicitly; already queued messages drain before the failure is surfaced.
+    """
+
+    def __init__(self, websocket, acknowledge):
+        self.websocket = websocket
+        self.acknowledge = acknowledge
+        self.pending = deque()
+        self.pending_bytes = 0
+        self.changed = asyncio.Event()
+        self.finished = False
+        self.disconnected = False
+        self.error = None
+        self.task = asyncio.create_task(self._read(), name="audio-v2-control-reader")
+
+    async def _read(self):
+        try:
+            while True:
+                incoming = await self.websocket.receive()
+                if incoming.get("type") == "websocket.disconnect":
+                    self.disconnected = True
+                    return
+                raw_text = incoming.get("text")
+                raw_bytes = incoming.get("bytes")
+                if raw_text is not None:
+                    control = parse_client_control_json(raw_text)
+                    if control.WhichOneof("event") == "playback_acknowledgement":
+                        await self.acknowledge(control)
+                        continue
+                size = (
+                    len(raw_text.encode())
+                    if raw_text is not None
+                    else len(raw_bytes or b"")
+                )
+                if (
+                    len(self.pending) >= CAPTURE_INPUT_MAX_MESSAGES
+                    or self.pending_bytes + size > CAPTURE_INPUT_MAX_BYTES
+                ):
+                    raise AudioProtocolV2Error(
+                        "capture input overloaded; queued audio will drain, but further packets were not accepted"
+                    )
+                self.pending.append((incoming, size))
+                self.pending_bytes += size
+                self.changed.set()
+        except (WebSocketDisconnect, OSError):
+            self.disconnected = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.error = error
+        finally:
+            self.finished = True
+            self.changed.set()
+
+    async def receive(self):
+        while not self.pending:
+            if self.finished:
+                if self.error is not None:
+                    raise self.error
+                return {"type": "websocket.disconnect"}
+            await self.changed.wait()
+        incoming, size = self.pending.popleft()
+        self.pending_bytes -= size
+        if not self.pending:
+            self.changed.clear()
+        return incoming
+
+    async def close(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
 async def _subscribe_v2_downlink(
     *,
     websocket: WebSocket,
@@ -104,6 +233,39 @@ async def _subscribe_v2_downlink(
     client_id: str,
 ) -> None:
     """Validate typed Redis downlink events and forward them to one bound socket."""
+
+    diagnostics = {}
+    flush_tasks = set()
+
+    def report(response_id, outcome):
+        diagnostic = diagnostics.pop(response_id, None)
+        if diagnostic is None:
+            return
+        if len(flush_tasks) >= 16:
+            logger.warning("Voice backend diagnostic flush capacity exhausted")
+            return
+        task = asyncio.create_task(
+            diagnostic.flush(outcome), name="voice-backend-diagnostic-flush"
+        )
+        flush_tasks.add(task)
+        task.add_done_callback(flush_tasks.discard)
+
+    def diagnostic_for(response_id, binding, generation, turn_id=""):
+        if response_id not in diagnostics:
+            if len(diagnostics) >= 16:
+                report(next(iter(diagnostics)), "diagnostic_capacity")
+            diagnostics[response_id] = VoiceCadenceRecorder(
+                user_id=user_id,
+                client_id=client_id,
+                capture_session_id=binding.capture_session_id.value,
+                voice_session_id=binding.voice_session_id.value,
+                capture_epoch=binding.capture_epoch,
+                response_id=response_id,
+                generation=generation,
+                turn_id=turn_id,
+                platform="backend-voice",
+            )
+        return diagnostics[response_id]
 
     channel = str(device_downlink_channel(ClientId.from_value(client_id)))
     pubsub = redis_client.pubsub()
@@ -124,6 +286,7 @@ async def _subscribe_v2_downlink(
             if kind == "playback_offer":
                 offer = event.playback_offer
                 binding = offer.binding
+                validation_started = time.perf_counter() * 1000
                 if not await voice_sessions.binding_matches(
                     user_id=user_id,
                     client_id=client_id,
@@ -134,11 +297,27 @@ async def _subscribe_v2_downlink(
                     require_ready=True,
                 ):
                     continue
-                await _send_control(websocket, playback_offer=offer)
+                diagnostic = diagnostic_for(
+                    offer.response_id.value,
+                    binding,
+                    offer.generation,
+                    offer.turn_id.value,
+                )
+                diagnostic.pre_skip_samples = offer.pre_skip_samples
+                diagnostic.observe(
+                    "offer_validation", validation_started, time.perf_counter() * 1000
+                )
+                with diagnostic.bind(), cadence_span("offer_socket_send"):
+                    await _send_control(websocket, playback_offer=offer)
             elif kind == "playback":
                 packet = event.playback
+                validation_started = time.perf_counter() * 1000
                 record = await responses.get(packet.response_id.value)
                 if record is None or record.generation != packet.generation:
+                    continue
+                try:
+                    await responses.assert_current(record)
+                except ResponseCoordinatorError:
                     continue
                 if not await voice_sessions.binding_matches(
                     user_id=user_id,
@@ -150,9 +329,73 @@ async def _subscribe_v2_downlink(
                     require_ready=True,
                 ):
                     continue
-                await websocket.send_bytes(
-                    serialize_media_envelope(audio_pb2.MediaEnvelope(playback=packet))
+                diagnostic = diagnostic_for(
+                    record.response_id,
+                    audio_pb2.CaptureBinding(
+                        capture_session_id=audio_pb2.CaptureSessionId(
+                            value=record.audio_session_id
+                        ),
+                        voice_session_id=audio_pb2.VoiceSessionId(
+                            value=record.voice_session_id
+                        ),
+                        capture_epoch=record.capture_epoch,
+                    ),
+                    record.generation,
+                    record.turn_id,
                 )
+                diagnostic.pre_skip_samples = record.pre_skip_samples
+                diagnostic.observe(
+                    "downlink_validation",
+                    validation_started,
+                    time.perf_counter() * 1000,
+                    sequence=packet.sequence,
+                    sample_end=(packet.sequence + 1) * 480,
+                )
+                with diagnostic.bind(), cadence_span(
+                    "socket_send",
+                    sequence=packet.sequence,
+                    sample_end=(packet.sequence + 1) * 480,
+                ):
+                    await websocket.send_bytes(
+                        serialize_media_envelope(
+                            audio_pb2.MediaEnvelope(playback=packet)
+                        )
+                    )
+            elif kind in {
+                "playback_finished",
+                "conversation_state",
+                "voice_processing_update",
+            }:
+                payload = getattr(event, kind)
+                binding = payload.binding
+                if not await voice_sessions.binding_matches(
+                    user_id=user_id,
+                    client_id=client_id,
+                    audio_session_id=binding.capture_session_id.value,
+                    voice_session_id=binding.voice_session_id.value,
+                    capture_epoch=binding.capture_epoch,
+                    socket_id=client_state.socket_id,
+                    require_ready=True,
+                ):
+                    continue
+                if kind == "voice_processing_update":
+                    try:
+                        await responses.assert_generation(
+                            user_id, client_id, payload.generation
+                        )
+                    except ResponseCoordinatorError:
+                        continue
+                if kind == "playback_finished":
+                    record = await responses.get(payload.response_id.value)
+                    if record is None or record.generation != payload.generation:
+                        continue
+                    try:
+                        await responses.assert_current(record)
+                    except ResponseCoordinatorError:
+                        continue
+                await _send_control(websocket, **{kind: payload})
+                if kind == "playback_finished":
+                    report(payload.response_id.value, "producer_finished_sent")
             elif kind == "cancel_playback":
                 cancel = event.cancel_playback
                 binding = cancel.binding
@@ -166,7 +409,12 @@ async def _subscribe_v2_downlink(
                 ):
                     continue
                 await _send_control(websocket, cancel_playback=cancel)
+                report(cancel.response_id.value, "cancel_sent")
     finally:
+        for response_id in list(diagnostics):
+            report(response_id, "socket_ended")
+        if flush_tasks:
+            await asyncio.gather(*list(flush_tasks), return_exceptions=True)
         await pubsub.unsubscribe(channel)
         await pubsub.close()
 
@@ -285,7 +533,8 @@ def _voice_capabilities(
                 audio_pb2.INPUT_ROUTE_BLUETOOTH_HFP: "bluetooth_hfp",
                 audio_pb2.INPUT_ROUTE_WIRED_MIC: "wired_mic",
                 audio_pb2.INPUT_ROUTE_USB: "usb",
-                audio_pb2.INPUT_ROUTE_REMOTE: "remote",
+                audio_pb2.INPUT_ROUTE_REMOTE: "unknown",
+                audio_pb2.INPUT_ROUTE_UNKNOWN: "unknown",
             }[capabilities.input_route],
             "output_route": {
                 audio_pb2.OUTPUT_ROUTE_SPEAKERPHONE: "speakerphone",
@@ -296,6 +545,7 @@ def _voice_capabilities(
                 audio_pb2.OUTPUT_ROUTE_REMOTE: "remote",
             }[capabilities.output_route],
             "native_sample_rate": capabilities.native_sample_rate_hz,
+            "incremental_playback": capabilities.incremental_playback,
             "aec": {
                 "requested": capabilities.acoustic_echo_cancellation.requested,
                 "available": capabilities.acoustic_echo_cancellation.available,
@@ -322,6 +572,7 @@ async def ingest_capture_packet(
     normalizer: RawOpusNormalizer,
     v2_streams: AudioV2Streams,
     canonical_sequence: int,
+    previous_monotonic_offset_us: int | None = None,
 ) -> int:
     """Normalize one bound Opus packet and publish canonical 20 ms frames."""
 
@@ -335,6 +586,12 @@ async def ingest_capture_packet(
     expected_voice = client_state.voice_session_id or ""
     if packet.binding.voice_session_id.value != expected_voice:
         raise AudioProtocolV2Error("capture packet has a stale voice binding")
+    if (
+        packet.delivery_class == audio_pb2.DELIVERY_CLASS_LIVE
+        and previous_monotonic_offset_us is not None
+        and packet.monotonic_offset_us <= previous_monotonic_offset_us
+    ):
+        raise AudioProtocolV2Error("live capture clock did not advance")
 
     frames = await _decode_opus_frames(normalizer, packet.opus_payload)
     for index, pcm in enumerate(frames):
@@ -350,6 +607,11 @@ async def ingest_capture_packet(
                     sequence=canonical_sequence + index,
                     captured_at=captured_at,
                     monotonic_offset_us=packet.monotonic_offset_us + index * 20_000,
+                    device_monotonic_timestamp_us=(
+                        packet.device_monotonic_timestamp_us + index * 20_000
+                        if packet.HasField("device_monotonic_timestamp_us")
+                        else None
+                    ),
                     delivery_class=packet.delivery_class,
                     pcm_s16le=pcm,
                     data_purpose={
@@ -376,6 +638,24 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
     downlink_task = None
     v2_streams = None
     active_binding = None
+    capture_input = None
+
+    async def send_control(**event):
+        # Once the peer disconnects, drain queued media without attempting ACK
+        # writes on a closed socket. Only durable frames were ever acknowledged.
+        if capture_input is not None and capture_input.disconnected:
+            return
+        try:
+            await _send_control(websocket, **event)
+        except (WebSocketDisconnect, OSError):
+            if capture_input is None:
+                raise
+            # Overflow may have ended the reader before it could observe EOF.
+            # A send-side disconnect is equally authoritative: stop admission
+            # and ACK writes, while the ordered consumer drains its queued prefix.
+            capture_input.disconnected = True
+            await capture_input.close()
+
     try:
         first = await websocket.receive_text()
         hello_control = parse_client_control_json(first)
@@ -384,8 +664,7 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
         hello = hello_control.hello
         user, _failure = await websocket_auth(websocket, hello.bearer_token)
         if user is None:
-            await _send_control(
-                websocket,
+            await send_control(
                 error=audio_pb2.ProtocolError(
                     code=audio_pb2.PROTOCOL_ERROR_CODE_AUTHENTICATION_FAILED,
                     detail="authentication failed",
@@ -413,21 +692,50 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                 client_id=client_id,
             )
         )
-        await _send_control(
-            websocket,
+        await send_control(
             hello=audio_pb2.ServerHello(
                 client_id=audio_pb2.ClientId(value=client_id),
                 connection_id=audio_pb2.ConnectionId(value=client_state.socket_id),
             ),
         )
 
+        capture_input = _CaptureInput(
+            websocket,
+            partial(
+                _handle_playback_acknowledgement,
+                websocket,
+                responses=responses,
+                user_id=user.user_id,
+                client_id=client_id,
+                socket_id=client_state.socket_id,
+            ),
+        )
         normalizer = None
         active_delivery_class = audio_pb2.DELIVERY_CLASS_UNSPECIFIED
         last_sequence = -1
+        last_monotonic_offset_us = None
         canonical_sequence = 0
         while True:
-            incoming = await websocket.receive()
+            incoming = await capture_input.receive()
             if incoming.get("type") == "websocket.disconnect":
+                # The reader surfaces disconnect only after the admitted prefix
+                # has drained. Publish its exact durable terminal boundary.
+                if v2_streams is not None and active_binding is not None:
+                    await finalize_capture_session(
+                        client_state=client_state,
+                        producer=producer,
+                        user_id=user.user_id,
+                        client_id=client_id,
+                        completion_reason="websocket_disconnect",
+                    )
+                    await v2_streams.end(
+                        audio_pb2.CaptureStreamEvent(
+                            ended=audio_pb2.CaptureStreamEnded(
+                                binding=active_binding,
+                                reason=audio_pb2.STOP_REASON_AUDIO_DISCONNECT,
+                            )
+                        )
+                    )
                 break
             if incoming.get("text") is not None:
                 control = parse_client_control_json(incoming["text"])
@@ -466,7 +774,6 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                         },
                         provenance=provenance,
                     )
-                    active_binding = binding
                     binding = audio_pb2.CaptureBinding(
                         capture_session_id=audio_pb2.CaptureSessionId(
                             value=client_state.stream_session_id
@@ -476,6 +783,7 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                         ),
                         capture_epoch=client_state.capture_epoch,
                     )
+                    active_binding = binding
                     v2_streams = await AudioV2Streams.open(
                         producer.redis_client,
                         event=audio_pb2.CaptureStreamEvent(
@@ -516,8 +824,7 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                         speech_detection_job_id=job_ids["speech_detection"],
                         audio_persistence_job_id=job_ids["audio_persistence"],
                     )
-                    await _send_control(
-                        websocket,
+                    await send_control(
                         capture_started=audio_pb2.CaptureStarted(
                             binding=binding, audio_spec=start.audio_spec
                         ),
@@ -528,6 +835,15 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                     ):
                         raise AudioProtocolV2Error("stop has a stale capture binding")
                     binding = control.stop_capture.binding
+
+                    await runtime.VoiceConversationRuntime(
+                        producer.redis_client
+                    ).end_for_capture(
+                        user_id=str(user.user_id),
+                        client_id=client_id,
+                        binding=binding,
+                        reason="capture_stopped",
+                    )
                     await finalize_capture_session(
                         client_state=client_state,
                         producer=producer,
@@ -544,8 +860,7 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                             )
                         )
                     )
-                    await _send_control(
-                        websocket,
+                    await send_control(
                         capture_stopped=audio_pb2.CaptureStopped(binding=binding),
                     )
                     if interim_task is not None:
@@ -554,12 +869,13 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                         interim_task = None
                     active_delivery_class = audio_pb2.DELIVERY_CLASS_UNSPECIFIED
                     last_sequence = -1
+                    last_monotonic_offset_us = None
                     canonical_sequence = 0
                     normalizer = None
                     v2_streams = None
                     active_binding = None
                 elif event == "heartbeat":
-                    await _send_control(websocket, heartbeat=control.heartbeat)
+                    await send_control(heartbeat=control.heartbeat)
                 elif event == "voice_ready":
                     ready = control.voice_ready
                     if (
@@ -579,34 +895,29 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                         socket_id=client_state.socket_id,
                         capabilities=_voice_capabilities(ready.capabilities),
                     )
-                elif event == "playback_acknowledgement":
-                    acknowledgement = control.playback_acknowledgement
-                    binding = acknowledgement.binding
-                    state = {
-                        audio_pb2.PLAYBACK_STATE_STARTED: "started",
-                        audio_pb2.PLAYBACK_STATE_DONE: "done",
-                        audio_pb2.PLAYBACK_STATE_CANCELLED: "cancelled",
-                        audio_pb2.PLAYBACK_STATE_FAILED: "failed",
-                    }.get(acknowledgement.state)
-                    if state is None:
-                        raise AudioProtocolV2Error("unsupported playback state")
+                elif event == "conversation_command":
+
                     try:
-                        await responses.playback(
-                            response_id=acknowledgement.response_id.value,
-                            generation=acknowledgement.generation,
-                            state=state,
-                            user_id=user.user_id,
+                        snapshot = await runtime.VoiceConversationRuntime(
+                            producer.redis_client
+                        ).control(
+                            control.conversation_command,
+                            user_id=str(user.user_id),
                             client_id=client_id,
-                            audio_session_id=binding.capture_session_id.value,
-                            voice_session_id=binding.voice_session_id.value,
-                            capture_epoch=binding.capture_epoch,
                             socket_id=client_state.socket_id,
-                            monotonic_timestamp_ms=(
-                                acknowledgement.monotonic_timestamp_us // 1_000
-                            ),
+                            event_id=control.event_id.value,
                         )
-                    except ResponseCoordinatorError as error:
-                        raise AudioProtocolV2Error(str(error)) from error
+                    except (ValueError, VoiceSessionError) as error:
+                        # A rejected dialogue action must not tear down durable capture.
+                        await send_control(
+                            error=audio_pb2.ProtocolError(
+                                code=audio_pb2.PROTOCOL_ERROR_CODE_INVALID_TRANSITION,
+                                detail=str(error),
+                                rejected_event_id=control.event_id,
+                            )
+                        )
+                    else:
+                        await send_control(conversation_state=snapshot)
                 elif event == "button_event":
                     button_state = {
                         audio_pb2.BUTTON_STATE_SINGLE_PRESS: "SINGLE_PRESS",
@@ -646,20 +957,23 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                     normalizer=normalizer,
                     v2_streams=v2_streams,
                     canonical_sequence=canonical_sequence,
+                    previous_monotonic_offset_us=last_monotonic_offset_us,
                 )
-                await _send_control(
-                    websocket,
+                await send_control(
                     capture_packet_accepted=audio_pb2.CapturePacketAccepted(
                         binding=packet.binding,
                         sequence=packet.sequence,
                     ),
                 )
                 last_sequence = packet.sequence
+                last_monotonic_offset_us = packet.monotonic_offset_us
             else:
                 raise AudioProtocolV2Error("unsupported WebSocket message")
     except WebSocketDisconnect:
         pass
     except AudioProtocolV2Error as error:
+        if capture_input is not None:
+            await capture_input.close()
         logger.warning(
             "Rejecting audio-v2 client=%s session=%s: %s",
             client_id,
@@ -690,8 +1004,7 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
                 )
             )
         try:
-            await _send_control(
-                websocket,
+            await send_control(
                 error=audio_pb2.ProtocolError(
                     code=audio_pb2.PROTOCOL_ERROR_CODE_INVALID_MEDIA,
                     detail=str(error),
@@ -701,13 +1014,32 @@ async def handle_audio_v2_websocket(websocket: WebSocket) -> None:
         except Exception:
             pass
     finally:
-        if interim_task is not None and not interim_task.done():
-            interim_task.cancel()
-        if downlink_task is not None and not downlink_task.done():
-            downlink_task.cancel()
-            try:
-                await downlink_task
-            except asyncio.CancelledError:
-                pass
+        if capture_input is not None:
+            await capture_input.close()
+        forwarding_tasks = [
+            task for task in (interim_task, downlink_task) if task is not None
+        ]
+        for task in forwarding_tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*forwarding_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Audio-v2 forwarding stopped during socket cleanup: %s", result
+                )
         if client_id is not None and client_state is not None:
+            if producer is not None and active_binding is not None:
+
+                try:
+                    await runtime.VoiceConversationRuntime(
+                        producer.redis_client
+                    ).end_for_capture(
+                        user_id=str(user.user_id),
+                        client_id=client_id,
+                        binding=active_binding,
+                        reason="connection_lost",
+                    )
+                except Exception:
+                    logger.exception("Could not end voice engagement after socket loss")
             await cleanup_client_state(client_id, client_state.socket_id)

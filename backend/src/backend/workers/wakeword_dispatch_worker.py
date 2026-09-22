@@ -33,6 +33,8 @@ from backend.services.plugin_service import (
     initialize_plugins,
     run_plugin_recovery,
 )
+from backend.services.voice_latency import COLLECTION as TIMING_COLLECTION
+from backend.services.voice_latency import VoiceTimingLedger
 from backend.services.wakeword import WakeWordDispatcher
 from backend.services.wakeword.interaction_event_consumer import (
     WakeInteractionEventConsumer,
@@ -82,6 +84,10 @@ async def main():
         await interaction_facts.create_index(
             [("wake_trace_id", 1), ("stage", 1), ("ordinal", 1)], unique=True
         )
+        timing_ledger = VoiceTimingLedger(
+            mongo_client[MONGODB_DATABASE][TIMING_COLLECTION]
+        )
+        await timing_ledger.initialize()
         logger.info("✅ Database (Beanie) initialized for speaker gate")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}", exc_info=True)
@@ -118,7 +124,7 @@ async def main():
         interaction_ledger=interaction_ledger,
     )
     interaction_consumer = WakeInteractionEventConsumer(
-        redis_client, interaction_ledger
+        redis_client, interaction_ledger, timing_ledger
     )
 
     async def stop_consumers() -> None:

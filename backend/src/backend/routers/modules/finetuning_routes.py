@@ -18,7 +18,9 @@ from backend.constants import is_non_enrollable_speaker
 from backend.cron_scheduler import get_scheduler
 from backend.models.annotation import Annotation, AnnotationSource, AnnotationType
 from backend.models.conversation import Conversation
+from backend.services import privacy
 from backend.services.observability.system_events import record_event
+from backend.services.speaker_enrollment import capture_evidence
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.users import User
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
@@ -247,6 +249,15 @@ async def get_enrollment_candidates(
         {"conversation_id": {"$in": list(labels_by_conv.keys())}}
     ).to_list()
 
+    privacy_filter = privacy.ConversationPrivacyFilter()
+    permitted = await privacy_filter.filter(
+        [{"conversation_id": conv.conversation_id} for conv in conversations]
+    )
+    allowed_ids = {row["conversation_id"] for row in permitted}
+    conversations = [
+        conv for conv in conversations if conv.conversation_id in allowed_ids
+    ]
+
     def _clip(conv, segs, i, auto):
         s = segs[i]
         dur = round(s.end - s.start, 2)
@@ -335,6 +346,7 @@ async def get_enrollment_candidates(
             }
         )
 
+    await privacy_filter.assert_current()
     return JSONResponse(
         content={
             "candidates": candidates,
@@ -392,6 +404,8 @@ async def enroll_selected_clips(
     skipped = 0
     errors: list[str] = []
     touched_conv_ids: set[str] = set()
+    policies = {}
+    held = 0
 
     # Cache conversations to avoid refetching per clip
     conv_cache = {}
@@ -413,6 +427,11 @@ async def enroll_selected_clips(
                 errors.append(f"{clip.conversation_id[:8]}: conversation not found")
                 continue
 
+            policy = await privacy.require_record(conv)
+            policies[clip.conversation_id] = (str(conv.user_id), policy)
+            visibility = privacy.ConversationPrivacyFilter()
+            visibility.snapshots[str(conv.user_id)] = policy
+
             # Re-validate the span against the current active version (guards a
             # version change between candidate-fetch and submit).
             segs = conv.active_transcript.segments
@@ -433,6 +452,9 @@ async def enroll_selected_clips(
                 )
                 continue
 
+            evidence_records = await capture_evidence(
+                visibility, [clip.conversation_id]
+            )
             wav_bytes = await reconstruct_audio_segment(
                 conversation_id=clip.conversation_id,
                 start_time=seg.start,
@@ -445,15 +467,22 @@ async def enroll_selected_clips(
                 )
                 continue
 
+            await privacy.assert_current(str(conv.user_id), policy)
             existing = await speaker_client.get_speaker_by_name(
                 speaker_name=clip.speaker, user_id=str(current_user.user_id)
             )
+            await privacy.assert_current(str(conv.user_id), policy)
             if existing:
                 result = await speaker_client.append_to_speaker(
                     speaker_id=existing["id"],
                     audio_data=wav_bytes,
                     user_id=str(current_user.user_id),
+                    speaker_name=clip.speaker,
+                    conversation_ids=[clip.conversation_id],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                await privacy.assert_current(str(conv.user_id), policy)
                 if "error" in result:
                     failed += 1
                     errors.append(
@@ -469,7 +498,11 @@ async def enroll_selected_clips(
                     speaker_name=clip.speaker,
                     audio_data=wav_bytes,
                     user_id=str(current_user.user_id),
+                    conversation_ids=[clip.conversation_id],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                await privacy.assert_current(str(conv.user_id), policy)
                 if "error" in result:
                     failed += 1
                     errors.append(
@@ -483,6 +516,9 @@ async def enroll_selected_clips(
 
             touched_conv_ids.add(clip.conversation_id)
 
+        except privacy.PrivacyHeld:
+            held += 1
+            continue
         except Exception as e:
             failed += 1
             errors.append(
@@ -510,6 +546,8 @@ async def enroll_selected_clips(
             {"conversation_id": {"$in": list(touched_conv_ids)}},
         ).to_list()
         for a in anns:
+            owner, policy = policies[a.conversation_id]
+            await privacy.assert_current(owner, policy)
             if a.processed_by and "training" in a.processed_by:
                 continue
             a.processed_by = (
@@ -531,6 +569,7 @@ async def enroll_selected_clips(
             "enrolled_new": enrolled,
             "appended": appended,
             "total_enrolled": total,
+            "privacy_held": held,
             "failed": failed,
             "skipped": skipped,
             "annotations_marked_trained": marked,

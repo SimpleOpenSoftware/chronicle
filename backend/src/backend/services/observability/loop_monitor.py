@@ -280,6 +280,8 @@ class LoopMonitor:
             maxlen=GC_PAUSE_SAMPLES
         )
         self._gc_started: Optional[float] = None
+        self._gc_context: Optional[dict] = None
+        self._gc_details: deque[dict] = deque(maxlen=GC_PAUSE_SAMPLES)
         self._gc_registered = False
 
     # ------------------------------------------------------------------ #
@@ -290,15 +292,51 @@ class LoopMonitor:
         """Time each collection. Runs on whichever thread triggered it."""
         if phase == "start":
             self._gc_started = time.monotonic()
+            self._gc_context = None
+            if int(info.get("generation", -1)) >= 1:
+                # No locals, object graph, source-line lookup, or I/O inside GC.
+                # The trigger is an allocation site, not necessarily a leak owner.
+                frames = []
+                frame = sys._getframe(1) if self.capture_stacks else None
+                while frame is not None and len(frames) < STACK_DEPTH:
+                    code = frame.f_code
+                    frames.append(
+                        f"{code.co_filename}:{frame.f_lineno} in {code.co_name}"
+                    )
+                    frame = frame.f_back
+                del frame
+                self._gc_context = {
+                    "started_perf_counter_ms": time.perf_counter() * 1000,
+                    "started_wall_ms": time.time() * 1000,
+                    "thread_id": threading.get_ident(),
+                    "trigger_stack": list(reversed(frames)),
+                    "allocation_counts_at_start": list(gc.get_count()),
+                    "thresholds_at_start": list(gc.get_threshold()),
+                }
             return
         started = self._gc_started
+        context = self._gc_context
         self._gc_started = None
+        self._gc_context = None
         if started is None:
             return
         duration = time.monotonic() - started
         if duration >= GC_PAUSE_MIN_SECONDS:
             self._gc_pauses.append(
                 (time.monotonic(), int(info.get("generation", -1)), duration)
+            )
+            self._gc_details.append(
+                {
+                    **(context or {}),
+                    "started_monotonic_ms": started * 1000,
+                    "ended_monotonic_ms": (started + duration) * 1000,
+                    "ended_perf_counter_ms": time.perf_counter() * 1000,
+                    "ended_wall_ms": time.time() * 1000,
+                    "duration_ms": duration * 1000,
+                    "generation": int(info.get("generation", -1)),
+                    "collected": int(info.get("collected", 0)),
+                    "uncollectable": int(info.get("uncollectable", 0)),
+                }
             )
 
     def _gc_pause_during(self, started_at: float, duration: float) -> Optional[tuple]:
@@ -569,6 +607,16 @@ class LoopMonitor:
             by_generation.setdefault(generation, []).append(seconds)
         return {
             "tracked_pauses": len(pauses),
+            "enabled": gc.isenabled(),
+            "thresholds": list(gc.get_threshold()),
+            "allocation_counts": list(gc.get_count()),
+            "generation_stats": gc.get_stats(),
+            "recent_pauses": list(self._gc_details),
+            "clock": {
+                "host": os.uname().nodename,
+                "pid": os.getpid(),
+                "note": "perf_counter timestamps correlate with cadence reports only in this process; wall anchors do not synchronize hosts",
+            },
             "min_tracked_ms": round(GC_PAUSE_MIN_SECONDS * 1000),
             "max_pause_ms": (
                 round(max(s for _e, _g, s in pauses) * 1000, 1) if pauses else None

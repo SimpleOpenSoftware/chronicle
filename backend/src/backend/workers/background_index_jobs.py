@@ -5,11 +5,11 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from pymongo import UpdateOne
 from rq import get_current_job
 
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
 
@@ -18,10 +18,9 @@ MAX_SPEECH_SECONDS = 15.0
 MIN_GAP_SECONDS = 2.0
 MAX_GAP_SECONDS = 8.0
 EMBED_CONCURRENCY = 4
+CORPUS_BATCH_SIZE = 64
 SERVICE_READY_ATTEMPTS = 6
 SERVICE_READY_DELAY_SECONDS = 2
-PROGRESS_INTERVAL = 100
-BULK_WRITE_SIZE = 500
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,47 @@ def _gap_windows(segments: list[dict], duration: float) -> list[tuple[float, flo
     return windows
 
 
-async def _corpus_candidates(requested_by: str) -> list[dict]:
+async def _corpus_batches(cursor):
+    batch = []
+    async for document in cursor:
+        batch.append(document)
+        if len(batch) == CORPUS_BATCH_SIZE:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+async def _admit_corpus_batch(documents):
+    """Share enumeration work, retaining independent recovery on policy changes.
+
+    This admission only enumerates candidates. Each recording still obtains a
+    fresh filter before inference and retains its original claim through publication.
+    """
+    visibility = privacy.ConversationPrivacyFilter()
+    try:
+        allowed = await visibility.filter(documents)
+        await visibility.assert_current()
+    except privacy.PrivacyHeld:
+        if len(documents) == 1:
+            return [], 1
+        # Discard the batch's admission entirely. An updating source must not
+        # starve other devices, so retry each original document independently.
+        admitted, deferred = [], 0
+        for document in documents:
+            rows, held = await _admit_corpus_batch([document])
+            admitted.extend(rows)
+            deferred += held
+        return admitted, deferred
+    return [
+        (document, visibility.originals[document["conversation_id"]])
+        for document in allowed
+    ], 0
+
+
+async def _corpus_candidates(
+    requested_by: str,
+) -> tuple[list[tuple[dict, list[dict]]], int]:
     query = {
         "user_id": requested_by,
         "deleted": {"$ne": True},
@@ -77,55 +116,62 @@ async def _corpus_candidates(requested_by: str) -> list[dict]:
         "active_transcript_version": 1,
         "transcript_versions": 1,
     }
-    candidates: list[dict] = []
-    async for doc in Conversation.get_pymongo_collection().find(query, projection):
-        conversation_id = doc["conversation_id"]
-        duration = float(doc.get("audio_total_duration") or 0.0)
-        segments = _active_segments(doc)
-        for segment_index, segment in enumerate(segments):
-            if segment.get("segment_type", "speech") != "speech":
-                continue
-            start = float(segment.get("start", 0))
-            end = min(
-                float(segment.get("end", 0)), start + MAX_SPEECH_SECONDS, duration
-            )
-            if end - start < MIN_SPEECH_SECONDS:
-                continue
-            candidates.append(
-                {
-                    "clip_key": f"{conversation_id}:{start:.3f}:{end:.3f}:speech",
-                    "conversation_id": conversation_id,
-                    "conversation_title": doc.get("title") or conversation_id[:8],
-                    "conversation_date": doc.get("created_at"),
-                    "segment_index": segment_index,
-                    "start": start,
-                    "end": end,
-                    "duration": end - start,
-                    "text": (segment.get("text") or "")[:300],
-                    "candidate_type": "background_speech",
-                    "current_label": segment.get("identified_as")
-                    or segment.get("speaker"),
-                    "stored_confidence": segment.get("confidence"),
-                }
-            )
-        for start, end in _gap_windows(segments, duration):
-            candidates.append(
-                {
-                    "clip_key": f"{conversation_id}:{start:.3f}:{end:.3f}:noise",
-                    "conversation_id": conversation_id,
-                    "conversation_title": doc.get("title") or conversation_id[:8],
-                    "conversation_date": doc.get("created_at"),
-                    "segment_index": -1,
-                    "start": start,
-                    "end": end,
-                    "duration": end - start,
-                    "text": "",
-                    "candidate_type": "noise",
-                    "current_label": None,
-                    "stored_confidence": None,
-                }
-            )
-    return candidates
+    recordings = []
+    deferred = 0
+    cursor = Conversation.get_pymongo_collection().find(query, projection)
+    async for batch in _corpus_batches(cursor):
+        admitted, held = await _admit_corpus_batch(batch)
+        deferred += held
+        for doc, original in admitted:
+            conversation_id = doc["conversation_id"]
+            candidates: list[dict] = []
+            duration = float(doc.get("audio_total_duration") or 0.0)
+            segments = _active_segments(doc)
+            for segment_index, segment in enumerate(segments):
+                if segment.get("segment_type", "speech") != "speech":
+                    continue
+                start = float(segment.get("start", 0))
+                end = min(
+                    float(segment.get("end", 0)), start + MAX_SPEECH_SECONDS, duration
+                )
+                if end - start < MIN_SPEECH_SECONDS:
+                    continue
+                candidates.append(
+                    {
+                        "clip_key": f"{conversation_id}:{start:.3f}:{end:.3f}:speech",
+                        "conversation_id": conversation_id,
+                        "conversation_title": doc.get("title") or conversation_id[:8],
+                        "conversation_date": doc.get("created_at"),
+                        "segment_index": segment_index,
+                        "start": start,
+                        "end": end,
+                        "duration": end - start,
+                        "text": (segment.get("text") or "")[:300],
+                        "candidate_type": "background_speech",
+                        "current_label": segment.get("identified_as")
+                        or segment.get("speaker"),
+                        "stored_confidence": segment.get("confidence"),
+                    }
+                )
+            for start, end in _gap_windows(segments, duration):
+                candidates.append(
+                    {
+                        "clip_key": f"{conversation_id}:{start:.3f}:{end:.3f}:noise",
+                        "conversation_id": conversation_id,
+                        "conversation_title": doc.get("title") or conversation_id[:8],
+                        "conversation_date": doc.get("created_at"),
+                        "segment_index": -1,
+                        "start": start,
+                        "end": end,
+                        "duration": end - start,
+                        "text": "",
+                        "candidate_type": "noise",
+                        "current_label": None,
+                        "stored_confidence": None,
+                    }
+                )
+            recordings.append((original, candidates))
+    return recordings, deferred
 
 
 def _progress(current: int, total: int, message: str) -> None:
@@ -153,7 +199,7 @@ async def _wait_for_embedding_model(client: SpeakerRecognitionClient) -> str:
         if attempt < SERVICE_READY_ATTEMPTS - 1:
             _progress(0, 0, "Waiting for speaker recognition…")
             await asyncio.sleep(SERVICE_READY_DELAY_SECONDS)
-    raise RuntimeError(f"Could not resolve speaker embedding model: {last_info}")
+    raise RuntimeError("Could not resolve speaker embedding model")
 
 
 @async_job(redis=False, beanie=True, timeout=14400)
@@ -169,111 +215,141 @@ async def index_background_corpus_job(requested_by: str, source_revision: str) -
     model = await _wait_for_embedding_model(client)
 
     phase_started = time.perf_counter()
-    candidates = await _corpus_candidates(requested_by)
+    recordings, held_recordings = await _corpus_candidates(requested_by)
     timings["enumerate_corpus_s"] = time.perf_counter() - phase_started
     job = get_current_job()
     run_id = job.id if job else datetime.now(timezone.utc).isoformat()
-    candidate_keys = [candidate["clip_key"] for candidate in candidates]
-    phase_started = time.perf_counter()
-    cached_ids = {
-        row["clip_key"]: row["_id"]
-        async for row in cache.find(
-            {
-                "requested_by": requested_by,
-                "clip_key": {"$in": candidate_keys},
-                "embedding_model": model,
-                "embedding": {"$exists": True, "$ne": None},
-            },
-            {"clip_key": 1},
-        )
-    }
-    timings["load_cache_s"] = time.perf_counter() - phase_started
-    cached_candidates = [
-        candidate for candidate in candidates if candidate["clip_key"] in cached_ids
-    ]
-    missing_candidates = [
-        candidate for candidate in candidates if candidate["clip_key"] not in cached_ids
-    ]
+    total = sum(len(candidates) for _, candidates in recordings)
     semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
     progress_lock = asyncio.Lock()
-    completed = len(cached_candidates)
-    cached_count = len(cached_candidates)
-    embedded_count = 0
-    failures = 0
+    completed = cached_count = embedded_count = failures = 0
 
-    phase_started = time.perf_counter()
-    for offset in range(0, len(cached_candidates), BULK_WRITE_SIZE):
-        batch = cached_candidates[offset : offset + BULK_WRITE_SIZE]
-        if batch:
-            await cache.bulk_write(
-                [
-                    UpdateOne(
-                        {"_id": cached_ids[candidate["clip_key"]]},
-                        {"$set": {"run_id": run_id, **candidate}},
-                    )
-                    for candidate in batch
-                ],
-                ordered=False,
-            )
-    timings["refresh_cached_metadata_s"] = time.perf_counter() - phase_started
-    _progress(
-        completed,
-        len(candidates),
-        f"Loaded {completed}/{len(candidates)} cached background vectors",
-    )
-
-    async def index(candidate: dict) -> None:
-        nonlocal completed, embedded_count, failures
+    async def index_recording(original: dict, candidates: list[dict]) -> None:
+        nonlocal completed, cached_count, embedded_count, failures, held_recordings
         async with semaphore:
+            # The first admission identifies the exact capture used to enumerate
+            # candidate offsets. Re-reading cannot silently retarget those offsets.
+            visibility = privacy.ConversationPrivacyFilter()
+            cid = original["conversation_id"]
+            visibility.originals[cid] = original
             try:
-                wav = await reconstruct_audio_segment(
-                    candidate["conversation_id"],
-                    candidate["start"],
-                    candidate["end"],
+                if not await visibility.filter([{"conversation_id": cid}]):
+                    raise privacy.PrivacyHeld()
+                receipt = await visibility.reference_receipt(
+                    requested_by, conversation_ids=[cid]
                 )
-                result = await client.extract_speaker_embedding(wav)
-                if result.get("error") or not result.get("embedding"):
-                    raise RuntimeError(str(result))
-                await cache.update_one(
-                    {
-                        "requested_by": requested_by,
-                        "clip_key": candidate["clip_key"],
-                        "embedding_model": model,
-                    },
-                    {
-                        "$set": {
-                            **candidate,
-                            **result,
-                            "requested_by": requested_by,
-                            "run_id": run_id,
-                            "indexed_at": datetime.now(timezone.utc),
-                        }
-                    },
-                    upsert=True,
+                cached_rows = await visibility.filter_embeddings(
+                    [
+                        row
+                        async for row in cache.find(
+                            {
+                                "requested_by": requested_by,
+                                "conversation_id": cid,
+                                "embedding_model": model,
+                                "embedding": {"$exists": True, "$ne": None},
+                            }
+                        )
+                    ]
                 )
-                embedded_count += 1
-            except Exception:
-                failures += 1
-        async with progress_lock:
-            completed += 1
-            if completed == len(candidates) or completed % PROGRESS_INTERVAL == 0:
-                _progress(
-                    completed,
-                    len(candidates),
-                    f"Embedding new background audio {completed}/{len(candidates)}",
-                )
+                cached = {row["clip_key"]: row for row in cached_rows}
+                await visibility.assert_current()
+                for candidate in candidates:
+                    try:
+                        # Also detect a rewritten capture claim before reconstructing
+                        # or attaching fresh metadata to a previously cached vector.
+                        if not await visibility.filter([{"conversation_id": cid}]):
+                            raise privacy.PrivacyHeld()
+                        await visibility.assert_current()
+                        hit = cached.get(candidate["clip_key"])
+                        if hit:
+                            values = {
+                                "run_id": run_id,
+                                **candidate,
+                                "privacy_reference_receipt": sorted(
+                                    set(receipt) | set(hit["privacy_reference_receipt"])
+                                ),
+                            }
+                            query = {"_id": hit["_id"]}
+                        else:
+                            wav = await reconstruct_audio_segment(
+                                cid, candidate["start"], candidate["end"]
+                            )
+                            if not await visibility.filter([{"conversation_id": cid}]):
+                                raise privacy.PrivacyHeld()
+                            await visibility.assert_current()
+                            result = await client.extract_speaker_embedding(wav)
+                            await visibility.assert_current()
+                            if (
+                                result.get("error")
+                                or not result.get("embedding")
+                                or result.get("embedding_model") != model
+                            ):
+                                raise RuntimeError("Speaker embedding unavailable")
+                            values = {
+                                **candidate,
+                                **result,
+                                "privacy_reference_receipt": receipt,
+                                "requested_by": requested_by,
+                                "run_id": run_id,
+                                "indexed_at": datetime.now(timezone.utc),
+                            }
+                            query = {
+                                "requested_by": requested_by,
+                                "clip_key": candidate["clip_key"],
+                                "embedding_model": model,
+                            }
+                        async with visibility.publication():
+                            # Reject capture rewrites during inference as well as
+                            # policy changes. Publication owns the original owners' locks.
+                            if not await visibility.filter([{"conversation_id": cid}]):
+                                raise privacy.PrivacyHeld()
+                            await cache.update_one(
+                                query, {"$set": values}, upsert=not bool(hit)
+                            )
+                        if hit:
+                            cached_count += 1
+                        else:
+                            embedded_count += 1
+                    except privacy.PrivacyHeld:
+                        raise
+                    except Exception:
+                        failures += 1
+            except privacy.PrivacyHeld:
+                held_recordings += 1
+            finally:
+                async with progress_lock:
+                    completed += len(candidates)
+                    _progress(
+                        completed,
+                        total,
+                        f"Indexed {cached_count + embedded_count}/{total} vectors; "
+                        f"{held_recordings} recordings held",
+                    )
 
     phase_started = time.perf_counter()
-    await asyncio.gather(*(index(candidate) for candidate in missing_candidates))
-    timings["embed_missing_s"] = time.perf_counter() - phase_started
-    phase_started = time.perf_counter()
-    await cache.delete_many(
-        {
-            "requested_by": requested_by,
-            "embedding_model": model,
-            "run_id": {"$ne": run_id},
-        }
+    # Drain every independent recording. A hold discards that recording's pending
+    # results without starving recordings whose original evidence remains allowed.
+    outcomes = await asyncio.gather(
+        *(index_recording(original, candidates) for original, candidates in recordings),
+        return_exceptions=True,
     )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    timings["embed_missing_s"] = time.perf_counter() - phase_started
+    if held_recordings:
+        # Successful per-recording cache entries are durable and can be resumed.
+        # Do not stamp the full corpus current or delete untouched cache entries.
+        raise privacy.PrivacyHeld()
+    phase_started = time.perf_counter()
+    if not failures:
+        await cache.delete_many(
+            {
+                "requested_by": requested_by,
+                "embedding_model": model,
+                "run_id": {"$ne": run_id},
+            }
+        )
     counts = {
         kind: await cache.count_documents(
             {
@@ -287,21 +363,22 @@ async def index_background_corpus_job(requested_by: str, source_revision: str) -
     await database["background_cluster_cache"].delete_many(
         {"requested_by": requested_by}
     )
-    await database["background_index_runs"].update_one(
-        {"requested_by": requested_by},
-        {
-            "$set": {
-                "source_revision": source_revision,
-                "indexed_at": datetime.now(timezone.utc),
-            }
-        },
-    )
+    if not failures:
+        await database["background_index_runs"].update_one(
+            {"requested_by": requested_by},
+            {
+                "$set": {
+                    "source_revision": source_revision,
+                    "indexed_at": datetime.now(timezone.utc),
+                }
+            },
+        )
     timings["finalize_s"] = time.perf_counter() - phase_started
     timings["total_s"] = time.perf_counter() - started_at
     timings = {name: round(seconds, 3) for name, seconds in timings.items()}
     logger.info(
         "Background corpus index timings (%d vectors, %d cached): %s",
-        len(candidates),
+        total,
         cached_count,
         timings,
     )

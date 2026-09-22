@@ -1,5 +1,22 @@
 # Chronicle Design System
 
+## Current production theme
+
+The WebUI uses the Espresso palette in `backend/webui/chronicle-espresso-preset.js`.
+Its copy in `extras/speaker-recognition/webui/chronicle-espresso-preset.js` must stay
+identical. Tailwind gray utilities resolve to warm espresso neutrals and blue
+utilities resolve to terracotta. The original exported specimens below predate
+this palette; their literal blue/gray values are historical, not production defaults.
+
+`backend/webui/src/index.css` defines the shared workspace roles in both themes:
+`--chronicle-navigation` for navigation, `--tape-paper` for workspaces,
+`--tape-paper-raised` for cards and inputs, `--tape-ink` for primary text,
+`--tape-activity` for readable secondary text, `--tape-line` for control/card borders,
+and `--tape-focus`/`--tape-selected` for focus and selection. Use these roles when
+combining recording search with Timeline surfaces. Do not create another palette.
+Shared icon actions use a 44px minimum hit area; visible glyphs remain compact.
+
+
 A design system **reverse-engineered from the Chronicle admin dashboard code** — the
 project was AI-generated with inline Tailwind and never built off a system, so this
 captures the patterns that already recur across the product and turns them into reusable

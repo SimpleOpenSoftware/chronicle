@@ -233,7 +233,7 @@ export default function PluginAssistant() {
               Plugin Configuration Assistant
             </h3>
             <p className="text-sm text-gray-500 dark:text-gray-400 mb-6 max-w-md">
-              Ask me to create, configure, enable, disable, or test your plugins. I can generate plugin code, inspect settings, and apply changes for you.
+              Inspect plugin activity or request configuration changes.
             </p>
             <div className="flex flex-wrap gap-2 justify-center max-w-lg">
               {EXAMPLE_PROMPTS.map((prompt) => (

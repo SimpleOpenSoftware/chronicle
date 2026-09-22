@@ -34,7 +34,9 @@ def _conv(**overrides):
         active_transcript_version=None,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    result = SimpleNamespace(**base)
+    result.model_dump = lambda: dict(base)
+    return result
 
 
 def _chunk(start: float, end: float, scores, hop_ms: float = 100.0):
@@ -226,6 +228,15 @@ def _segment(start, end, text, speaker="speaker_0"):
 
 
 class TestPreviewExport:
+    @pytest.fixture(autouse=True)
+    def privacy_database(self, monkeypatch):
+        from mongomock_motor import AsyncMongoMockClient
+
+        from backend.services import privacy
+
+        database = AsyncMongoMockClient().privacy_export_test
+        monkeypatch.setattr(privacy, "database", lambda: database)
+
     @pytest.mark.asyncio
     async def test_preview_returns_clips_with_sliced_transcripts(self, monkeypatch):
         segments = [
@@ -233,6 +244,7 @@ class TestPreviewExport:
             _segment(21.0, 23.0, "second clip words"),
         ]
         version = SimpleNamespace(version_id="v1", segments=segments)
+        version.model_dump = lambda: {"version_id": "v1", "segments": segments}
         conv = _conv(transcript_versions=[version], active_transcript_version="v1")
         _FakeConversationCls.docs = {"conv-1": conv}
         monkeypatch.setattr(data_audit_controller, "Conversation", _FakeConversationCls)

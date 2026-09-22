@@ -10,6 +10,7 @@ from typing import Optional
 from beanie import PydanticObjectId
 from fastapi.responses import JSONResponse
 
+import backend.services.privacy as privacy
 from backend.controllers.conversation_controller import _memory_audit_to_dict
 from backend.models.conversation import Conversation
 from backend.models.memory_audit import MemoryAuditEntry
@@ -48,6 +49,16 @@ async def get_memory_audit(
             query = query.find(MemoryAuditEntry.conversation_id == conversation_id)
 
         entries = await query.sort(-MemoryAuditEntry.created_at).limit(limit).to_list()
+
+        private_paths = {
+            path.casefold()
+            for path in await privacy.quarantined_vault_paths(target_user_id)
+        }
+        entries = [
+            entry
+            for entry in entries
+            if not entry.note_path or entry.note_path.casefold() not in private_paths
+        ]
 
         return {
             "user_id": target_user_id,
@@ -93,6 +104,15 @@ async def get_memory_audit_diff(user: User, entry_id: str):
         if entry.user_id != user.user_id and not user.is_superuser:
             return JSONResponse(
                 status_code=403, content={"message": "Not authorized for this entry"}
+            )
+
+        if entry.note_path and entry.note_path.casefold() in {
+            path.casefold()
+            for path in await privacy.quarantined_vault_paths(entry.user_id)
+        }:
+            return JSONResponse(
+                status_code=423,
+                content={"message": "This note is held by privacy settings"},
             )
 
         after_text = entry.after_text

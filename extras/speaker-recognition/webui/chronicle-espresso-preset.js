@@ -24,7 +24,7 @@
 
 // warm espresso neutrals (DS gray scale, extended to 950)
 const espresso = {
-  50: '#f7f3ea', 100: '#f2ece2', 200: '#ddd5c6', 300: '#c9bfae', 400: '#948976',
+  50: '#f7f3ea', 100: '#f2ece2', 200: '#ddd5c6', 300: '#c9bfae', 400: '#b5a791',
   500: '#6b5f4f', 600: '#42392f', 700: '#2c251d', 800: '#211b15', 900: '#191410', 950: '#120d0a',
 }
 

@@ -24,7 +24,10 @@ from backend.models.conversation import Conversation
 from backend.models.user import User
 from backend.prompt_registry import get_prompt_registry
 from backend.redis_factory import create_async_redis
+from backend.services import privacy
 from backend.services.memory import get_memory_service
+from backend.services.speaker_enrollment import capture_evidence
+from backend.services.transcription.context import cached_jargon, jargon_cache_key
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import (
     reconstruct_audio_segment,
@@ -91,6 +94,7 @@ async def run_speaker_finetuning_job() -> dict:
     appended = 0
     failed = 0
     cleaned = 0
+    held = 0
 
     skipped = 0
 
@@ -121,6 +125,10 @@ async def run_speaker_finetuning_job() -> dict:
                 cleaned += 1
                 continue
 
+            policy = await privacy.require_record(conversation)
+            visibility = privacy.ConversationPrivacyFilter()
+            visibility.snapshots[str(conversation.user_id)] = policy
+
             if annotation.segment_index >= len(conversation.active_transcript.segments):
                 logger.warning(
                     f"Invalid segment index {annotation.segment_index} for "
@@ -133,6 +141,9 @@ async def run_speaker_finetuning_job() -> dict:
 
             segment = conversation.active_transcript.segments[annotation.segment_index]
 
+            evidence_records = await capture_evidence(
+                visibility, [annotation.conversation_id]
+            )
             wav_bytes = await reconstruct_audio_segment(
                 conversation_id=annotation.conversation_id,
                 start_time=segment.start,
@@ -143,17 +154,24 @@ async def run_speaker_finetuning_job() -> dict:
                 await _record_failure(annotation, "No audio for segment")
                 continue
 
+            await privacy.assert_current(str(conversation.user_id), policy)
             existing_speaker = await speaker_client.get_speaker_by_name(
                 speaker_name=annotation.corrected_speaker,
                 user_id=conversation.user_id,
             )
 
+            await privacy.assert_current(str(conversation.user_id), policy)
             if existing_speaker:
                 result = await speaker_client.append_to_speaker(
                     speaker_id=existing_speaker["id"],
                     audio_data=wav_bytes,
                     user_id=conversation.user_id,
+                    speaker_name=annotation.corrected_speaker,
+                    conversation_ids=[annotation.conversation_id],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                await privacy.assert_current(str(conversation.user_id), policy)
                 if "error" in result:
                     failed += 1
                     await _record_failure(
@@ -169,7 +187,11 @@ async def run_speaker_finetuning_job() -> dict:
                     speaker_name=annotation.corrected_speaker,
                     audio_data=wav_bytes,
                     user_id=conversation.user_id,
+                    conversation_ids=[annotation.conversation_id],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                await privacy.assert_current(str(conversation.user_id), policy)
                 if "error" in result:
                     failed += 1
                     await _record_failure(
@@ -181,16 +203,20 @@ async def run_speaker_finetuning_job() -> dict:
                 else:
                     enrolled += 1
 
-            # Mark as trained (clear any prior failure record)
-            annotation.processed_by = (
-                f"{annotation.processed_by},training"
-                if annotation.processed_by
-                else "training"
-            )
-            annotation.training_error = None
-            annotation.updated_at = datetime.now(timezone.utc)
-            await annotation.save()
+            async with visibility.publication():
+                # Mark as trained (clear any prior failure record)
+                annotation.processed_by = (
+                    f"{annotation.processed_by},training"
+                    if annotation.processed_by
+                    else "training"
+                )
+                annotation.training_error = None
+                annotation.updated_at = datetime.now(timezone.utc)
+                await annotation.save()
 
+        except privacy.PrivacyHeld:
+            held += 1
+            continue
         except Exception as e:
             logger.error(
                 f"Speaker finetuning: error processing annotation {annotation.id}: {e}"
@@ -216,6 +242,7 @@ async def run_speaker_finetuning_job() -> dict:
         "skipped": skipped,
         "cleaned": cleaned,
         "processed": total,
+        "privacy_held": held,
     }
 
 
@@ -310,6 +337,8 @@ async def run_asr_finetuning_job() -> dict:
             by_conversation.setdefault(a.conversation_id, []).append(a)
 
     errors = 0
+    held = 0
+    snapshots = []
 
     # Accumulate all conversations into a single batch for one POST
     all_files = []  # list of ("audio_files", (filename, BytesIO, mime))
@@ -332,6 +361,9 @@ async def run_asr_finetuning_job() -> dict:
                     errors += 1
                     continue
 
+                policy = await privacy.require_record(conversation)
+                owner = str(conversation.user_id)
+
                 if not conversation.active_transcript.segments:
                     logger.info(
                         f"ASR finetuning: conversation {conv_id} has no segments, skipping"
@@ -347,6 +379,8 @@ async def run_asr_finetuning_job() -> dict:
                     errors += 1
                     continue
 
+                await privacy.assert_current(owner, policy)
+
                 # Build training label
                 label = _build_vibevoice_label(conversation)
                 if not label.get("segments"):
@@ -357,10 +391,9 @@ async def run_asr_finetuning_job() -> dict:
 
                 # Try to add jargon context from Redis cache
                 if conversation.user_id:
-                    jargon = await redis_client.get(
-                        f"asr:jargon:{conversation.user_id}"
-                    )
+                    jargon, context_policy, _ = await cached_jargon(owner, redis_client)
                     if jargon:
+                        snapshots.append((owner, context_policy))
                         label["customized_context"] = [
                             t.strip() for t in jargon.split(",") if t.strip()
                         ]
@@ -373,7 +406,11 @@ async def run_asr_finetuning_job() -> dict:
                 )
                 all_labels.append(label)
                 pending_annotations.extend(conv_annotations)
+                snapshots.append((owner, policy))
 
+            except privacy.PrivacyHeld:
+                held += 1
+                continue
             except Exception as e:
                 logger.error(
                     f"ASR finetuning: error processing conversation {conv_id}: {e}"
@@ -389,6 +426,7 @@ async def run_asr_finetuning_job() -> dict:
             "conversations_exported": 0,
             "annotations_consumed": 0,
             "errors": errors,
+            "privacy_held": held,
             "message": "No valid conversations to export",
         }
 
@@ -398,11 +436,16 @@ async def run_asr_finetuning_job() -> dict:
 
     async with httpx.AsyncClient(timeout=600) as client:
         try:
+            for owner, snapshot in snapshots:
+                await privacy.assert_current(owner, snapshot)
             response = await client.post(
                 f"{vibevoice_url}/fine-tune",
                 files=all_files,
                 data={"labels": json.dumps(all_labels)},
             )
+
+            for owner, snapshot in snapshots:
+                await privacy.assert_current(owner, snapshot)
 
             if response.status_code == 200:
                 exported = len(all_files)
@@ -412,6 +455,8 @@ async def run_asr_finetuning_job() -> dict:
 
                 # Mark all annotations as consumed
                 for ann in pending_annotations:
+                    for owner, snapshot in snapshots:
+                        await privacy.assert_current(owner, snapshot)
                     ann.processed_by = (
                         f"{ann.processed_by},{_ASR_TRAINING_MARKER}"
                         if ann.processed_by
@@ -422,13 +467,14 @@ async def run_asr_finetuning_job() -> dict:
                     consumed += 1
             else:
                 logger.error(
-                    f"ASR finetuning: batch POST failed: "
-                    f"{response.status_code} {response.text[:200]}"
+                    f"ASR finetuning: batch POST failed: " f"{response.status_code}"
                 )
                 errors += len(all_files)
 
+        except privacy.PrivacyHeld:
+            held += len(all_files)
         except Exception as e:
-            logger.error(f"ASR finetuning: batch POST error: {e}")
+            logger.error("ASR finetuning: batch POST failed (%s)", type(e).__name__)
             errors += len(all_files)
 
     logger.info(
@@ -439,6 +485,7 @@ async def run_asr_finetuning_job() -> dict:
         "conversations_exported": exported,
         "annotations_consumed": consumed,
         "errors": errors,
+        "privacy_held": held,
     }
 
 
@@ -459,17 +506,27 @@ async def run_asr_jargon_extraction_job() -> dict:
         for user in users:
             user_id = str(user.id)
             try:
-                jargon = await _extract_jargon_for_user(user_id)
+                snapshot = await privacy.load_snapshot(user_id)
+                await privacy.assert_current(user_id, snapshot)
+                jargon = await _extract_jargon_for_user(user_id, snapshot)
                 if jargon:
+                    await privacy.assert_current(user_id, snapshot)
                     await redis_client.set(
-                        f"asr:jargon:{user_id}", jargon, ex=JARGON_CACHE_TTL
+                        jargon_cache_key(user_id, snapshot),
+                        json.dumps(jargon),
+                        ex=JARGON_CACHE_TTL,
                     )
+                    await privacy.assert_current(user_id, snapshot)
                     processed += 1
-                    logger.debug(f"Cached jargon for user {user_id}: {jargon[:80]}...")
+                    logger.debug(
+                        "Cached ASR vocabulary (%d characters)", len(jargon["text"])
+                    )
                 else:
                     skipped += 1
+            except privacy.PrivacyHeld:
+                skipped += 1
             except Exception as e:
-                logger.error(f"Jargon extraction failed for user {user_id}: {e}")
+                logger.error("Jargon extraction failed (%s)", type(e).__name__)
                 errors += 1
     finally:
         await redis_client.close()
@@ -481,10 +538,10 @@ async def run_asr_jargon_extraction_job() -> dict:
     return {"users_processed": processed, "skipped": skipped, "errors": errors}
 
 
-async def _extract_jargon_for_user(user_id: str) -> Optional[str]:
+async def _extract_jargon_for_user(user_id: str, snapshot) -> Optional[dict]:
     """Pull recent memories, call LLM to extract jargon terms.
 
-    Returns a comma-separated string of jargon terms, or None if nothing found.
+    Return terms and immutable note evidence, or None if nothing was found.
     """
     memory_service = get_memory_service()
     if memory_service is None:
@@ -503,18 +560,26 @@ async def _extract_jargon_for_user(user_id: str) -> Optional[str]:
     if not memory_text.strip():
         return None
 
+    receipt = await privacy.vault_reference_receipt(
+        user_id,
+        [memory.id for memory in memories if memory.content],
+        snapshot=snapshot,
+    )
+
     # Use LLM to extract jargon
     registry = get_prompt_registry()
     prompt_template = await registry.get_prompt(
         "asr.jargon_extraction", memories=memory_text
     )
 
+    await privacy.assert_current(user_id, snapshot)
     result = await async_generate(prompt_template)
+    await privacy.assert_current(user_id, snapshot)
 
     # Clean up: strip whitespace, remove empty items
     if result:
         terms = [t.strip() for t in result.split(",") if t.strip()]
         if terms:
-            return ", ".join(terms)
+            return {"text": ", ".join(terms), "privacy_reference_receipt": receipt}
 
     return None

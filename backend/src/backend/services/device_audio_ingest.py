@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import tempfile
 import wave
@@ -12,6 +13,8 @@ from typing import Any, Sequence
 
 from beanie import PydanticObjectId
 
+import backend.services.privacy as privacy
+import backend.services.privacy_audio_recovery as privacy_audio_recovery
 from backend.config import require_speech_for_transcription
 from backend.controllers.audio_controller import materialize_and_process_audio_claim
 from backend.models.audio_capture import AudioRangeRef
@@ -35,6 +38,9 @@ _SESSION_GAP = timedelta(seconds=60)
 _CLOSE_DELAY = timedelta(seconds=90)
 # Ingest attempts allowed for one session start before its chunks are dropped.
 _MAX_INGEST_ATTEMPTS = 5
+# Transform identity: corrected assembly must never overwrite retained captures
+# or adopt conversations produced by a different sample-time mapping.
+_CAPTURE_ASSEMBLY_VERSION = "aligned-v2"
 # How much contiguous capture is mixed and profiled at once. This bounds *compute*,
 # not conversations: where one recording ends is decided afterwards, from the speech
 # profile (see plan_session_cuts). ScreenPipe records continuously, so the 60s gap
@@ -236,7 +242,7 @@ def _capture_external_source_id(
     """Stable identity for one closed ScreenPipe compute window."""
     capture_source_id = _audio_capture_source_id(source_id, direction, session)
     return (
-        f"screenpipe-capture:{capture_source_id}:"
+        f"screenpipe-capture:{_CAPTURE_ASSEMBLY_VERSION}:{capture_source_id}:"
         f"{session[0].source_item_id}-{session[-1].source_item_id}"
     )
 
@@ -322,7 +328,7 @@ async def _mix_session(
         )
         labels.append(f"[{label}]")
     chains.append(
-        f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=1,alimiter=limit=0.95[out]"
+        f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=1,alimiter=limit=0.95:latency=1[out]"
     )
     command.extend(
         [
@@ -357,7 +363,217 @@ class _Segment:
     path: Path
     started_at: datetime
     ended_at: datetime
-    profile: AudioEvidenceProfile
+    profile: AudioEvidenceProfile | None
+    privacy_partition: bool = False
+
+
+def _unprocessed_spans(spans, processed_spans):
+    for done_start, done_end in processed_spans:
+        remaining = []
+        for low, high in spans:
+            if done_end <= low or done_start >= high:
+                remaining.append((low, high))
+            else:
+                if low < done_start:
+                    remaining.append((low, done_start))
+                if done_end < high:
+                    remaining.append((done_end, high))
+        spans = remaining
+    return spans
+
+
+def _audio_input_identity(session):
+    """Exact retained bytes and assembly inputs; never an acoustic similarity key."""
+    inputs = []
+    for item in session:
+        data = getattr(item, "media_data", None)
+        if not isinstance(data, bytes) or not data:
+            return None
+        inputs.append(
+            {
+                "stream": audio_stream_key(item),
+                "source_item_id": item.source_item_id,
+                "started_at": _as_utc(item.captured_at).isoformat(),
+                "ended_at": _as_utc(item.ended_at or item.captured_at).isoformat(),
+                "suffix": Path(item.media_filename or "chunk.wav").suffix or ".wav",
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    return hashlib.sha256(
+        json.dumps(
+            [_CAPTURE_ASSEMBLY_VERSION, inputs], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+
+
+async def _screened_audio_has_no_new_work(user_id, source_id, input_identity):
+    """Skip repeat assembly only after successful persistence of these exact inputs.
+
+    This receipt never establishes permission. Recompute allowed spans from current
+    policy on every attempt so an override can make previously held audio eligible.
+    """
+    if input_identity is None:
+        return False
+
+    scope = {"user_id": str(user_id), "source_id": source_id}
+    receipt = await privacy.database().privacy_audio_inputs.find_one(
+        {"_id": input_identity, **scope}
+    )
+    if receipt is None:
+        return False
+    start, end = privacy.utc(receipt["started_at"]), privacy.utc(receipt["ended_at"])
+    progress = (
+        await privacy.database().privacy_audio_progress.find_one(
+            {"_id": receipt["progress_id"], **scope}
+        )
+        or {}
+    )
+    done = [
+        (privacy.utc(s["started_at"]), privacy.utc(s["ended_at"]))
+        for s in progress.get("completed", [])
+    ]
+    if privacy.merged(done) == [(start, end)]:
+        # A crash after completion but before ingress cleanup must resume the
+        # existing capture validation and deletion path, retaining raw evidence.
+        return False
+    spans = await privacy.capture_screening_spans(user_id, source_id, start, end)
+    if spans is None or _unprocessed_spans(spans, done):
+        return False
+    return True
+
+
+def _privacy_segments(segments, snapshot, source_id, processed_spans=()):
+    """Slice transient processing WAVs; canonical capture and clocks never move."""
+    safe = []
+    for segment in segments:
+        spans = snapshot.allowed_spans(source_id, segment.started_at, segment.ended_at)
+        spans = _unprocessed_spans(spans, processed_spans)
+        if spans == [(segment.started_at, segment.ended_at)]:
+            safe.append(segment)
+            continue
+        if not spans:
+            continue
+        with wave.open(str(segment.path), "rb") as audio:
+            rate, channels, width = (
+                audio.getframerate(),
+                audio.getnchannels(),
+                audio.getsampwidth(),
+            )
+            pcm = audio.readframes(audio.getnframes())
+        stride = channels * width
+        for index, (start, end) in enumerate(spans):
+            low = round((start - _as_utc(segment.started_at)).total_seconds() * rate)
+            high = round((end - _as_utc(segment.started_at)).total_seconds() * rate)
+            piece = pcm[low * stride : high * stride]
+            if not piece:
+                continue
+            path = segment.path.with_name(
+                f"{segment.path.stem}-private-cut-{index}.wav"
+            )
+            _write_wav(path, piece, rate, channels, width)
+            safe.append(_Segment(segment.items, path, start, end, None, True))
+    return safe
+
+
+async def _process_screened_window(
+    user, source_id, direction, session, output, capture, snapshot, input_identity=None
+):
+    """Retain staged private portions so a later override can process only new time.
+
+    The progress ledger records completed absolute spans independently of the
+    detector revision. Replays cannot transcribe the already admitted portions a
+    second time or join private gaps into the temporary processing audio.
+    """
+
+    started = min(_as_utc(item.captured_at) for item in session)
+    ended = max(_as_utc(item.ended_at or item.captured_at) for item in session)
+    # Range IDs identify individual claims and are regenerated on reconstruction.
+    # Capture identity, absolute bounds and chunk IDs remain stable across retries.
+    identity = hashlib.sha256(
+        (
+            str(user.user_id)
+            + capture.audio_range.model_dump_json(exclude={"range_id"})
+        ).encode()
+    ).hexdigest()
+    ledger = privacy.database().privacy_audio_progress
+    if input_identity is not None:
+        # Written only after _persist_capture_window succeeds. A model failure,
+        # missing input, or interrupted capture write cannot create a receipt.
+        await privacy.database().privacy_audio_inputs.update_one(
+            {"_id": input_identity},
+            {
+                "$setOnInsert": {
+                    "user_id": str(user.user_id),
+                    "source_id": source_id,
+                    "progress_id": identity,
+                    "started_at": started,
+                    "ended_at": ended,
+                },
+            },
+            upsert=True,
+        )
+    progress = await ledger.find_one({"_id": identity}) or {}
+    done = [
+        (privacy.utc(row["started_at"]), privacy.utc(row["ended_at"]))
+        for row in progress.get("completed", [])
+    ]
+    whole = _Segment(session, output, started, ended, None, True)
+    segments = await asyncio.to_thread(
+        _privacy_segments, [whole], snapshot, source_id, done
+    )
+    processed = 0
+    for segment in segments:
+        if segment.profile is None:
+            segment.profile = await asyncio.to_thread(_profile_wav, segment.path)
+        claim = await _segment_audio_range(capture.audio_range, segment)
+        # Local acoustic profiling produces no published or external result. Its
+        # scheduling snapshot may age while other captures are screened. Admit
+        # this exact claim against current policy before any semantic processing,
+        # then retain that revision fence until its result has been recorded.
+        admission = await privacy.load_snapshot(
+            user.user_id, claim.started_at, claim.ended_at
+        )
+        if not admission.permits_record({"audio_ranges": [claim]}):
+            raise privacy.PrivacyHeld()
+        await privacy.assert_current(user.user_id, admission)
+        detection = (
+            _speech_detection(segment.profile)
+            if require_speech_for_transcription()
+            else None
+        )
+        if detection is not None and detection.should_reject:
+            await _save_evidence_span(
+                session,
+                direction,
+                segment.profile,
+                state="no_speech",
+                bounds=(segment.started_at, segment.ended_at),
+                audio_ranges=[claim],
+            )
+        elif await _ingest_segment(user, source_id, direction, segment, claim) is None:
+            continue
+        else:
+            processed += 1
+        await privacy.assert_current(user.user_id, admission)
+        row = {"started_at": segment.started_at, "ended_at": segment.ended_at}
+        await ledger.update_one(
+            {"_id": identity},
+            {
+                "$setOnInsert": {"user_id": str(user.user_id), "source_id": source_id},
+                "$addToSet": {"completed": row},
+            },
+            upsert=True,
+        )
+        done.append((segment.started_at, segment.ended_at))
+
+    if privacy.merged(done) == [(started, ended)]:
+        completion = await privacy.load_snapshot(user.user_id, started, ended)
+        if not completion.permits_record({"audio_ranges": [capture.audio_range]}):
+            raise privacy.PrivacyHeld()
+        await privacy.assert_current(user.user_id, completion)
+        for item in session:
+            await item.delete()
+    return processed
 
 
 def _write_wav(
@@ -514,6 +730,7 @@ async def _save_evidence_span(
     bounds: tuple[datetime, datetime] | None = None,
     audio_ranges: Sequence[AudioRangeRef] = (),
 ) -> AudioEvidenceSpan:
+
     locator = _audio_locator(session[0])
     if any(_audio_locator(item) != locator for item in session[1:]):
         raise ValueError("audio evidence span cannot combine provider-local tracks")
@@ -527,6 +744,9 @@ async def _save_evidence_span(
         if bounds
         else max(_as_utc(item.ended_at or item.captured_at) for item in session)
     )
+    # A single source file can contribute multiple disjoint allowed portions.
+    # BSON precision is also the replay identity used by persisted span bounds.
+    started_at, ended_at = privacy.utc(started_at), privacy.utc(ended_at)
     source_item_ids = [item.source_item_id for item in session]
     covered, missing, coverage = _coverage_profile(
         session, started_at, ended_at, profile.bucket_seconds
@@ -536,7 +756,12 @@ async def _save_evidence_span(
         coverage.extend([0.0] * (series_length - len(coverage)))
     elif len(coverage) > series_length:
         coverage = coverage[:series_length]
-    range_hash = hashlib.sha256("\n".join(source_item_ids).encode()).hexdigest()
+    range_hash = hashlib.sha256(
+        json.dumps(
+            [source_item_ids, started_at.isoformat(), ended_at.isoformat()],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     values = {
         "locator": locator,
         "source_item_ids": source_item_ids,
@@ -573,6 +798,8 @@ async def _save_evidence_span(
         AudioEvidenceSpan.locator.track_id == locator.track_id,
         AudioEvidenceSpan.first_source_item_id == source_item_ids[0],
         AudioEvidenceSpan.last_source_item_id == source_item_ids[-1],
+        AudioEvidenceSpan.started_at == started_at,
+        AudioEvidenceSpan.ended_at == ended_at,
     )
     if existing is not None:
         for field, value in values.items():
@@ -681,6 +908,8 @@ async def _ingest_segment(
     audio_range: AudioRangeRef,
 ) -> str | None:
     """Materialize one detected Conversation without copying capture audio."""
+
+    await privacy.require_audio_ranges([audio_range])
     external_source_id = format_screenpipe_segment_source_id(
         source_id,
         direction,
@@ -688,13 +917,15 @@ async def _ingest_segment(
         segment.items[0].source_item_id,
         segment.items[-1].source_item_id,
     )
+    if segment.privacy_partition:
+        external_source_id += f":privacy:{int(segment.started_at.timestamp()*1000)}:{int(segment.ended_at.timestamp()*1000)}"
     try:
         conversation = await materialize_and_process_audio_claim(
             user,
             audio_range,
             device_name=f"{source_id}-{_audio_locator(segment.items[0]).track_id}",
             title="Detected conversation",
-            segmentation_key=f"detected:{external_source_id}:v2",
+            segmentation_key=f"detected:{external_source_id}:{_CAPTURE_ASSEMBLY_VERSION}",
             external_source_id=external_source_id,
             external_source_type="screenpipe",
             # This is the semantic layer the user asked to see on Recordings. The
@@ -761,6 +992,10 @@ async def _ingest_segment(
 
 
 async def process_device_audio() -> dict[str, Any]:
+
+    transcription_recovery = (
+        await privacy_audio_recovery.resume_privacy_held_transcriptions()
+    )
     pending = (
         await DeviceInputItem.find(
             DeviceInputItem.kind == "audio",
@@ -774,6 +1009,8 @@ async def process_device_audio() -> dict[str, Any]:
         by_source.setdefault(audio_stream_key(item), []).append(item)
     processed = 0
     rejected_no_speech = 0
+    held_windows_before_decode = 0
+    retained_windows_without_new_work = 0
     unscored_sessions = 0
     unscored_reasons: dict[str, int] = {}
     require_speech = require_speech_for_transcription()
@@ -791,6 +1028,27 @@ async def process_device_audio() -> dict[str, Any]:
                 )
                 if session_end > utcnow() - _CLOSE_DELAY:
                     continue
+
+                session_start = min(_as_utc(item.captured_at) for item in session)
+                try:
+                    screening_spans = await privacy.capture_screening_spans(
+                        user_id, source_id, session_start, session_end
+                    )
+                except privacy.PrivacyHeld:
+                    held_windows_before_decode += 1
+                    continue
+                if screening_spans == []:
+                    # Original uploaded bytes remain in DeviceInputItem. Wait for
+                    # screening or review before decoding an entirely held window.
+                    # This is only a deferral: admission below always reloads policy.
+                    held_windows_before_decode += 1
+                    continue
+                input_identity = await asyncio.to_thread(_audio_input_identity, session)
+                if await _screened_audio_has_no_new_work(
+                    user_id, source_id, input_identity
+                ):
+                    retained_windows_without_new_work += 1
+                    continue
                 with tempfile.TemporaryDirectory(
                     prefix="chronicle-screenpipe-"
                 ) as temp_dir:
@@ -806,6 +1064,21 @@ async def process_device_audio() -> dict[str, Any]:
                     capture = await _persist_capture_window(
                         user, source_id, direction, session, output
                     )
+                    privacy_snapshot = await privacy.load_snapshot(
+                        user_id, session_start, session_end
+                    )
+                    if privacy_snapshot.source(source_id):
+                        processed += await _process_screened_window(
+                            user,
+                            source_id,
+                            direction,
+                            session,
+                            output,
+                            capture,
+                            privacy_snapshot,
+                            input_identity,
+                        )
+                        continue
                     # Decode + energy loop + one ctypes VAD call per 256-sample hop:
                     # ~112k foreign calls for a 30-minute window. Cron jobs run on the
                     # API's own loop, so doing that inline stops the whole process.
@@ -912,9 +1185,12 @@ async def process_device_audio() -> dict[str, Any]:
                 )
                 continue
     return {
+        "privacy_transcription_recovery": transcription_recovery,
         "pending_chunks": len(pending),
         "processed_sessions": processed,
         "rejected_no_speech": rejected_no_speech,
+        "held_windows_before_decode": held_windows_before_decode,
+        "retained_windows_without_new_work": retained_windows_without_new_work,
         "vad_unscored_sessions": unscored_sessions,
         "vad_unscored_reasons": unscored_reasons,
     }

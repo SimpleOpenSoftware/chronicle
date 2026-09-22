@@ -22,8 +22,10 @@ from fastapi import (
     UploadFile,
 )
 from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+import backend.services.screening_revisions as screening_revisions
 from backend.auth import current_active_user
 from backend.config import get_screen_context_settings
 from backend.models.conversation import Conversation
@@ -46,6 +48,7 @@ from backend.services.memory.vault_media import promote_image_bytes, write_media
 from backend.services.timeline import dirty_ranges
 
 logger = logging.getLogger(__name__)
+from backend.services import privacy, privacy_history_inventory, privacy_setup
 
 router = APIRouter(prefix="/device-input", tags=["device-input"])
 _PAIRING_TTL = timedelta(minutes=10)
@@ -151,7 +154,13 @@ async def _mobile_source(user: User) -> CaptureSource:
     # heartbeat staleness rule in _effective_source_status applies without a special case.
     source.status = "online"
     source.last_seen_at = utcnow()
-    await source.save()
+    await source.set(
+        {
+            CaptureSource.health: source.health,
+            CaptureSource.status: source.status,
+            CaptureSource.last_seen_at: source.last_seen_at,
+        }
+    )
     return source
 
 
@@ -239,10 +248,16 @@ def _same_device_input_identity(
 ) -> bool:
     """Return whether a duplicate key names the same immutable evidence item."""
 
+    def stored_time(value: datetime) -> datetime:
+        # BSON stores milliseconds, while collectors send sub-millisecond times.
+        # Compare the persisted identity so replaying the same frame is idempotent.
+        value = _as_utc(value)
+        return value.replace(microsecond=value.microsecond // 1000 * 1000)
+
     def same_optional_time(left: Optional[datetime], right: Optional[datetime]) -> bool:
         if left is None or right is None:
             return left is right
-        return _as_utc(left) == _as_utc(right)
+        return stored_time(left) == stored_time(right)
 
     return (
         existing.user_id == requested.user_id
@@ -250,7 +265,7 @@ def _same_device_input_identity(
         and existing.kind == requested.kind
         and existing.source_item_id == requested.source_item_id
         and existing.locator == requested.locator
-        and _as_utc(existing.captured_at) == _as_utc(requested.captured_at)
+        and stored_time(existing.captured_at) == stored_time(requested.captured_at)
         and same_optional_time(existing.ended_at, requested.ended_at)
         and existing.content_hash == requested.content_hash
     )
@@ -300,7 +315,13 @@ async def heartbeat(
     )
     source.health = body.health
     source.last_seen_at = utcnow()
-    await source.save()
+    await source.set(
+        {
+            CaptureSource.health: source.health,
+            CaptureSource.status: source.status,
+            CaptureSource.last_seen_at: source.last_seen_at,
+        }
+    )
     return {"ok": True, "source_id": source.source_id}
 
 
@@ -491,6 +512,360 @@ async def _ensure_observation_preview(
     ).insert()
 
 
+@router.post("/screening")
+async def submit_screening(
+    body: privacy.ScreeningResult, source: CaptureSource = Depends(_device_source)
+):
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    try:
+        await privacy.save_screening(source, body)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True}
+
+
+class ScreeningReplacement(BaseModel):
+    replacement_interval_id: str = Field(min_length=1, max_length=256)
+    previous_interval_ids: list[str] = Field(min_length=1, max_length=64)
+
+
+@router.post("/screening/replace")
+async def replace_screening(
+    body: ScreeningReplacement, source: CaptureSource = Depends(_device_source)
+):
+
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    try:
+        await screening_revisions.supersede(
+            source, body.replacement_interval_id, body.previous_interval_ids
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True}
+
+
+@router.get("/screening/results")
+async def screening_results(
+    start_at: datetime,
+    end_at: datetime,
+    policy_version: str,
+    after: str = "",
+    source: CaptureSource = Depends(_device_source),
+):
+    """Collector-only metadata for rechecking its original frames locally."""
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    start_at, end_at = privacy.utc(start_at), privacy.utc(end_at)
+    if not timedelta(0) < end_at - start_at <= timedelta(days=32):
+        raise HTTPException(422, "Choose a range of at most 32 days")
+    if not 0 < len(policy_version) <= 64 or (
+        after and not re.fullmatch(r"[a-f0-9]{64}", after)
+    ):
+        raise HTTPException(422, "Invalid screening query")
+    query = {
+        "user_id": source.user_id,
+        "source_id": source.source_id,
+        "started_at": {"$gte": start_at},
+        "ended_at": {"$lte": end_at},
+        "policy_version": policy_version,
+        "superseded_by": {"$exists": False},
+    }
+    if after:
+        query["_id"] = {"$gt": after}
+    fields = {
+        key: 1
+        for key in (
+            "interval_id",
+            "track_id",
+            "started_at",
+            "ended_at",
+            "policy_version",
+            "model_version",
+            "segments",
+            "evidence.frame_id",
+            "evidence.captured_at",
+            "evidence.state",
+        )
+    }
+    rows = (
+        await privacy.database()
+        .privacy_screening.find(query, fields)
+        .sort("_id", 1)
+        .limit(500)
+        .to_list(None)
+    )
+    cursor = str(rows[-1]["_id"]) if len(rows) == 500 else None
+    for row in rows:
+        row.pop("_id", None)
+        # Mongo's naïve BSON datetimes are UTC. Always put that timezone on the
+        # wire so a collector in another timezone finds the original captures.
+        for record in [row, *row.get("segments", []), *row.get("evidence", [])]:
+            for field in ("started_at", "ended_at", "captured_at"):
+                if field in record:
+                    record[field] = privacy.utc(record[field])
+    return {"results": rows, "next_cursor": cursor}
+
+
+@router.post("/screening/displays")
+async def submit_privacy_displays(
+    body: privacy.PrivacyDisplaySet, source: CaptureSource = Depends(_device_source)
+):
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    try:
+        await privacy.save_display_set(source, body)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True}
+
+
+@router.post("/screening/required-range")
+async def submit_privacy_required_range(
+    body: privacy.PrivacyRequiredRange, source: CaptureSource = Depends(_device_source)
+):
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    try:
+        await privacy.save_required_range(source, body)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True}
+
+
+@router.post("/screening/required-range/inventory")
+async def refine_privacy_required_range(
+    body: privacy_history_inventory.InventoryRefinement,
+    source: CaptureSource = Depends(_device_source),
+):
+    if source.provider != "screenpipe":
+        raise HTTPException(400, "Screening requires a ScreenPipe source")
+    try:
+        await privacy_history_inventory.refine(source, body)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True}
+
+
+class PrivacyActivation(BaseModel):
+    started_at: datetime
+
+
+@router.post("/sources/{source_id}/privacy/prepare")
+async def prepare_privacy(
+    source_id: str, body: PrivacyActivation, user: User = Depends(current_active_user)
+):
+    source = await CaptureSource.find_one(
+        {"source_id": source_id, "user_id": _user_id(user)}
+    )
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    return await privacy_setup.prepare(source, body.started_at)
+
+
+@router.post("/sources/{source_id}/privacy/activate")
+async def activate_privacy(
+    source_id: str, body: PrivacyActivation, user: User = Depends(current_active_user)
+):
+
+    source = await CaptureSource.find_one(
+        {"source_id": source_id, "user_id": _user_id(user)}
+    )
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    await privacy.ensure_indexes()
+    db = privacy.database()
+    owner = _user_id(user)
+    query = {"source_id": source_id, "user_id": owner}
+    current = await db.capture_sources.find_one(query)
+    started_at = privacy.utc(body.started_at)
+    now = privacy.utc(datetime.now(timezone.utc))
+    if started_at > now:
+        raise HTTPException(422, "Privacy activation cannot start in the future")
+    operation = hashlib.sha256(
+        f"{owner}:{source_id}:activate:{started_at.isoformat()}".encode()
+    ).hexdigest()
+    if (
+        current.get("privacy_updating")
+        and current.get("privacy_operation") != operation
+    ):
+        raise HTTPException(409, "Privacy policy update in progress")
+    if current.get("privacy_enabled_from"):
+        if not current.get("privacy_updating"):
+            return {
+                "active": True,
+                "started_at": privacy.utc(current["privacy_enabled_from"]),
+            }
+        # The operation identity uses the requested start; the durable start
+        # includes earlier waiting time and must survive every retry.
+        started_at = privacy.utc(current["privacy_enabled_from"])
+    else:
+        waiting = await privacy_setup.waiting_starts(owner, [source_id])
+        started_at = min(started_at, waiting.get(source_id, started_at))
+        health = current.get("health", {}).get("privacy_screening", {})
+
+        def fresh(value):
+            try:
+                return timedelta(0) <= now - privacy.utc(value) <= timedelta(minutes=2)
+            except (AttributeError, TypeError, ValueError):
+                return False
+
+        if (
+            source.provider != "screenpipe"
+            or health.get("state") != "ready"
+            or not health.get("model_version")
+            or not fresh(current.get("last_seen_at"))
+            or not fresh(health.get("inventory_checked_at"))
+        ):
+            raise HTTPException(409, "Screening worker readiness is missing or stale")
+        inventory = await db.privacy_display_sets.find_one(
+            query, sort=[("observed_at", -1)]
+        )
+        if not inventory or not inventory["track_ids"]:
+            raise HTTPException(409, "Display coverage is not ready")
+        if privacy.utc(inventory["observed_at"]) > privacy.utc(
+            health["inventory_checked_at"]
+        ):
+            raise HTTPException(
+                409, "Display coverage changed; wait for worker readiness"
+            )
+        for track in inventory["track_ids"]:
+            completed = await db.privacy_screening.find_one(
+                {
+                    **query,
+                    "track_id": track,
+                    "model_version": health["model_version"],
+                    "ended_at": {"$gte": now - timedelta(minutes=2), "$lte": now},
+                }
+            )
+            if not completed:
+                raise HTTPException(
+                    409, "Waiting for successful screening on every display"
+                )
+        updated = await privacy.begin_update(
+            owner,
+            {
+                **query,
+                "privacy_enabled_from": None,
+                "privacy_revision": current.get("privacy_revision", 0),
+                "privacy_operation": None,
+                "health": current.get("health", {}),
+                "last_seen_at": current.get("last_seen_at"),
+            },
+            {
+                "$set": {
+                    "privacy_enabled_from": started_at,
+                    "privacy_operation": operation,
+                    "privacy_updating": True,
+                },
+                "$inc": {"privacy_revision": 1},
+            },
+        )
+        if not updated.matched_count:
+            raise HTTPException(409, "Privacy readiness changed; retry activation")
+    # Historical activation changes eligibility immediately. Keep the fence held
+    # until downstream invalidation is durably queued; the same request resumes it.
+    await dirty_ranges.mark_evidence_dirty(
+        owner, started_at, now, operation, "privacy_activation", source_kind="privacy"
+    )
+    # Normal activated coverage now holds every unresolved portion, including
+    # pre-readiness time. Retain the setup evidence and retire only this type of
+    # obligation, while the source is still fenced against publication.
+    await db.privacy_required_ranges.update_many(
+        privacy_setup.waiting_query(owner, [source_id]),
+        {"$set": {"superseded_by": operation}},
+    )
+    await db.capture_sources.update_one(
+        {**query, "privacy_operation": operation},
+        {"$set": {"privacy_updating": False, "privacy_operation": None}},
+    )
+    return {"active": True, "started_at": started_at}
+
+
+@router.get("/privacy/intervals")
+async def privacy_intervals(
+    start_at: datetime, end_at: datetime, user: User = Depends(current_active_user)
+):
+    if end_at <= start_at or end_at - start_at > timedelta(days=32):
+        raise HTTPException(422, "Choose a range of at most 32 days")
+    return {"intervals": await privacy.list_intervals(_user_id(user), start_at, end_at)}
+
+
+class PrivacyOverride(BaseModel):
+    source_id: str
+    started_at: datetime
+    ended_at: datetime
+    revision: int = Field(ge=0)
+    decision: Literal["allowed", "excluded"]
+
+
+@router.post("/privacy/override")
+async def override_privacy(
+    body: PrivacyOverride, user: User = Depends(current_active_user)
+):
+
+    if body.ended_at <= body.started_at:
+        raise HTTPException(422, "Invalid interval")
+    owner = _user_id(user)
+    operation = hashlib.sha256((owner + body.model_dump_json()).encode()).hexdigest()
+    db = privacy.database()
+    updated = await privacy.begin_update(
+        owner,
+        {
+            "source_id": body.source_id,
+            "user_id": owner,
+            "privacy_revision": body.revision,
+            "privacy_operation": None,
+        },
+        {
+            "$inc": {"privacy_revision": 1},
+            "$set": {"privacy_operation": operation, "privacy_updating": True},
+        },
+    )
+    if not updated.matched_count:
+        interrupted = await db.capture_sources.find_one(
+            {
+                "source_id": body.source_id,
+                "user_id": owner,
+                "privacy_revision": body.revision + 1,
+                "privacy_operation": operation,
+                "privacy_updating": True,
+            }
+        )
+        if not interrupted:
+            raise HTTPException(
+                409, "Privacy decision changed; reload before reviewing"
+            )
+    await db.privacy_overrides.update_one(
+        {"_id": operation},
+        {
+            "$setOnInsert": {
+                "source_id": body.source_id,
+                "user_id": owner,
+                "started_at": privacy.utc(body.started_at),
+                "ended_at": privacy.utc(body.ended_at),
+                "override": body.decision,
+                "revision": body.revision + 1,
+            }
+        },
+        upsert=True,
+    )
+    await dirty_ranges.mark_evidence_dirty(
+        owner,
+        privacy.utc(body.started_at),
+        privacy.utc(body.ended_at),
+        operation,
+        "privacy_decision",
+        source_kind="privacy",
+    )
+    await db.capture_sources.update_one(
+        {"user_id": owner, "source_id": body.source_id, "privacy_operation": operation},
+        {"$set": {"privacy_updating": False, "privacy_operation": None}},
+    )
+    return {"revision": body.revision + 1, "decision": body.decision}
+
+
 @router.post("/observations")
 async def ingest_observations(
     body: ObservationBatch, source: CaptureSource = Depends(_device_source)
@@ -575,7 +950,13 @@ async def ingest_observations(
         await _ensure_observation_preview(item, source)
     source.last_seen_at = utcnow()
     source.status = "online"
-    await source.save()
+    await source.set(
+        {
+            CaptureSource.health: source.health,
+            CaptureSource.status: source.status,
+            CaptureSource.last_seen_at: source.last_seen_at,
+        }
+    )
     return {
         "accepted": accepted,
         "duplicate_samples": duplicate_samples,
@@ -682,16 +1063,15 @@ async def next_job(source: CaptureSource = Depends(_device_source)):
         DeviceInputJob.status == "claimed",
         DeviceInputJob.claimed_at < utcnow() - timedelta(minutes=5),
     ).update_many({"$set": {"status": "pending", "claimed_at": None}})
-    job = await DeviceInputJob.find_one(
-        DeviceInputJob.source_id == source.source_id,
-        DeviceInputJob.status == "pending",
-        sort=[("created_at", 1)],
+    row = await DeviceInputJob.get_pymongo_collection().find_one_and_update(
+        {"user_id": source.user_id, "source_id": source.source_id, "status": "pending"},
+        {"$set": {"status": "claimed", "claimed_at": utcnow()}},
+        sort=[("priority", -1), ("created_at", 1), ("_id", 1)],
+        return_document=ReturnDocument.AFTER,
     )
-    if job is None:
+    if row is None:
         return {"job": None}
-    job.status = "claimed"
-    job.claimed_at = utcnow()
-    await job.save()
+    job = DeviceInputJob.model_validate(row)
     return {
         "job": {
             "id": str(job.id),
@@ -1019,6 +1399,9 @@ async def list_sources(user: User = Depends(current_active_user)):
         .sort("-last_seen_at")
         .to_list()
     )
+    waiting = await privacy_setup.waiting_starts(
+        _user_id(user), [row.source_id for row in rows]
+    )
     return {
         "sources": [
             {
@@ -1030,6 +1413,9 @@ async def list_sources(user: User = Depends(current_active_user)):
                 "health": row.health,
                 "last_seen_at": _utc_iso(row.last_seen_at),
                 "capabilities": row.capabilities,
+                "privacy_enabled_from": _utc_iso(row.privacy_enabled_from),
+                "privacy_waiting_from": _utc_iso(waiting.get(row.source_id)),
+                "privacy_revision": row.privacy_revision,
             }
             for row in rows
         ]
@@ -1052,6 +1438,7 @@ async def create_job(body: JobRequest, user: User = Depends(current_active_user)
         end_at=body.end_at,
         purpose=body.purpose,
         payload=body.payload,
+        priority=100,
     )
     await job.insert()
     return {"job_id": str(job.id), "status": job.status}
@@ -1070,6 +1457,7 @@ async def timeline(
         .sort("captured_at")
         .to_list()
     )
+    rows = await privacy.filter_records(rows, _user_id(user))
     return {
         "items": [
             {
@@ -1107,6 +1495,7 @@ async def conversation_context(
         .sort("captured_at")
         .to_list()
     )
+    rows = await privacy.filter_records(rows, _user_id(user))
     return {
         "items": [
             {
@@ -1157,6 +1546,10 @@ async def _owned_item(item_id: str, user: User) -> DeviceInputItem:
         item = None
     if item is None or item.user_id != _user_id(user):
         raise HTTPException(status_code=404, detail="Context item not found")
+    try:
+        await privacy.require_record(item)
+    except privacy.PrivacyHeld as exc:
+        raise HTTPException(423, str(exc)) from exc
     return item
 
 
@@ -1197,7 +1590,7 @@ async def context_thumbnail(item_id: str, user: User = Depends(current_active_us
         return Response(
             content=item.media_data,
             media_type=item.media_content_type,
-            headers={"Cache-Control": "private, max-age=3600"},
+            headers={"Cache-Control": "private, no-store"},
         )
     asset_id = item.metadata.get("asset_id")
     if item.kind != "immich_memory" or not asset_id:
@@ -1246,6 +1639,7 @@ async def request_item_thumbnail(
         end_at=item.ended_at,
         purpose="timeline_thumbnail",
         payload={"item_id": item_id, "frame_id": frame_id, "width": 960},
+        priority=100,
     )
     await job.insert()
     return {"status": "pending", "job_id": str(job.id)}

@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from beanie import init_beanie
 from fastapi import FastAPI
 
+import backend.services.privacy as privacy
 from backend.app_config import get_app_config
 from backend.auth import (
     bearer_backend,
@@ -69,6 +70,11 @@ from backend.models.notification import (
     NotificationIntent,
     PushDevice,
 )
+from backend.models.session_memory import (
+    MemorySourceDecision,
+    SessionPreparation,
+    UndatedSession,
+)
 from backend.models.system_event import SystemEvent
 from backend.models.timeline import (
     AudioEvidenceSpan,
@@ -92,8 +98,10 @@ from backend.routers.modules.websocket_routes import router as websocket_router
 from backend.services.audio_service import get_audio_stream_service
 from backend.services.audio_stream import AudioStreamProducer
 from backend.services.audio_stream.reclaim import reclaim_settled_audio_streams
+from backend.services.chat_review import process_chat_review_queue
 from backend.services.device_audio_ingest import process_device_audio
 from backend.services.device_context import purge_screen_context
+from backend.services.immich_discovery import scan_immich_memories
 from backend.services.manual_memories.image import process_manual_memory_images
 from backend.services.manual_memories.visual_index import (
     process_manual_memory_visual_index,
@@ -117,12 +125,16 @@ from backend.services.plugin_service import (
     set_plugin_router,
 )
 from backend.services.reaper import run_reaper
+from backend.services.source_search import recover_search_index
+from backend.services.speaker_enrollment import recover_speaker_enrollments
 from backend.services.status_reconciler import reconcile_conversation_statuses
+from backend.services.timeline.accepted_context import recover_context_assessments
 from backend.services.timeline.consolidation import prefetch_consolidation_horizon
 from backend.services.timeline.dirty_ranges import reconcile_dirty_ranges
 from backend.services.timeline.dispatch import dispatch_ready_episodes
 from backend.services.timeline.publication import recover_timeline_publications
 from backend.services.timeline.review import process_memory_review_queue
+from backend.services.timeline.sessions import prepare_recent_sessions
 from backend.services.timeline.thumbnails import process_episode_thumbnails
 from backend.task_manager import get_task_manager, init_task_manager
 from backend.users import User, UserRead, UserUpdate, register_client_to_user
@@ -142,11 +154,13 @@ def register_application_cron_jobs() -> None:
     """Register the production cron entrypoints in one directly testable seam."""
 
     register_cron_job("speaker_finetuning", run_speaker_finetuning_job)
+    register_cron_job("speaker_enrollment_recovery", recover_speaker_enrollments)
     register_cron_job("asr_finetuning", run_asr_finetuning_job)
     register_cron_job("asr_jargon_extraction", run_asr_jargon_extraction_job)
     register_cron_job("prompt_optimization", run_prompt_optimization_job)
     register_cron_job("annotation_suggestions", surface_error_suggestions)
     register_cron_job("auto_clean", run_auto_clean_cron)
+    register_cron_job("immich_memories", scan_immich_memories)
     register_cron_job("person_photos", sync_person_photos)
     register_cron_job("device_audio_ingest", process_device_audio)
     register_cron_job("screen_context_retention", purge_screen_context)
@@ -160,6 +174,10 @@ def register_application_cron_jobs() -> None:
     register_cron_job("manual_memory_image_enrichment", process_manual_memory_images)
     register_cron_job("manual_memory_visual_index", process_manual_memory_visual_index)
     register_cron_job("episode_memory_review", process_memory_review_queue)
+    register_cron_job("chat_note_review", process_chat_review_queue)
+    register_cron_job("session_memory_prepare", prepare_recent_sessions)
+    register_cron_job("source_search_index", recover_search_index)
+    register_cron_job("vault_context_assessment", recover_context_assessments)
     register_cron_job("audio_stream_reclaim", reclaim_settled_audio_streams)
     register_cron_job(
         "pi_operating_memory_threshold", run_operating_memory_threshold_job
@@ -246,6 +264,9 @@ async def lifespan(app: FastAPI):
                 DirtyEvidenceRange,
                 EpisodeDispatchLatch,
                 MemoryReviewProposal,
+                MemorySourceDecision,
+                SessionPreparation,
+                UndatedSession,
                 PushDevice,
                 NotificationIntent,
                 NotificationDelivery,
@@ -651,6 +672,8 @@ def create_app() -> FastAPI:
         disable_request_logging=os.getenv("DISABLE_REQUEST_LOGGING", "").lower()
         == "true",
     )
+
+    app.add_exception_handler(privacy.PrivacyHeld, privacy.held_response)
 
     # Include all routers
     app.include_router(api_router)

@@ -283,48 +283,119 @@ def create_general_response(user_message: str, json_mode: bool = False) -> dict:
     }
 
 
-async def handle_chat_completions(request: web.Request) -> web.Response:
-    """Handle /v1/chat/completions endpoint."""
+def create_chat_response(data: dict) -> dict:
+    """Build one canonical deterministic result for JSON and streaming callers."""
+    messages = data.get("messages", [])
+    json_mode = (data.get("response_format") or {}).get("type") == "json_object"
+    tool_names = {
+        (tool.get("function") or {}).get("name") for tool in data.get("tools") or []
+    }
+    if "write_note" in tool_names:
+        return create_vault_agent_response(messages)
+    request_type = detect_request_type(messages)
+    logger.info("Chat completion request detected as: %s", request_type)
+    if request_type == "fact_extraction":
+        return create_fact_extraction_response()
+    if request_type == "memory_update":
+        return create_memory_update_response()
+    content = messages[-1].get("content", "") if messages else ""
+    return create_general_response(content, json_mode=json_mode)
+
+
+def completion_chunks(response: dict, *, include_usage: bool = False):
+    """Exercise real SDK delta assembly, including split tool argument JSON."""
+    base = {key: response[key] for key in ("id", "created", "model")}
+    base["object"] = "chat.completion.chunk"
+    for choice in response["choices"]:
+        index = choice["index"]
+        message = choice["message"]
+
+        def chunk(delta, finish_reason=None):
+            return {
+                **base,
+                "choices": [
+                    {"index": index, "delta": delta, "finish_reason": finish_reason}
+                ],
+            }
+
+        yield chunk({"role": message["role"]})
+        content = message.get("content") or ""
+        for offset in range(0, len(content), 16):
+            yield chunk({"content": content[offset : offset + 16]})
+        for tool_index, call in enumerate(message.get("tool_calls") or []):
+            function = call["function"]
+            yield chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": tool_index,
+                            "id": call["id"],
+                            "type": call["type"],
+                            "function": {"name": function["name"], "arguments": ""},
+                        }
+                    ]
+                }
+            )
+            arguments = function["arguments"]
+            for offset in range(0, len(arguments), 16):
+                yield chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": tool_index,
+                                "function": {
+                                    "arguments": arguments[offset : offset + 16]
+                                },
+                            }
+                        ]
+                    }
+                )
+        yield chunk({}, choice["finish_reason"])
+    if include_usage and "usage" in response:
+        yield {**base, "choices": [], "usage": response["usage"]}
+
+
+async def stream_chat_response(
+    request: web.Request, completion: dict, *, include_usage: bool
+):
+    response = web.StreamResponse(
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+        }
+    )
+    await response.prepare(request)
+    try:
+        for chunk in completion_chunks(completion, include_usage=include_usage):
+            await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            await asyncio.sleep(
+                0
+            )  # Let other requests run while the SDK consumes deltas.
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+    except ConnectionResetError:
+        logger.info("Streaming chat client disconnected")
+    return response
+
+
+async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
+    """Honor the same OpenAI JSON/SSE contract as the real profile providers."""
     try:
         data = await request.json()
-        messages = data.get("messages", [])
-        json_mode = (data.get("response_format") or {}).get("type") == "json_object"
-
-        # The vault memory agent is identified by its write tools, not its
-        # prompt: only that caller offers write_note. Read-only tool callers
-        # (the retrieval agent) fall through to a plain content answer, which
-        # they treat as a deliberate completion.
-        tool_names = {
-            (t.get("function") or {}).get("name") for t in data.get("tools") or []
-        }
-        if "write_note" in tool_names:
-            logger.info("Chat completion request detected as: vault_agent")
-            return web.json_response(create_vault_agent_response(messages))
-
-        # Detect request type
-        request_type = detect_request_type(messages)
-        logger.info(f"Chat completion request detected as: {request_type}")
-
-        # Generate appropriate response
-        if request_type == "fact_extraction":
-            response = create_fact_extraction_response()
-            logger.info("Returning fact extraction response")
-
-        elif request_type == "memory_update":
-            response = create_memory_update_response()
-            logger.info("Returning memory update response")
-
-        else:
-            user_content = messages[-1].get("content", "") if messages else ""
-            response = create_general_response(user_content, json_mode=json_mode)
-            logger.info(f"Returning general response (json_mode={json_mode})")
-
+        response = create_chat_response(data)
+        if data.get("stream"):
+            return await stream_chat_response(
+                request,
+                response,
+                include_usage=bool(
+                    (data.get("stream_options") or {}).get("include_usage")
+                ),
+            )
         return web.json_response(response)
-
-    except Exception as e:
-        logger.error(f"Error handling chat completions: {e}", exc_info=True)
+    except Exception as error:
+        logger.error("Error handling chat completions: %s", error, exc_info=True)
         return web.json_response(
-            {"error": {"message": str(e), "type": "server_error"}}, status=500
+            {"error": {"message": str(error), "type": "server_error"}}, status=500
         )
 
 

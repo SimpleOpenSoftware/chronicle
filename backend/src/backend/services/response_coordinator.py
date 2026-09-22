@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -24,8 +25,11 @@ from backend.redis_keys import (
 from backend.services.playback_audio import (
     DOWNLINK_BITRATE_BPS,
     DOWNLINK_FRAME_MS,
+    DOWNLINK_FRAME_SAMPLES,
     DOWNLINK_SAMPLE_RATE_HZ,
 )
+from backend.services.voice_diagnostics import cadence_span
+from backend.services.voice_latency import TimingIdentity, VoiceTrace
 from backend.services.voice_sessions import VoiceSessionCoordinator
 
 RESPONSE_RETENTION_SECONDS = 24 * 60 * 60
@@ -34,6 +38,11 @@ PLAYBACK_START_ACK_SECONDS = 5.0
 PLAYBACK_COMPLETION_GRACE_SECONDS = 2.0
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_DURATION_MS = 60_000
+STREAM_CLIENT_BUFFER_SAMPLES = DOWNLINK_SAMPLE_RATE_HZ * 2
+STREAM_STALL_SECONDS = 5.0
+STREAM_POLL_SECONDS = 0.02
+STREAM_FIRST_AUDIO_SECONDS = 15.0
+STREAM_PRODUCER_STALL_SECONDS = 15.0
 WAKE_INTERACTION_EVENTS_STREAM = "wakeword:interaction-events"
 
 ResponseState = Literal[
@@ -89,6 +98,17 @@ class ResponseRecord:
     playback_monotonic_ms: int | None = None
     terminal_reason: str | None = None
     wake_trace_id: str | None = None
+    incremental: bool = False
+    producer_finished: bool = False
+    pre_skip_samples: int = 0
+    sent_samples: int = 0
+    total_samples: int = 0
+    rendered_samples: int = 0
+    buffered_samples: int = 0
+    packet_count: int = 0
+    progress_at: float = 0.0
+    production_finished_at: float = 0.0
+    terminal_ack_state: str | None = None
 
 
 def _decode(value):
@@ -141,6 +161,17 @@ def _record_from_hash(raw: dict) -> ResponseRecord | None:
         playback_monotonic_ms=_optional_int(values, "playback_monotonic_ms"),
         terminal_reason=values.get("terminal_reason") or None,
         wake_trace_id=values.get("wake_trace_id") or None,
+        incremental=values.get("incremental") == "1",
+        producer_finished=values.get("producer_finished") == "1",
+        pre_skip_samples=int(values.get("pre_skip_samples", 0)),
+        sent_samples=int(values.get("sent_samples", 0)),
+        total_samples=int(values.get("total_samples", 0)),
+        rendered_samples=int(values.get("rendered_samples", 0)),
+        buffered_samples=int(values.get("buffered_samples", 0)),
+        packet_count=int(values.get("packet_count", 0)),
+        progress_at=float(values.get("progress_at", 0)),
+        production_finished_at=float(values.get("production_finished_at", 0)),
+        terminal_ack_state=values.get("terminal_ack_state") or None,
     )
 
 
@@ -170,6 +201,17 @@ def _record_mapping(record: ResponseRecord) -> dict[str, str]:
         "playback_monotonic_ms": str(record.playback_monotonic_ms or ""),
         "terminal_reason": record.terminal_reason or "",
         "wake_trace_id": record.wake_trace_id or "",
+        "incremental": str(int(record.incremental)),
+        "producer_finished": str(int(record.producer_finished)),
+        "pre_skip_samples": str(record.pre_skip_samples),
+        "sent_samples": str(record.sent_samples),
+        "total_samples": str(record.total_samples),
+        "rendered_samples": str(record.rendered_samples),
+        "buffered_samples": str(record.buffered_samples),
+        "packet_count": str(record.packet_count),
+        "progress_at": str(record.progress_at),
+        "production_finished_at": str(record.production_finished_at),
+        "terminal_ack_state": record.terminal_ack_state or "",
     }
 
 
@@ -286,22 +328,41 @@ class ResponseCoordinator:
                             },
                         )
                         pipe.expire(current_record_key, RESPONSE_RETENTION_SECONDS)
+                        if cancelled.kind == "speech":
+                            timing = VoiceTrace(
+                                self.redis,
+                                TimingIdentity.from_response(cancelled),
+                                response_id=cancelled.response_id,
+                                generation=cancelled.generation,
+                            ).event("response_cancelled", detail=reason)
+                            pipe.xadd(
+                                WAKE_INTERACTION_EVENTS_STREAM,
+                                {"timing": timing.SerializeToString()},
+                            )
+                        event = audio_pb2.DeviceDownlinkEvent(
+                            cancel_playback=audio_pb2.CancelPlayback(
+                                binding=_capture_binding(cancelled),
+                                response_id=audio_pb2.ResponseId(
+                                    value=cancelled.response_id
+                                ),
+                                generation=generation,
+                                reason=audio_pb2.STOP_REASON_INTERACTION_COMPLETE,
+                            )
+                        )
+                        pipe.publish(
+                            str(
+                                device_downlink_channel(
+                                    ClientId.from_value(cancelled.client_id)
+                                )
+                            ),
+                            event.SerializeToString(),
+                        )
                     await pipe.execute()
                     break
                 except WatchError:
                     cancelled = None
                     continue
 
-        if cancelled is not None and cancelled.state == "cancelled":
-            event = audio_pb2.DeviceDownlinkEvent(
-                cancel_playback=audio_pb2.CancelPlayback(
-                    binding=_capture_binding(cancelled),
-                    response_id=audio_pb2.ResponseId(value=cancelled.response_id),
-                    generation=generation,
-                    reason=audio_pb2.STOP_REASON_INTERACTION_COMPLETE,
-                )
-            )
-            await self._publish(cancelled.client_id, event.SerializeToString())
         return generation
 
     async def queue(
@@ -380,6 +441,17 @@ class ResponseCoordinator:
                         record.response_id,
                         ex=RESPONSE_RETENTION_SECONDS,
                     )
+                    if record.kind == "speech":
+                        event = VoiceTrace(
+                            self.redis,
+                            TimingIdentity.from_response(record),
+                            response_id=record.response_id,
+                            generation=record.generation,
+                        ).event("response_queued")
+                        pipe.xadd(
+                            WAKE_INTERACTION_EVENTS_STREAM,
+                            {"timing": event.SerializeToString()},
+                        )
                     if record.wake_trace_id:
                         pipe.xadd(
                             WAKE_INTERACTION_EVENTS_STREAM,
@@ -402,11 +474,14 @@ class ResponseCoordinator:
         return record
 
     async def assert_current(self, record: ResponseRecord) -> None:
-        generation = await self.current_generation(record.user_id, record.client_id)
-        current_id = _decode(
-            await self.redis.get(self._current_key(record.user_id, record.client_id))
+        generation, current_id = await self.redis.mget(
+            self._generation_key(record.user_id, record.client_id),
+            self._current_key(record.user_id, record.client_id),
         )
-        if generation != record.generation or current_id != record.response_id:
+        if (
+            int(_decode(generation) or 0) != record.generation
+            or _decode(current_id) != record.response_id
+        ):
             raise StaleResponse("response is not current")
 
     async def _set_state(
@@ -448,6 +523,57 @@ class ResponseCoordinator:
                     pipe.expire(record_key, RESPONSE_RETENTION_SECONDS)
                     if state in {"done", "cancelled", "failed"}:
                         pipe.delete(current_key)
+                    if record.kind == "speech" and state != "synthesizing":
+                        trace = VoiceTrace(
+                            self.redis,
+                            TimingIdentity.from_response(record),
+                            response_id=record.response_id,
+                            generation=record.generation,
+                        )
+                        ack_ms = (updates or {}).get("playback_monotonic_ms")
+                        timing_stage = (
+                            "response_started"
+                            if state == "playing"
+                            else "response_" + state
+                        )
+                        event = trace.event(
+                            timing_stage,
+                            **(
+                                {
+                                    "timestamp_ms": float(ack_ms),
+                                    "clock_domain": trace.identity.device_clock,
+                                }
+                                if ack_ms is not None
+                                else {}
+                            ),
+                            detail=(updates or {}).get("terminal_reason", ""),
+                        )
+                        pipe.xadd(
+                            WAKE_INTERACTION_EVENTS_STREAM,
+                            {"timing": event.SerializeToString()},
+                        )
+                    if state == "failed" and record.incremental:
+                        # A producer/stall failure must stop already queued
+                        # playback even if this caller loses the EXEC reply.
+                        # Publish alongside the state change and timing record.
+                        cancellation = audio_pb2.DeviceDownlinkEvent(
+                            cancel_playback=audio_pb2.CancelPlayback(
+                                binding=_capture_binding(record),
+                                response_id=audio_pb2.ResponseId(
+                                    value=record.response_id
+                                ),
+                                generation=record.generation,
+                                reason=audio_pb2.STOP_REASON_INTERACTION_COMPLETE,
+                            )
+                        )
+                        pipe.publish(
+                            str(
+                                device_downlink_channel(
+                                    ClientId.from_value(record.client_id)
+                                )
+                            ),
+                            cancellation.SerializeToString(),
+                        )
                     stage = {
                         "ready": "response_ready",
                         "offered": "response_offered",
@@ -507,6 +633,29 @@ class ResponseCoordinator:
         if record is None:
             raise StaleResponse("response does not exist")
         current_time = now if now is not None else time.time()
+        if record.incremental and record.state in {"offered", "playing"}:
+            if record.packet_count == 0:
+                deadline = record.created_at + STREAM_FIRST_AUDIO_SECONDS
+                reason = "first_audio_timeout"
+            elif record.producer_finished:
+                deadline = record.production_finished_at + STREAM_STALL_SECONDS
+                reason = "playback_drain_timeout"
+            elif (
+                record.sent_samples - record.pre_skip_samples - record.rendered_samples
+                > DOWNLINK_FRAME_SAMPLES
+            ):
+                deadline = (
+                    record.progress_at or record.created_at
+                ) + STREAM_STALL_SECONDS
+                reason = "playback_progress_timeout"
+            else:
+                # Opus pre-skip is transport delay, and the client retains its
+                # final decoded frame until producer finish. Neither is playable
+                # audio; when only these remain, use the producer deadline.
+                return record
+            if current_time >= deadline:
+                return await self.fail(response_id, reason)
+            return record
         age_seconds = current_time - record.updated_at
         if record.state == "offered" and age_seconds >= PLAYBACK_START_ACK_SECONDS:
             return await self.fail(response_id, "playback_start_ack_timeout")
@@ -606,6 +755,7 @@ class ResponseCoordinator:
         )
         await self._publish(offered.client_id, offer.SerializeToString())
         for sequence, payload in enumerate(opus_packets):
+            await self.assert_current(offered)
             media = audio_pb2.DeviceDownlinkEvent(
                 playback=audio_pb2.PlaybackMediaPacket(
                     response_id=audio_pb2.ResponseId(value=offered.response_id),
@@ -624,7 +774,7 @@ class ResponseCoordinator:
         *,
         response_id: str,
         generation: int,
-        state: Literal["started", "done", "cancelled", "failed"],
+        state: Literal["started", "progress", "done", "cancelled", "failed"],
         user_id: str,
         client_id: str,
         audio_session_id: str,
@@ -632,6 +782,8 @@ class ResponseCoordinator:
         capture_epoch: int,
         socket_id: str,
         monotonic_timestamp_ms: int,
+        rendered_samples: int = 0,
+        buffered_samples: int = 0,
     ) -> ResponseRecord:
         record = await self.get(response_id)
         if record is None or record.generation != generation:
@@ -654,14 +806,50 @@ class ResponseCoordinator:
         ):
             raise StaleResponse("playback acknowledgment binding is stale")
 
+        if record.incremental:
+            return await self._stream_ack(
+                record,
+                state=state,
+                rendered_samples=rendered_samples,
+                buffered_samples=buffered_samples,
+                monotonic_timestamp_ms=monotonic_timestamp_ms,
+            )
+        if state == "progress":
+            raise InvalidResponseTransition(
+                "finite playback has no progress acknowledgements"
+            )
+
         # Generation fencing terminally cancels the response before the physical
         # player can report that it actually stopped. Accept that later observation
         # without reviving the response or replacing the coordinator's reason.
         if state == "cancelled" and record.state == "cancelled":
+            prior = await self.redis.hget(
+                voice_response(response_id), "ack_cancelled_ms"
+            )
+            if prior is not None:
+                if float(_decode(prior)) != monotonic_timestamp_ms:
+                    raise InvalidResponseTransition(
+                        "conflicting cancellation acknowledgement"
+                    )
+                return record
+            if record.kind == "speech":
+                trace = VoiceTrace(
+                    self.redis,
+                    TimingIdentity.from_response(record),
+                    response_id=record.response_id,
+                    generation=record.generation,
+                )
+                await trace.emit(
+                    "response_cancelled",
+                    timestamp_ms=monotonic_timestamp_ms,
+                    clock_domain=trace.identity.device_clock,
+                    detail=record.terminal_reason or "cancelled",
+                )
             await self.redis.hset(
                 voice_response(response_id),
                 mapping={
                     "playback_monotonic_ms": str(monotonic_timestamp_ms),
+                    "ack_cancelled_ms": str(monotonic_timestamp_ms),
                     "updated_at": str(time.time()),
                 },
             )
@@ -669,6 +857,14 @@ class ResponseCoordinator:
             if acknowledged is None:
                 raise StaleResponse("response disappeared during cancellation ACK")
             return acknowledged
+
+        prior_ack = await self.redis.hget(
+            voice_response(response_id), f"ack_{state}_ms"
+        )
+        if prior_ack is not None:
+            if float(_decode(prior_ack)) != monotonic_timestamp_ms:
+                raise InvalidResponseTransition("conflicting playback acknowledgement")
+            return record
 
         transitions: dict[str, tuple[set[ResponseState], ResponseState]] = {
             "started": ({"offered"}, "playing"),
@@ -684,8 +880,377 @@ class ResponseCoordinator:
             state=next_state,
             updates={
                 "playback_monotonic_ms": str(monotonic_timestamp_ms),
+                f"ack_{state}_ms": str(monotonic_timestamp_ms),
                 "terminal_reason": terminal_reason,
             },
+        )
+
+    async def _stream_update(self, response_id, mutate, *, allow_cancelled=False):
+        """CAS state and publication together, so cancellation cannot race a late publish."""
+        key = voice_response(response_id)
+        while True:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.hgetall(key)
+                    record = _record_from_hash(raw)
+                    if record is None:
+                        raise StaleResponse("response does not exist")
+                    generation_key = self._generation_key(
+                        record.user_id, record.client_id
+                    )
+                    current_key = self._current_key(record.user_id, record.client_id)
+                    await pipe.watch(generation_key, current_key)
+                    terminal_ack = allow_cancelled and record.state in {
+                        "cancelled",
+                        "done",
+                        "failed",
+                    }
+                    generation, current_id = await pipe.mget(
+                        generation_key, current_key
+                    )
+                    if not terminal_ack and (
+                        int(_decode(generation) or 0) != record.generation
+                        or _decode(current_id) != response_id
+                    ):
+                        raise StaleResponse("response generation was superseded")
+                    mapping, event = mutate(record)
+                    mapping["updated_at"] = str(time.time())
+                    pipe.multi()
+                    pipe.hset(key, mapping=mapping)
+                    pipe.expire(key, RESPONSE_RETENTION_SECONDS)
+                    if (
+                        mapping.get("state") in {"done", "failed", "cancelled"}
+                        and not terminal_ack
+                    ):
+                        pipe.delete(current_key)
+                    next_state = mapping.get("state", record.state)
+                    if next_state != record.state and record.kind == "speech":
+                        trace = VoiceTrace(
+                            self.redis,
+                            TimingIdentity.from_response(record),
+                            response_id=record.response_id,
+                            generation=record.generation,
+                        )
+                        timestamp = mapping.get("playback_monotonic_ms")
+                        timing = trace.event(
+                            (
+                                "response_started"
+                                if next_state == "playing"
+                                else "response_" + next_state
+                            ),
+                            **(
+                                {
+                                    "timestamp_ms": float(timestamp),
+                                    "clock_domain": trace.identity.device_clock,
+                                }
+                                if timestamp
+                                else {}
+                            ),
+                            detail=mapping.get("terminal_reason", ""),
+                        )
+                        pipe.xadd(
+                            WAKE_INTERACTION_EVENTS_STREAM,
+                            {"timing": timing.SerializeToString()},
+                        )
+                    if event is not None:
+                        channel = str(
+                            device_downlink_channel(
+                                ClientId.from_value(record.client_id)
+                            )
+                        )
+                        pipe.publish(channel, event.SerializeToString())
+                    if event is not None and event.HasField("playback"):
+                        with cadence_span(
+                            "publish_transaction",
+                            sequence=event.playback.sequence,
+                            sample_end=(event.playback.sequence + 1)
+                            * DOWNLINK_FRAME_SAMPLES,
+                        ):
+                            await pipe.execute()
+                    else:
+                        await pipe.execute()
+                    # Return precisely this successful commit. A later ACK or
+                    # cancellation belongs to a subsequent operation; a readback
+                    # cannot make this return atomic with those future changes.
+                    return _record_from_hash({**_decode_hash(raw), **mapping})
+                except WatchError:
+                    continue
+
+    async def _assert_stream_binding(self, record):
+        if not await self.voice_sessions.binding_matches(
+            user_id=record.user_id,
+            client_id=record.client_id,
+            audio_session_id=record.audio_session_id,
+            voice_session_id=record.voice_session_id,
+            capture_epoch=record.capture_epoch,
+            socket_id=record.socket_id,
+        ):
+            raise StaleResponse("stream voice binding is stale")
+
+    async def open_stream(
+        self, response_id: str, *, pre_skip_samples: int = 0
+    ) -> ResponseRecord:
+        if not 0 <= pre_skip_samples < DOWNLINK_FRAME_SAMPLES:
+            raise ValueError("invalid Opus pre-skip")
+        record = await self.get(response_id)
+        if record is None:
+            raise StaleResponse("response does not exist")
+        await self._assert_stream_binding(record)
+        voice = await self.voice_sessions.get(record.voice_session_id)
+        if not voice or not (voice.capabilities or {}).get("incremental_playback"):
+            raise InvalidResponseTransition(
+                "target does not support incremental playback"
+            )
+
+        def mutate(current):
+            if current.state != "queued":
+                raise InvalidResponseTransition("stream must start from queued")
+            event = audio_pb2.DeviceDownlinkEvent(
+                playback_offer=audio_pb2.PlaybackOffer(
+                    binding=_capture_binding(current),
+                    turn_id=audio_pb2.TurnId(value=current.turn_id),
+                    response_id=audio_pb2.ResponseId(value=current.response_id),
+                    generation=current.generation,
+                    incremental=True,
+                    pre_skip_samples=pre_skip_samples,
+                    barge_in_allowed=current.barge_in_allowed,
+                    audio_spec=audio_pb2.AudioSpec(
+                        codec=audio_pb2.AUDIO_CODEC_OPUS,
+                        sample_rate_hz=DOWNLINK_SAMPLE_RATE_HZ,
+                        channel_count=1,
+                        bitrate_bps=DOWNLINK_BITRATE_BPS,
+                        frame_duration=duration_pb2.Duration(
+                            nanos=DOWNLINK_FRAME_MS * 1_000_000
+                        ),
+                    ),
+                )
+            )
+            return {
+                "state": "offered",
+                "incremental": "1",
+                "pre_skip_samples": str(pre_skip_samples),
+                "sample_rate": str(DOWNLINK_SAMPLE_RATE_HZ),
+            }, event
+
+        return await self._stream_update(response_id, mutate)
+
+    async def append_stream(
+        self, response_id: str, opus_packet: bytes
+    ) -> ResponseRecord:
+        """Append one encoded 20 ms frame, waiting for bounded rendered progress."""
+        if not opus_packet or len(opus_packet) > 1275:
+            raise ValueError("invalid Opus packet size")
+        deadline = time.monotonic() + STREAM_STALL_SECONDS
+        with cadence_span("publish_credit_check"):
+            while True:
+                record = await self.get(response_id)
+                if record is None:
+                    raise StaleResponse("response does not exist")
+                await self.assert_current(record)
+                await self._assert_stream_binding(record)
+                record = await self.expire_stalled(response_id)
+                if (
+                    record.state not in {"offered", "playing"}
+                    or record.producer_finished
+                ):
+                    raise InvalidResponseTransition("stream is no longer producing")
+                # Credit also bounds packets in Redis/socket transit, not only reported FIFO depth.
+                if (
+                    record.sent_samples
+                    - record.rendered_samples
+                    + DOWNLINK_FRAME_SAMPLES
+                    <= STREAM_CLIENT_BUFFER_SAMPLES
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    await self.fail(response_id, "playback_backpressure_timeout")
+                    raise TimeoutError("playback is not consuming audio")
+                with cadence_span(
+                    "playback_credit_wait",
+                    sequence=record.packet_count,
+                    rendered_samples=record.rendered_samples,
+                    buffered_samples=record.sent_samples - record.rendered_samples,
+                ):
+                    await asyncio.sleep(STREAM_POLL_SECONDS)
+
+        def mutate(current):
+            if (
+                not current.incremental
+                or current.producer_finished
+                or current.state not in {"offered", "playing"}
+            ):
+                raise InvalidResponseTransition("stream is not producing")
+            if (
+                current.sent_samples - current.rendered_samples + DOWNLINK_FRAME_SAMPLES
+                > STREAM_CLIENT_BUFFER_SAMPLES
+            ):
+                raise InvalidResponseTransition(
+                    "concurrent stream producers exhausted playback credit"
+                )
+            if (
+                current.sent_samples + DOWNLINK_FRAME_SAMPLES
+                > DOWNLINK_SAMPLE_RATE_HZ * MAX_RESPONSE_DURATION_MS // 1000
+            ):
+                raise ValueError("stream exceeds maximum duration")
+            if (current.byte_length or 0) + len(opus_packet) > MAX_RESPONSE_BYTES:
+                raise ValueError("stream exceeds maximum encoded bytes")
+            event = audio_pb2.DeviceDownlinkEvent(
+                playback=audio_pb2.PlaybackMediaPacket(
+                    response_id=audio_pb2.ResponseId(value=current.response_id),
+                    generation=current.generation,
+                    sequence=current.packet_count,
+                    opus_payload=opus_packet,
+                )
+            )
+            return {
+                "sent_samples": str(current.sent_samples + DOWNLINK_FRAME_SAMPLES),
+                "packet_count": str(current.packet_count + 1),
+                "byte_length": str((current.byte_length or 0) + len(opus_packet)),
+                **(
+                    {"progress_at": str(time.time())}
+                    if current.packet_count == 0
+                    else {}
+                ),
+            }, event
+
+        with cadence_span(
+            "publish_cas",
+            sequence=record.packet_count,
+            sample_end=record.sent_samples + DOWNLINK_FRAME_SAMPLES,
+        ):
+            return await self._stream_update(response_id, mutate)
+
+    async def finish_stream(
+        self, response_id: str, *, total_samples: int
+    ) -> ResponseRecord:
+        def mutate(current):
+            if (
+                not current.incremental
+                or current.producer_finished
+                or current.state not in {"offered", "playing"}
+            ):
+                raise InvalidResponseTransition("stream is not producing")
+            if not (
+                0 < total_samples <= current.sent_samples
+                and 0
+                <= current.sent_samples - current.pre_skip_samples - total_samples
+                < DOWNLINK_FRAME_SAMPLES
+            ):
+                raise ValueError("final sample length does not match encoded packets")
+            event = audio_pb2.DeviceDownlinkEvent(
+                playback_finished=audio_pb2.PlaybackFinished(
+                    binding=_capture_binding(current),
+                    response_id=audio_pb2.ResponseId(value=current.response_id),
+                    generation=current.generation,
+                    total_samples=total_samples,
+                )
+            )
+            return {
+                "producer_finished": "1",
+                "total_samples": str(total_samples),
+                "duration_ms": str(
+                    round(total_samples * 1000 / DOWNLINK_SAMPLE_RATE_HZ)
+                ),
+                "production_finished_at": str(time.time()),
+            }, event
+
+        return await self._stream_update(response_id, mutate)
+
+    async def wait_stream_done(self, response_id: str) -> ResponseRecord:
+        while True:
+            record = await self.expire_stalled(response_id)
+            if record.state == "done":
+                return record
+            if record.state in {"cancelled", "failed"}:
+                raise StaleResponse(record.terminal_reason or record.state)
+            await self.assert_current(record)
+            await asyncio.sleep(STREAM_POLL_SECONDS)
+
+    async def _stream_ack(
+        self,
+        record,
+        *,
+        state,
+        rendered_samples,
+        buffered_samples,
+        monotonic_timestamp_ms,
+    ):
+        def mutate(current):
+            if current.terminal_ack_state:
+                if (
+                    state != current.terminal_ack_state
+                    or rendered_samples != current.rendered_samples
+                    or buffered_samples != current.buffered_samples
+                    or monotonic_timestamp_ms != current.playback_monotonic_ms
+                ):
+                    raise InvalidResponseTransition(
+                        "conflicting terminal playback acknowledgement"
+                    )
+                return {}, None
+            if monotonic_timestamp_ms < (current.playback_monotonic_ms or 0):
+                raise InvalidResponseTransition("playback timestamp regressed")
+            limit = (
+                current.total_samples
+                if current.producer_finished
+                else max(0, current.sent_samples - current.pre_skip_samples)
+            )
+            if not (current.rendered_samples <= rendered_samples <= limit):
+                raise InvalidResponseTransition(
+                    "rendered position regressed or exceeds sent audio"
+                )
+            if not (0 <= buffered_samples <= STREAM_CLIENT_BUFFER_SAMPLES):
+                raise InvalidResponseTransition(
+                    "playback buffer exceeds configured capacity"
+                )
+            if rendered_samples + buffered_samples > current.sent_samples:
+                raise InvalidResponseTransition(
+                    "playback position exceeds published audio"
+                )
+            expected = {
+                "started": {"offered", "playing"},
+                "progress": {"playing"},
+                "done": {"playing", "done"},
+                "cancelled": {"offered", "playing", "cancelled", "failed"},
+                "failed": {"offered", "playing", "failed"},
+            }
+            if current.state not in expected[state]:
+                raise InvalidResponseTransition(
+                    f"cannot acknowledge {state} from {current.state}"
+                )
+            if state == "done" and (
+                not current.producer_finished
+                or rendered_samples < current.total_samples
+                or buffered_samples
+            ):
+                raise InvalidResponseTransition(
+                    "playback cannot finish before producer and renderer drain"
+                )
+            if current.state in {"done", "cancelled", "failed"}:
+                next_state = current.state
+            else:
+                next_state = "playing" if state in {"started", "progress"} else state
+            updates = {
+                "state": next_state,
+                "rendered_samples": str(rendered_samples),
+                "buffered_samples": str(buffered_samples),
+                "playback_monotonic_ms": str(monotonic_timestamp_ms),
+            }
+            # Repeated heartbeats without rendered progress must not defeat stall detection.
+            if rendered_samples > current.rendered_samples or (
+                state == "started" and current.state == "offered"
+            ):
+                updates["progress_at"] = str(time.time())
+            if state in {"cancelled", "done", "failed"}:
+                updates["terminal_ack_state"] = state
+            if state in {"cancelled", "failed"}:
+                updates["terminal_reason"] = current.terminal_reason or state
+            return updates, None
+
+        return await self._stream_update(
+            record.response_id,
+            mutate,
+            allow_cancelled=state in {"cancelled", "done", "failed"},
         )
 
     async def _publish(self, client_id: str, payload: bytes) -> None:

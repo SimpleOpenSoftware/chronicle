@@ -37,11 +37,8 @@ def test_prompt_version_is_pinned():
     the only thing a second copy can achieve.
     """
 
-    assert SEPARATION_PROMPT_VERSION == "timeline-separation-v11-recording-coverage"
-    assert (
-        INTERPRETATION_PROMPT_VERSION
-        == "timeline-interpretation-v6-device-local-coverage"
-    )
+    assert SEPARATION_PROMPT_VERSION == "timeline-separation-pi-v1"
+    assert INTERPRETATION_PROMPT_VERSION == "timeline-interpretation-pi-v1"
 
 
 def test_separation_schema_contains_only_structure_and_explicit_lineage():
@@ -73,13 +70,9 @@ def test_interpretation_schema_joins_semantics_without_structure():
     assert "evidence_ids" not in episode["properties"]
 
 
-def test_staged_prompts_preserve_concurrency_and_local_rejection():
-    separation = build_separation_prompt()
-    interpretation = build_interpretation_prompt()
-
-    assert "Hypotheses may overlap" in separation
-    assert "interval overlap are never" in separation
-    assert "Pins own fields, never time territory" in separation
-    assert "Do not title, classify, summarize" in separation
-    assert "Rejection is local" in interpretation
-    assert "Do not add, remove, split, merge, or move" in interpretation
+def test_stage_tools_receive_their_distinct_result_contracts():
+    # Check the interfaces, not a prescribed phrasing or investigation sequence.
+    assert '"hypotheses"' in build_separation_prompt()
+    assert '"retirements"' in build_separation_prompt()
+    assert '"accepted"' in build_interpretation_prompt()
+    assert '"rejected"' in build_interpretation_prompt()

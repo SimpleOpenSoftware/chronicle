@@ -14,6 +14,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
+import backend.services.privacy as privacy
 from backend.app_config import get_audio_chunk_dir
 from backend.auth import (
     current_active_user_optional,
@@ -140,6 +141,11 @@ async def get_conversation_audio(
     ):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    try:
+        policy = await privacy.require_record(conversation)
+    except privacy.PrivacyHeld as exc:
+        raise HTTPException(423, str(exc)) from exc
+
     filename = _safe_filename(conversation)
 
     if format == "opus":
@@ -152,7 +158,8 @@ async def get_conversation_audio(
         range_header = request.headers.get("range")
 
         if not range_header:
-            return Response(
+            return privacy.PrivacyBytesResponse(
+                privacy_snapshots=[(str(conversation.user_id), policy)],
                 content=opus_data,
                 media_type="audio/ogg",
                 headers={
@@ -174,7 +181,8 @@ async def get_conversation_audio(
             range_end = min(file_size - 1, range_end)
             content_length = range_end - range_start + 1
 
-            return Response(
+            return privacy.PrivacyBytesResponse(
+                privacy_snapshots=[(str(conversation.user_id), policy)],
                 content=opus_data[range_start : range_end + 1],
                 status_code=206,
                 media_type="audio/ogg",
@@ -186,7 +194,8 @@ async def get_conversation_audio(
                 },
             )
         except (ValueError, IndexError):
-            return Response(
+            return privacy.PrivacyBytesResponse(
+                privacy_snapshots=[(str(conversation.user_id), policy)],
                 status_code=416,
                 headers={"Content-Range": f"bytes */{file_size}"},
             )
@@ -205,8 +214,12 @@ async def get_conversation_audio(
     range_header = request.headers.get("range")
 
     if not range_header:
-        return StreamingResponse(
-            io.BytesIO(wav_data),
+        return privacy.PrivacyStreamingResponse(
+            privacy_snapshots=[(str(conversation.user_id), policy)],
+            content=(
+                wav_data[offset : offset + 65536]
+                for offset in range(0, len(wav_data), 65536)
+            ),
             media_type="audio/wav",
             headers={
                 "Content-Disposition": f'inline; filename="{filename}.wav"',
@@ -226,7 +239,8 @@ async def get_conversation_audio(
         range_end = min(file_size - 1, range_end)
         content_length = range_end - range_start + 1
 
-        return Response(
+        return privacy.PrivacyBytesResponse(
+            privacy_snapshots=[(str(conversation.user_id), policy)],
             content=wav_data[range_start : range_end + 1],
             status_code=206,
             media_type="audio/wav",
@@ -238,8 +252,10 @@ async def get_conversation_audio(
             },
         )
     except (ValueError, IndexError):
-        return Response(
-            status_code=416, headers={"Content-Range": f"bytes */{file_size}"}
+        return privacy.PrivacyBytesResponse(
+            privacy_snapshots=[(str(conversation.user_id), policy)],
+            status_code=416,
+            headers={"Content-Range": f"bytes */{file_size}"},
         )
 
 
@@ -296,6 +312,11 @@ async def stream_conversation_audio(
     ):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    try:
+        policy = await privacy.require_record(conversation)
+    except privacy.PrivacyHeld as exc:
+        raise HTTPException(423, str(exc)) from exc
+
     # Check if chunks exist
     if not conversation.audio_chunks_count or conversation.audio_chunks_count == 0:
         raise HTTPException(
@@ -328,6 +349,7 @@ async def stream_conversation_audio(
         batch_size = 20
 
         while start_index < conversation.audio_chunks_count:
+            await privacy.assert_current(str(conversation.user_id), policy)
             # Retrieve batch of chunks
             chunks = await retrieve_audio_chunks(
                 conversation_id=conversation_id,
@@ -339,6 +361,7 @@ async def stream_conversation_audio(
                 break
 
             # Decode and concatenate this batch
+            await privacy.assert_current(str(conversation.user_id), policy)
             pcm_batch = await concatenate_chunks_to_pcm(chunks)
 
             # Yield PCM data (client's WAV parser handles the stream)
@@ -348,8 +371,9 @@ async def stream_conversation_audio(
             start_index += batch_size
 
     filename = _safe_filename(conversation)
-    return StreamingResponse(
-        stream_chunks(),
+    return privacy.PrivacyStreamingResponse(
+        privacy_snapshots=[(str(conversation.user_id), policy)],
+        content=stream_chunks(),
         media_type="audio/wav",
         headers={
             "Content-Disposition": f'inline; filename="{filename}.wav"',
@@ -404,6 +428,11 @@ async def get_audio_chunk_range(
     ):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    try:
+        policy = await privacy.require_record(conversation)
+    except privacy.PrivacyHeld as exc:
+        raise HTTPException(423, str(exc)) from exc
+
     # Validate time range
     if start_time < 0 or end_time <= start_time:
         raise HTTPException(status_code=400, detail="Invalid time range")
@@ -422,7 +451,8 @@ async def get_audio_chunk_range(
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
-        return Response(
+        return privacy.PrivacyBytesResponse(
+            privacy_snapshots=[(str(conversation.user_id), policy)],
             content=opus_data,
             media_type="audio/ogg",
             headers={
@@ -447,7 +477,8 @@ async def get_audio_chunk_range(
             status_code=500, detail=f"Failed to reconstruct audio: {str(e)}"
         )
 
-    return Response(
+    return privacy.PrivacyBytesResponse(
+        privacy_snapshots=[(str(conversation.user_id), policy)],
         content=wav_data,
         media_type="audio/wav",
         headers={

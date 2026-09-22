@@ -14,150 +14,6 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "backend"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "chronicle-wearable-sdk" },
-    { name = "croniter" },
-    { name = "easy-audio-interfaces" },
-    { name = "en-core-web-sm" },
-    { name = "fastapi" },
-    { name = "fastapi-users", extra = ["beanie"] },
-    { name = "fastmcp" },
-    { name = "google-api-python-client" },
-    { name = "google-auth-httplib2" },
-    { name = "google-auth-oauthlib" },
-    { name = "httpx" },
-    { name = "jsonschema" },
-    { name = "langfuse" },
-    { name = "mcp" },
-    { name = "minidisc-python" },
-    { name = "motor" },
-    { name = "ollama" },
-    { name = "omegaconf" },
-    { name = "openinference-instrumentation-openai" },
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-sdk" },
-    { name = "pillow" },
-    { name = "protobuf" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "redis" },
-    { name = "rich" },
-    { name = "rq" },
-    { name = "ruamel-yaml" },
-    { name = "soundfile" },
-    { name = "spacy" },
-    { name = "ten-vad" },
-    { name = "uvicorn" },
-    { name = "websockets" },
-    { name = "wyoming" },
-]
-
-[package.optional-dependencies]
-benchmark = [
-    { name = "huggingface-hub" },
-    { name = "ijson" },
-]
-galileo = [
-    { name = "galileo" },
-    { name = "opentelemetry-exporter-otlp" },
-]
-local-audio = [
-    { name = "easy-audio-interfaces", extra = ["local-audio"] },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "black" },
-    { name = "isort" },
-    { name = "pre-commit" },
-    { name = "pre-commit-uv" },
-]
-test = [
-    { name = "aiosqlite" },
-    { name = "hypothesis" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-html" },
-    { name = "pytest-json-report" },
-    { name = "pytest-mock" },
-    { name = "pytest-spec" },
-    { name = "pytest-xdist" },
-    { name = "requests-mock" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.8.0" },
-    { name = "chronicle-wearable-sdk", git = "https://github.com/SimpleOpenSoftware/chronicle?subdirectory=extras%2Fchronicle-wearable-sdk&branch=dev" },
-    { name = "croniter", specifier = ">=1.3.0" },
-    { name = "easy-audio-interfaces", specifier = ">=0.7.1" },
-    { name = "easy-audio-interfaces", extras = ["local-audio"], marker = "extra == 'local-audio'", specifier = ">=0.7.1" },
-    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
-    { name = "fastapi", specifier = ">=0.115.12" },
-    { name = "fastapi-users", extras = ["beanie"], specifier = ">=14.0.1" },
-    { name = "fastmcp", specifier = ">=0.5.0" },
-    { name = "galileo", marker = "extra == 'galileo'", specifier = ">=1.0" },
-    { name = "google-api-python-client", specifier = ">=2.0.0" },
-    { name = "google-auth-httplib2", specifier = ">=0.2.0" },
-    { name = "google-auth-oauthlib", specifier = ">=1.0.0" },
-    { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
-    { name = "huggingface-hub", marker = "extra == 'benchmark'", specifier = ">=0.23" },
-    { name = "ijson", marker = "extra == 'benchmark'", specifier = ">=3.2.0" },
-    { name = "jsonschema", specifier = ">=4.25.1" },
-    { name = "langfuse", specifier = ">=4.0.0" },
-    { name = "mcp", specifier = ">=1.20,<2.0" },
-    { name = "minidisc-python", specifier = ">=0.1.0" },
-    { name = "motor", specifier = ">=3.7.1" },
-    { name = "ollama", specifier = ">=0.4.8" },
-    { name = "omegaconf", specifier = ">=2.3.0" },
-    { name = "openinference-instrumentation-openai", specifier = ">=0.1" },
-    { name = "opentelemetry-api", specifier = ">=1.20" },
-    { name = "opentelemetry-exporter-otlp", marker = "extra == 'galileo'", specifier = ">=1.20" },
-    { name = "opentelemetry-sdk", specifier = ">=1.20" },
-    { name = "pillow", specifier = ">=11,<13" },
-    { name = "protobuf", specifier = ">=5.29.0,<6" },
-    { name = "python-dotenv", specifier = ">=1.1.0" },
-    { name = "pyyaml", specifier = ">=6.0.1" },
-    { name = "redis", specifier = ">=5.0.0" },
-    { name = "rich", specifier = ">=13.0.0" },
-    { name = "rq", specifier = ">=1.16.0" },
-    { name = "ruamel-yaml", specifier = ">=0.18.0" },
-    { name = "soundfile", specifier = ">=0.12.1" },
-    { name = "spacy", specifier = ">=3.8.2" },
-    { name = "ten-vad", git = "https://github.com/TEN-framework/ten-vad.git?rev=22a3bcd4509d0faaa8eef4881e8af5f39c178950" },
-    { name = "uvicorn", specifier = ">=0.34.2" },
-    { name = "websockets", specifier = ">=12.0" },
-    { name = "wyoming", specifier = ">=1.6.1" },
-]
-provides-extras = ["local-audio", "galileo", "benchmark"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "black", specifier = ">=25.1.0" },
-    { name = "isort", specifier = ">=6.0.1" },
-    { name = "pre-commit", specifier = ">=4.2.0" },
-    { name = "pre-commit-uv", specifier = ">=4.1.4" },
-]
-test = [
-    { name = "aiosqlite", specifier = ">=0.20.0" },
-    { name = "hypothesis", specifier = ">=6.138.0" },
-    { name = "pytest", specifier = ">=8.4.1" },
-    { name = "pytest-asyncio", specifier = ">=1.0.0" },
-    { name = "pytest-cov", specifier = ">=6.0.0" },
-    { name = "pytest-html", specifier = ">=4.0.0" },
-    { name = "pytest-json-report", specifier = ">=1.5.0" },
-    { name = "pytest-mock", specifier = ">=3.14.0" },
-    { name = "pytest-spec", specifier = ">=3.2.0" },
-    { name = "pytest-xdist", specifier = ">=3.6.0" },
-    { name = "requests-mock", specifier = ">=1.12.1" },
-]
-
-[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -372,6 +228,154 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/bb/9b/b1661026ff24bc641b76b78c5222d614776b0c085bcfdac9bd15a1cb4b35/authlib-1.6.6.tar.gz", hash = "sha256:45770e8e056d0f283451d9996fbb59b70d45722b45d854d58f32878d0a40c38e", size = 164894, upload-time = "2025-12-12T08:01:41.464Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/51/321e821856452f7386c4e9df866f196720b1ad0c5ea1623ea7399969ae3b/authlib-1.6.6-py2.py3-none-any.whl", hash = "sha256:7d9e9bc535c13974313a87f53e8430eb6ea3d1cf6ae4f6efcd793f2e949143fd", size = 244005, upload-time = "2025-12-12T08:01:40.209Z" },
+]
+
+[[package]]
+name = "backend"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "chronicle-wearable-sdk" },
+    { name = "croniter" },
+    { name = "easy-audio-interfaces" },
+    { name = "en-core-web-sm" },
+    { name = "fastapi" },
+    { name = "fastapi-users", extra = ["beanie"] },
+    { name = "fastmcp" },
+    { name = "google-api-python-client" },
+    { name = "google-auth-httplib2" },
+    { name = "google-auth-oauthlib" },
+    { name = "httpx" },
+    { name = "jsonschema" },
+    { name = "langfuse" },
+    { name = "mcp" },
+    { name = "minidisc-python" },
+    { name = "motor" },
+    { name = "num2words" },
+    { name = "ollama" },
+    { name = "omegaconf" },
+    { name = "openinference-instrumentation-openai" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
+    { name = "pillow" },
+    { name = "protobuf" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "redis" },
+    { name = "rich" },
+    { name = "rq" },
+    { name = "ruamel-yaml" },
+    { name = "soundfile" },
+    { name = "spacy" },
+    { name = "ten-vad" },
+    { name = "uvicorn" },
+    { name = "websockets" },
+    { name = "wyoming" },
+]
+
+[package.optional-dependencies]
+benchmark = [
+    { name = "huggingface-hub" },
+    { name = "ijson" },
+]
+galileo = [
+    { name = "galileo" },
+    { name = "opentelemetry-exporter-otlp" },
+]
+local-audio = [
+    { name = "easy-audio-interfaces", extra = ["local-audio"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "black" },
+    { name = "isort" },
+    { name = "mongomock-motor" },
+    { name = "pre-commit" },
+    { name = "pre-commit-uv" },
+]
+test = [
+    { name = "aiosqlite" },
+    { name = "hypothesis" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-html" },
+    { name = "pytest-json-report" },
+    { name = "pytest-mock" },
+    { name = "pytest-spec" },
+    { name = "pytest-xdist" },
+    { name = "requests-mock" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp", specifier = ">=3.8.0" },
+    { name = "chronicle-wearable-sdk", git = "https://github.com/SimpleOpenSoftware/chronicle?subdirectory=extras%2Fchronicle-wearable-sdk&branch=dev" },
+    { name = "croniter", specifier = ">=1.3.0" },
+    { name = "easy-audio-interfaces", specifier = ">=0.7.1" },
+    { name = "easy-audio-interfaces", extras = ["local-audio"], marker = "extra == 'local-audio'", specifier = ">=0.7.1" },
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
+    { name = "fastapi", specifier = ">=0.115.12" },
+    { name = "fastapi-users", extras = ["beanie"], specifier = ">=14.0.1" },
+    { name = "fastmcp", specifier = ">=0.5.0" },
+    { name = "galileo", marker = "extra == 'galileo'", specifier = ">=1.0" },
+    { name = "google-api-python-client", specifier = ">=2.0.0" },
+    { name = "google-auth-httplib2", specifier = ">=0.2.0" },
+    { name = "google-auth-oauthlib", specifier = ">=1.0.0" },
+    { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
+    { name = "huggingface-hub", marker = "extra == 'benchmark'", specifier = ">=0.23" },
+    { name = "ijson", marker = "extra == 'benchmark'", specifier = ">=3.2.0" },
+    { name = "jsonschema", specifier = ">=4.25.1" },
+    { name = "langfuse", specifier = ">=4.0.0" },
+    { name = "mcp", specifier = ">=1.20,<2.0" },
+    { name = "minidisc-python", specifier = ">=0.1.0" },
+    { name = "motor", specifier = ">=3.7.1" },
+    { name = "num2words", specifier = "==0.5.14" },
+    { name = "ollama", specifier = ">=0.4.8" },
+    { name = "omegaconf", specifier = ">=2.3.0" },
+    { name = "openinference-instrumentation-openai", specifier = ">=0.1" },
+    { name = "opentelemetry-api", specifier = ">=1.20" },
+    { name = "opentelemetry-exporter-otlp", marker = "extra == 'galileo'", specifier = ">=1.20" },
+    { name = "opentelemetry-sdk", specifier = ">=1.20" },
+    { name = "pillow", specifier = ">=11,<13" },
+    { name = "protobuf", specifier = ">=5.29.0,<6" },
+    { name = "python-dotenv", specifier = ">=1.1.0" },
+    { name = "pyyaml", specifier = ">=6.0.1" },
+    { name = "redis", specifier = ">=5.0.0" },
+    { name = "rich", specifier = ">=13.0.0" },
+    { name = "rq", specifier = ">=1.16.0" },
+    { name = "ruamel-yaml", specifier = ">=0.18.0" },
+    { name = "soundfile", specifier = ">=0.12.1" },
+    { name = "spacy", specifier = ">=3.8.2" },
+    { name = "ten-vad", git = "https://github.com/TEN-framework/ten-vad.git?rev=22a3bcd4509d0faaa8eef4881e8af5f39c178950" },
+    { name = "uvicorn", specifier = ">=0.34.2" },
+    { name = "websockets", specifier = ">=12.0" },
+    { name = "wyoming", specifier = ">=1.6.1" },
+]
+provides-extras = ["local-audio", "galileo", "benchmark"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black", specifier = ">=25.1.0" },
+    { name = "isort", specifier = ">=6.0.1" },
+    { name = "mongomock-motor", specifier = ">=0.0.36,<1" },
+    { name = "pre-commit", specifier = ">=4.2.0" },
+    { name = "pre-commit-uv", specifier = ">=4.1.4" },
+]
+test = [
+    { name = "aiosqlite", specifier = ">=0.20.0" },
+    { name = "hypothesis", specifier = ">=6.138.0" },
+    { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-asyncio", specifier = ">=1.0.0" },
+    { name = "pytest-cov", specifier = ">=6.0.0" },
+    { name = "pytest-html", specifier = ">=4.0.0" },
+    { name = "pytest-json-report", specifier = ">=1.5.0" },
+    { name = "pytest-mock", specifier = ">=3.14.0" },
+    { name = "pytest-spec", specifier = ">=3.2.0" },
+    { name = "pytest-xdist", specifier = ">=3.6.0" },
+    { name = "requests-mock", specifier = ">=1.12.1" },
 ]
 
 [[package]]
@@ -1041,6 +1045,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/8c/8b/57666417c0f90f08b
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/5a/18ad964b0086c6e62e2e7500f7edc89e3faa45033c71c1893d34eed2b2de/dnspython-2.8.0-py3-none-any.whl", hash = "sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af", size = 331094, upload-time = "2025-09-07T18:57:58.071Z" },
 ]
+
+[[package]]
+name = "docopt"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/55/8f8cab2afd404cf578136ef2cc5dfb50baa1761b68c9da1fb1e4eed343c9/docopt-0.6.2.tar.gz", hash = "sha256:49b3a825280bd66b3aa83585ef59c4a8c82f2c8a522dbe754a8bc8d08c85c491", size = 25901, upload-time = "2014-06-16T11:18:57.406Z" }
 
 [[package]]
 name = "docstring-parser"
@@ -2187,6 +2197,33 @@ wheels = [
 ]
 
 [[package]]
+name = "mongomock"
+version = "4.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "pytz" },
+    { name = "sentinels" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4d/a4/4a560a9f2a0bec43d5f63104f55bc48666d619ca74825c8ae156b08547cf/mongomock-4.3.0.tar.gz", hash = "sha256:32667b79066fabc12d4f17f16a8fd7361b5f4435208b3ba32c226e52212a8c30", size = 135862, upload-time = "2024-11-16T11:23:25.957Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/4d/8bea712978e3aff017a2ab50f262c620e9239cc36f348aae45e48d6a4786/mongomock-4.3.0-py2.py3-none-any.whl", hash = "sha256:5ef86bd12fc8806c6e7af32f21266c61b6c4ba96096f85129852d1c4fec1327e", size = 64891, upload-time = "2024-11-16T11:23:24.748Z" },
+]
+
+[[package]]
+name = "mongomock-motor"
+version = "0.0.36"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mongomock" },
+    { name = "motor" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/18/9f/38e42a34ebad323addaf6296d6b5d83eaf2c423adf206b757c68315e196a/mongomock_motor-0.0.36.tar.gz", hash = "sha256:3cf62352ece5af2f02e04d2f252393f88b5fe0487997da00584020cee4b8efba", size = 5754, upload-time = "2025-05-16T22:52:27.214Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/99/f5fdbbdc96bfd03e5f9c36339547a9076f5dbb5882900b7621526d41a38d/mongomock_motor-0.0.36-py3-none-any.whl", hash = "sha256:3ecb7949662b8986ff9c267fa0b1402b5b75a6afd57f03850cd6e13a067e3691", size = 7334, upload-time = "2025-05-16T22:52:25.417Z" },
+]
+
+[[package]]
 name = "more-itertools"
 version = "10.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2370,6 +2407,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/24/bf/d1bda4f6168e0b2e9e5958945e01910052158313224ada5ce1fb2e1113b8/nodeenv-1.10.0.tar.gz", hash = "sha256:996c191ad80897d076bdfba80a41994c2b47c68e224c542b48feba42ba00f8bb", size = 55611, upload-time = "2025-12-20T14:08:54.006Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/b2/d0896bdcdc8d28a7fc5717c305f1a861c26e18c05047949fb371034d98bd/nodeenv-1.10.0-py2.py3-none-any.whl", hash = "sha256:5bb13e3eed2923615535339b3c620e76779af4cb4c6a90deccc9e36b274d3827", size = 23438, upload-time = "2025-12-20T14:08:52.782Z" },
+]
+
+[[package]]
+name = "num2words"
+version = "0.5.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docopt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/58/ad645bd38b4b648eb2fc2ba1b909398e54eb0cbb6a7dbd2b4953e38c9621/num2words-0.5.14.tar.gz", hash = "sha256:b066ec18e56b6616a3b38086b5747daafbaa8868b226a36127e0451c0cf379c6", size = 218213, upload-time = "2024-12-17T20:17:10.191Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/5b/545e9267a1cc080c8a1be2746113a063e34bcdd0f5173fd665a5c13cb234/num2words-0.5.14-py3-none-any.whl", hash = "sha256:1c8e5b00142fc2966fd8d685001e36c4a9911e070d1b120e1beb721fa1edb33d", size = 163525, upload-time = "2024-12-17T20:17:06.074Z" },
 ]
 
 [[package]]
@@ -3922,6 +3971,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/46/f5af3402b579fd5e11573ce652019a67074317e18c1935cc0b4ba9b35552/secretstorage-3.5.0-py3-none-any.whl", hash = "sha256:0ce65888c0725fcb2c5bc0fdb8e5438eece02c523557ea40ce0703c266248137", size = 15554, upload-time = "2025-11-23T19:02:51.545Z" },
+]
+
+[[package]]
+name = "sentinels"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/9b/07195878aa25fe6ed209ec74bc55ae3e3d263b60a489c6e73fdca3c8fe05/sentinels-1.1.1.tar.gz", hash = "sha256:3c2f64f754187c19e0a1a029b148b74cf58dd12ec27b4e19c0e5d6e22b5a9a86", size = 4393, upload-time = "2025-08-12T07:57:50.26Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/65/dea992c6a97074f6d8ff9eab34741298cac2ce23e2b6c74fb7d08afdf85c/sentinels-1.1.1-py3-none-any.whl", hash = "sha256:835d3b28f3b47f5284afa4bf2db6e00f2dc5f80f9923d4b7e7aeeeccf6146a11", size = 3744, upload-time = "2025-08-12T07:57:48.858Z" },
 ]
 
 [[package]]

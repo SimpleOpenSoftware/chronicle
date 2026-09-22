@@ -37,6 +37,7 @@ from .modules import (
     wakeword_router,
 )
 from .modules.health_routes import router as health_router
+from .modules.source_search_routes import router as source_search_router
 
 logger = logging.getLogger(__name__)
 audio_logger = logging.getLogger("audio_processing")
@@ -66,6 +67,7 @@ router.include_router(sse_router)
 router.include_router(system_events_router)
 router.include_router(system_router)
 router.include_router(timeline_router)
+router.include_router(source_search_router)
 router.include_router(queue_router)
 router.include_router(vault_sync_router)
 router.include_router(wakeword_router)

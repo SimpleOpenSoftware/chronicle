@@ -86,11 +86,10 @@ class KokoroService(BaseTTSService):
         )
 
     def get_capabilities(self) -> list[str]:
-        return ["lightweight", "low_vram", "preset_voices"]
+        return ["lightweight", "low_vram", "preset_voices", "request_language"]
 
     def get_supported_languages(self) -> Optional[list[str]]:
-        lang_code = os.getenv("TTS_LANG_CODE", "a")
-        return [_LANG_BY_CODE.get(lang_code, "en")]
+        return ["en", "hi"]
 
 
 def main():

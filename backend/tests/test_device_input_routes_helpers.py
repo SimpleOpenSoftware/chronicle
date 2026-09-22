@@ -348,3 +348,83 @@ async def test_audio_compacted_duplicate_requires_the_same_track(
 
     assert exc_info.value.status_code == 409
     assert "Audio locator conflicts" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", [None, "captured_at", "ended_at", "locator"])
+async def test_complete_job_replays_bson_timestamp_precision(
+    monkeypatch, device_input_model, conflict
+):
+    from unittest.mock import AsyncMock
+
+    from bson import BSON
+
+    captured_at = datetime(2026, 9, 15, 20, 23, 5, 29538, tzinfo=timezone.utc)
+    ended_at = captured_at + timedelta(seconds=1, microseconds=123)
+    stored_times = BSON.encode(
+        {"captured_at": captured_at, "ended_at": ended_at}
+    ).decode()
+    locator = EvidenceLocator(
+        capture_source_id="screenpipe-rainbow", modality="screen", track_id="monitor_35"
+    )
+    existing = device_input_model(
+        user_id="user",
+        source_id="screenpipe-rainbow",
+        kind="screen_context",
+        source_item_id="frame:130882",
+        locator=locator,
+        **stored_times,
+    )
+    incoming_time = captured_at
+    incoming_end = ended_at
+    incoming_locator = locator
+    if conflict == "captured_at":
+        incoming_time += timedelta(milliseconds=1)
+    elif conflict == "ended_at":
+        incoming_end += timedelta(milliseconds=1)
+    elif conflict == "locator":
+        incoming_locator = locator.model_copy(update={"track_id": "monitor_1309"})
+    job = SimpleNamespace(
+        source_id="screenpipe-rainbow",
+        context_request_id=None,
+        status="claimed",
+        purpose="conversation_enrichment",
+        payload={"conversation_id": "conversation"},
+        save=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        device_input_routes,
+        "DeviceInputJob",
+        SimpleNamespace(get=AsyncMock(return_value=job)),
+    )
+    monkeypatch.setattr(
+        device_input_model,
+        "insert",
+        AsyncMock(side_effect=DuplicateKeyError("same frame")),
+    )
+    monkeypatch.setattr(
+        device_input_model, "find_one", AsyncMock(return_value=existing)
+    )
+    body = device_input_routes.JobCompletion(
+        items=[
+            device_input_routes.ActivityItem(
+                source_item_id="frame:130882",
+                locator=incoming_locator,
+                captured_at=incoming_time,
+                ended_at=incoming_end,
+                metadata={"app_name": "Browser", "text": "Captured screen context"},
+            )
+        ]
+    )
+    source = SimpleNamespace(user_id="user", source_id="screenpipe-rainbow")
+    if conflict:
+        with pytest.raises(device_input_routes.HTTPException) as exc:
+            await device_input_routes.complete_job("job", body, source)
+        assert exc.value.status_code == 409
+        job.save.assert_not_awaited()
+    else:
+        result = await device_input_routes.complete_job("job", body, source)
+        assert result["stored"] == 1
+        assert job.status == "complete"
+        assert job.payload["result_evidence_ids"] == ["observation:requested-item"]
+        job.save.assert_awaited_once()

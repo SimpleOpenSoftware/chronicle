@@ -90,7 +90,11 @@ class _Collection:
 @pytest.mark.asyncio
 async def test_unknown_scan_is_user_scoped_and_includes_active_annotation_datasets(
     monkeypatch,
+    isolated_privacy_database,
 ):
+    await isolated_privacy_database.conversations.insert_one(
+        {"conversation_id": "dataset-clip", "user_id": "user-1"}
+    )
     collection = _Collection(
         [
             {

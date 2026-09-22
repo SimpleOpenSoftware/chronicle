@@ -12,6 +12,7 @@ which auto-instruments all OpenAI calls at startup. No per-client wrapping neede
 """
 
 import logging
+import os
 
 import openai
 
@@ -60,10 +61,16 @@ def create_openai_client(api_key: str, base_url: str, is_async: bool = False):
     if client is not None:
         return client
 
+    gateway = os.getenv("SERVICE_GATEWAY_URL", "").rstrip("/")
+    options = (
+        {"max_retries": 0}
+        if gateway and base_url.startswith(gateway + "/deployments/")
+        else {}
+    )
     if is_async:
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url, **options)
     else:
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        client = openai.OpenAI(api_key=api_key, base_url=base_url, **options)
 
     _client_cache[cache_key] = client
     logger.info(

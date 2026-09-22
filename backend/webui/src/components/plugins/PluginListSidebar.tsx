@@ -18,7 +18,6 @@ interface PluginListSidebarProps {
   plugins: Plugin[]
   selectedPluginId: string | null
   onSelectPlugin: (pluginId: string) => void
-  onToggleEnabled: (pluginId: string, enabled: boolean) => void
   loading?: boolean
   connectivity?: Record<string, ConnectivityResult>
 }
@@ -27,7 +26,6 @@ export default function PluginListSidebar({
   plugins,
   selectedPluginId,
   onSelectPlugin,
-  onToggleEnabled,
   loading = false,
   connectivity = {}
 }: PluginListSidebarProps) {
@@ -45,7 +43,7 @@ export default function PluginListSidebar({
     if (!conn) {
       // No connectivity data yet — gray dot
       return (
-        <span title="Checking..." className="relative flex h-3 w-3">
+        <span title="Connectivity not confirmed" className="relative flex h-3 w-3">
           <span className="h-3 w-3 rounded-full bg-gray-400" />
         </span>
       )
@@ -86,15 +84,7 @@ export default function PluginListSidebar({
       return <StateBadge tone="danger">Error</StateBadge>
     }
 
-    // Fallback to status-based badge
-    switch (plugin.status) {
-      case 'active':
-        return <StateBadge tone="success">Active</StateBadge>
-      case 'error':
-        return <StateBadge tone="danger">Error</StateBadge>
-      default:
-        return <StateBadge tone="neutral">Unknown</StateBadge>
-    }
+    return <StateBadge tone="neutral">Enabled · not checked</StateBadge>
   }
 
   if (loading) {
@@ -124,11 +114,14 @@ export default function PluginListSidebar({
         const isSelected = selectedPluginId === plugin.plugin_id
 
         return (
-          <div
+          <button
+            type="button"
+            aria-pressed={isSelected}
+            aria-label={`Configure ${plugin.name}`}
             key={plugin.plugin_id}
             onClick={() => onSelectPlugin(plugin.plugin_id)}
             className={`
-              p-4 rounded-lg border cursor-pointer transition-all
+              block w-full text-left p-4 rounded-lg border cursor-pointer transition-all
               ${
                 isSelected
                   ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
@@ -153,36 +146,8 @@ export default function PluginListSidebar({
               {plugin.description}
             </p>
 
-            {/* Plugin Status and Toggle */}
-            <div className="flex items-center justify-between">
-              {getStatusBadge(plugin)}
-
-              <label
-                className="flex items-center space-x-2 cursor-pointer"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onToggleEnabled(plugin.plugin_id, !plugin.enabled)
-                }}
-              >
-                <span className="text-xs text-gray-600 dark:text-gray-400">
-                  {plugin.enabled ? 'Enabled' : 'Disabled'}
-                </span>
-                <div
-                  className={`
-                    relative inline-flex h-5 w-9 items-center rounded-full transition-colors
-                    ${plugin.enabled ? 'bg-blue-600' : 'bg-gray-300 dark:bg-gray-600'}
-                  `}
-                >
-                  <span
-                    className={`
-                      inline-block h-4 w-4 transform rounded-full bg-white transition-transform
-                      ${plugin.enabled ? 'translate-x-5' : 'translate-x-0.5'}
-                    `}
-                  />
-                </div>
-              </label>
-            </div>
-          </div>
+            {getStatusBadge(plugin)}
+          </button>
         )
       })}
     </div>

@@ -15,7 +15,7 @@ while their transcripts are stranded on a different conversation document.
 
 import pytest
 from fakeredis import FakeStrictRedis
-from rq import Queue
+from rq import Queue, Worker
 from rq.job import Job, JobStatus
 
 from backend.controllers import queue_controller as module
@@ -49,6 +49,22 @@ def test_distinct_sessions_get_distinct_jobs(qc):
 
     assert a != b
     assert qc.audio_queue.count == 2
+
+
+@pytest.mark.parametrize("owner_state", ["running", "missing", "dead", "different_job"])
+def test_started_job_requires_its_actual_worker_owner(qc, owner_state):
+    identifier = qc.enqueue_audio_persistence("sess-1", "user-1", "sess-1")
+    job = Job.fetch(identifier, connection=qc.redis_conn)
+    worker = Worker([qc.audio_queue], connection=qc.redis_conn, name="test-owner")
+    worker.register_birth()
+    worker.prepare_job_execution(job)
+    if owner_state == "missing":
+        qc.redis_conn.delete(worker.key)
+    elif owner_state == "dead":
+        worker.register_death()
+    elif owner_state == "different_job":
+        worker.set_current_job_id("other-job")
+    assert qc._job_is_live(identifier) is (owner_state == "running")
 
 
 def test_ended_job_allows_a_fresh_enqueue(qc):

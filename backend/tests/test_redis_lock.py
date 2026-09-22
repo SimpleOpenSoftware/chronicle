@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -80,3 +81,39 @@ async def test_expired_lock_does_not_mask_protected_result(monkeypatch):
 
     assert lock.released is True
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lose_lease", [False, True])
+async def test_renewed_lease_preserves_ownership_or_stops_the_operation(
+    monkeypatch, lose_lease
+):
+    lock = _FakeLock()
+    client = _FakeClient(lock)
+    monkeypatch.setattr(redis_lock, "create_async_redis", lambda **_: client)
+    renewed = asyncio.Event()
+    calls = []
+
+    async def extend(seconds, *, replace_ttl):
+        calls.append((seconds, replace_ttl))
+        if lose_lease:
+            raise LockError("Ownership lost")
+        renewed.set()
+        return True
+
+    lock.extend = extend
+
+    async def operation():
+        async with redis_lock.distributed_lock("generation", timeout=0.03, renew=True):
+            if lose_lease:
+                await asyncio.Event().wait()
+                raise AssertionError("Operation continued after losing ownership")
+            await renewed.wait()
+
+    if lose_lease:
+        with pytest.raises(redis_lock.LockUnavailable, match="lease lost"):
+            await asyncio.wait_for(operation(), 1)
+    else:
+        await asyncio.wait_for(operation(), 1)
+    assert calls == [(0.03, True)]
+    assert client.closed and lock.released

@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from typing import Dict
 
 import redis.asyncio as redis
@@ -61,6 +62,19 @@ SAVE_BUFFER_STATE = os.getenv("WAKEWORD_SAVE_BUFFER_STATE", "1").lower() not in 
 )
 
 PROBE_RESULT_RETENTION_SECONDS = 300
+# A wake decision arriving several seconds behind live audio is already a user-visible
+# miss even though the task is alive. Redis stream ids are server wall-clock
+# milliseconds, so they are a reliable queue-age signal independent of device clocks.
+MAX_DELIVERY_LAG_MS = float(os.getenv("WAKEWORD_MAX_DELIVERY_LAG_MS", "2000"))
+PERFORMANCE_WINDOW = 1200
+
+
+def _percentile_ms(values: deque[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))
+    return round(ordered[index], 1)
 
 
 @dataclasses.dataclass
@@ -107,6 +121,101 @@ class WakeWordConsumer:
         self._active_probe_by_session: dict[SessionId, str] = {}
         self._monotonic = time.monotonic
         self._wall_time = time.time
+        self.frames_consumed = 0
+        self.error_count = 0
+        self.last_success_at: float | None = None
+        self.last_consumed_id: str | None = None
+        self._stream_progress: dict[SessionId, dict] = {}
+        self._lagging_sessions: set[SessionId] = set()
+        self._processing_ms: deque[float] = deque(maxlen=PERFORMANCE_WINDOW)
+
+    def _record_stream_progress(
+        self,
+        session_id: SessionId,
+        stream_name: AudioStreamName,
+        message_id: str,
+        *,
+        processed_at_ms: float | None = None,
+        processing_ms: float | None = None,
+    ) -> None:
+        """Record server-side delivery age after one frame finishes scoring."""
+        if processed_at_ms is None:
+            processed_at_ms = self._wall_time() * 1000
+        try:
+            produced_at_ms = float(message_id.split("-", 1)[0])
+        except (TypeError, ValueError, IndexError):
+            produced_at_ms = processed_at_ms
+        delivery_lag_ms = max(0.0, processed_at_ms - produced_at_ms)
+        progress = self._stream_progress.setdefault(
+            session_id,
+            {
+                "stream": str(stream_name),
+                "frames_consumed": 0,
+            },
+        )
+        progress.update(
+            {
+                "last_consumed_id": message_id,
+                "last_success_at": processed_at_ms / 1000,
+                "delivery_lag_ms": round(delivery_lag_ms, 1),
+            }
+        )
+        if processing_ms is not None:
+            processing_ms = max(0.0, processing_ms)
+            progress["processing_ms"] = round(processing_ms, 1)
+            self._processing_ms.append(processing_ms)
+        progress["frames_consumed"] += 1
+        self.frames_consumed += 1
+        self.last_success_at = processed_at_ms / 1000
+        self.last_consumed_id = message_id
+        if delivery_lag_ms > MAX_DELIVERY_LAG_MS:
+            if session_id not in self._lagging_sessions:
+                logger.warning(
+                    "Wake detector is behind real time for '%s': %.0fms delivery "
+                    "lag (threshold %.0fms, last id %s)",
+                    session_id,
+                    delivery_lag_ms,
+                    MAX_DELIVERY_LAG_MS,
+                    message_id,
+                )
+            self._lagging_sessions.add(session_id)
+        elif session_id in self._lagging_sessions:
+            self._lagging_sessions.remove(session_id)
+            logger.info("Wake detector caught up for '%s'", session_id)
+
+    def health(self) -> dict:
+        """Liveness plus real-time progress for currently processed streams."""
+        active_sessions = {
+            session_id
+            for session_id, task in self._stream_tasks.items()
+            if not task.done()
+        }
+        streams = [
+            dict(progress)
+            for session_id, progress in self._stream_progress.items()
+            if session_id in active_sessions
+        ]
+        lagging_streams = sum(
+            progress.get("delivery_lag_ms", 0) > MAX_DELIVERY_LAG_MS
+            for progress in streams
+        )
+        lags = [progress.get("delivery_lag_ms", 0.0) for progress in streams]
+        return {
+            "healthy": self.running and lagging_streams == 0,
+            "running": self.running,
+            "active_streams": len(active_sessions),
+            "frames_consumed": self.frames_consumed,
+            "error_count": self.error_count,
+            "last_success_at": self.last_success_at,
+            "last_consumed_id": self.last_consumed_id,
+            "delivery_lag_threshold_ms": MAX_DELIVERY_LAG_MS,
+            "delivery_lag_max_ms": max(lags) if lags else None,
+            "lagging_streams": lagging_streams,
+            "processing_p50_ms": _percentile_ms(self._processing_ms, 0.50),
+            "processing_p95_ms": _percentile_ms(self._processing_ms, 0.95),
+            "processing_max_ms": _percentile_ms(self._processing_ms, 1.0),
+            "streams": streams,
+        }
 
     def start_probe(
         self,
@@ -474,9 +583,22 @@ class WakeWordConsumer:
                                     channels=1,
                                     sample_width=2,
                                 )
+                                processing_started = time.perf_counter()
                                 await self._process_detector_frame(
                                     state, session_ref, chunk_ref, pcm
                                 )
+                                self._record_stream_progress(
+                                    session_id,
+                                    stream_name,
+                                    msg_id,
+                                    processing_ms=(
+                                        time.perf_counter() - processing_started
+                                    )
+                                    * 1000,
+                                )
+                        except Exception:
+                            self.error_count += 1
+                            raise
                         finally:
                             await self.redis_client.xack(
                                 str(stream_name), GROUP_NAME, msg_id

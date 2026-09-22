@@ -97,6 +97,13 @@ function App() {
                     </Suspense>
                   </PageErrorBoundary>
                 } />
+                <Route path="data-audit/recordings/:id" element={
+                  <PageErrorBoundary>
+                    <Suspense fallback={<PageSkeleton />}>
+                      <RecordingDetail dataset />
+                    </Suspense>
+                  </PageErrorBoundary>
+                } />
                 <Route path="recordings/:id" element={
                   <PageErrorBoundary>
                     <Suspense fallback={<PageSkeleton />}>

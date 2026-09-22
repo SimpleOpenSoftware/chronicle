@@ -298,7 +298,7 @@ async def test_full_claim_reconstruction_uses_canonical_chained_decode(monkeypat
     second = _claimed("chunk-2", b"second", conversation_start=10, duration=10)
     first.chunk.duration = 10
     second.chunk.duration = 10
-    ranges = [SimpleNamespace(duration_seconds=20)]
+    ranges = [SimpleNamespace(duration_seconds=20, capture_source_id="phone")]
     chained_decode = AsyncMock(return_value=b"canonical-pcm")
 
     monkeypatch.setattr(

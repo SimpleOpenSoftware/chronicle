@@ -43,6 +43,13 @@ services:
       # mounted ./data volume), which then takes precedence over this on restart.
       - WAKEWORD_COLLECT_ONLY=${WAKEWORD_COLLECT_ONLY:-}
       - WAKEWORD_SCORE_LOG=${WAKEWORD_SCORE_LOG:-0}
+      # Health must fail when detection is alive but no longer real-time. The
+      # event-loop monitor also publishes system:loopmon:wakeword-service for the
+      # backend's /api/system/event-loop aggregation.
+      - WAKEWORD_MAX_DELIVERY_LAG_MS=${WAKEWORD_MAX_DELIVERY_LAG_MS:-2000}
+      - ACTIVE_TURN_MAX_DELIVERY_LAG_MS=${ACTIVE_TURN_MAX_DELIVERY_LAG_MS:-2000}
+      - EVENT_LOOP_STALL_SECONDS=${EVENT_LOOP_STALL_SECONDS:-1.0}
+      - EVENT_LOOP_HEALTH_LAG_MS=${EVENT_LOOP_HEALTH_LAG_MS:-100}
       - WAKEWORD_DEBOUNCE_SECS=${WAKEWORD_DEBOUNCE_SECS:-3.0}
       - WAKEWORD_VAD_THRESHOLD=${WAKEWORD_VAD_THRESHOLD:-0.5}
       - WAKEWORD_STOP_SECS=${WAKEWORD_STOP_SECS:-2.0}
@@ -79,6 +86,7 @@ services:
       - ./hubert_detector.py:/app/hubert_detector.py:ro
       - ./active_turn_consumer.py:/app/active_turn_consumer.py:ro
       - ./turn_segmenter.py:/app/turn_segmenter.py:ro
+      - ./loop_monitor.py:/app/loop_monitor.py:ro
     restart: unless-stopped
     # The "hermes" word runs the HuBERT .pt model on GPU. docker compose v2 honors
     # this reservation for `docker compose up` (no swarm needed).

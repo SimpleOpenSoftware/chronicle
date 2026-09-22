@@ -25,9 +25,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
+import backend.services.privacy as privacy
 from backend.model_registry import AppModels, ResolvedLLMOperation, get_models_registry
 from backend.services.inference_artifacts import canonical_hash, persist_inference_run
 
+from ..session_write import WriteSourcePermissions
 from ..telemetry import (
     current_memory_attempt,
     current_otel_context,
@@ -37,6 +39,8 @@ from ..telemetry import (
     set_safe_span_attributes,
     text_payload,
 )
+from .edit_engine import EditError
+from .inspection_evidence import INSPECTION_TOOLS, InspectionEvidence, inspection_window
 from .memory_agent import (
     AGENT_SYSTEM_PROMPT_ID,
     DEFAULT_AGENT_SYSTEM_PROMPT,
@@ -54,12 +58,15 @@ from .memory_agent import (
     forbidden_folders,
     immutable_sections,
     required_notes,
+    write_source_permissions,
+    write_system_prompt,
 )
 from .operating_memory import (
     RECALL_OPERATING_MEMORY_SCHEMA,
     OperatingMemoryStore,
     VaultWithOperatingMemoryTools,
 )
+from .pi_native_tools import PiNativeTextTools
 from .vault_skill import write_skill
 from .vault_tools import (
     VAULT_SEARCH_TOOL_SCHEMAS,
@@ -116,13 +123,9 @@ def _apply_operating_guidance(
     )
 
 
-# Pi keeps `--no-builtin-tools`. Its native `read` looked like the obvious fix for our
-# unbounded read_note, but in the pinned 0.83.0 `resolveReadPathAsync` only resolves the
-# path against cwd — absolute paths pass straight through and there is no confinement
-# check (upstream added one in a later release). The memory agent reads untrusted
-# transcript content, so granting it would let an injected transcript read /codex-home,
-# .env, or another user's vault and write the contents into a synced note. read_note is
-# bounded instead; see vault_tools.read_note.
+# Built-ins remain disabled: cwd is not a sandbox, including in Pi 0.85.1.
+# Confined VaultTools reads and locked edits reuse public native factories against
+# virtual text buffers. Only Chronicle resolves paths and commits validated content.
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 _PROXY_ENV_NAMES = {
     "ALL_PROXY",
@@ -192,6 +195,7 @@ class _PiRuntimeConfig:
     timeout_seconds: int
     reasoning: bool
     temperature: float
+    sampling: Dict[str, Any] = field(default_factory=dict)
     response_format: Optional[Dict[str, Any]] = None
     seed: Optional[int] = None
     input_modalities: List[str] = field(default_factory=lambda: ["text"])
@@ -224,6 +228,7 @@ class _PiEventResult:
     stderr: str = ""
     returncode: Optional[int] = None
     terminated_by_chronicle: bool = False
+    failure_kind: str | None = None
 
 
 def _pi_settings(registry: AppModels) -> Dict[str, Any]:
@@ -459,6 +464,18 @@ def _resolve_pi_config(
         reasoning=bool(model_def.thinking),
         reasoning_allowed=resolved.reasoning_allowed,
         temperature=resolved.temperature,
+        sampling={
+            key: model_params[key]
+            for key in (
+                "top_p",
+                "top_k",
+                "min_p",
+                "presence_penalty",
+                "frequency_penalty",
+                "repeat_penalty",
+            )
+            if model_params.get(key) is not None
+        },
         response_format=resolved.response_format,
         seed=_optional_seed(settings.get("seed", model_params.get("seed"))),
         input_modalities=input_modalities,
@@ -471,7 +488,11 @@ def validate_pi_executor_config(
     operation: str, *, force_fallback: bool = False
 ) -> None:
     """Validate that one operation resolves to a runnable Pi configuration."""
-    _resolve_pi_config(operation, force_fallback=force_fallback)
+    config = _resolve_pi_config(operation, force_fallback=force_fallback)
+    try:
+        PiNativeTextTools.validate_runtime(config.binary)
+    except EditError as exc:
+        raise PiExecutorError(str(exc)) from exc
 
 
 def pi_executor_available() -> tuple[bool, str]:
@@ -501,6 +522,7 @@ class _VaultToolGateway:
         tool_handler: Any = None,
         terminate_on_verified: bool = False,
         max_identical_tool_calls: Optional[int] = None,
+        native_binary: Optional[str] = None,
     ):
         self.tools = tool_handler or VaultTools(
             vault_root,
@@ -511,6 +533,18 @@ class _VaultToolGateway:
             allow_new_categories=allow_new_categories,
             user_id=user_id,
         )
+        self._native_text_tools: PiNativeTextTools | None = None
+        canonical_tools = getattr(self.tools, "vault_tools", self.tools)
+        if (
+            native_binary
+            and isinstance(canonical_tools, VaultTools)
+            and any(
+                schema["function"]["name"] in {"read_note", "edit_note"}
+                for schema in schemas
+            )
+        ):
+            self._native_text_tools = PiNativeTextTools(native_binary)
+            canonical_tools.text_operations = self._native_text_tools
         self.schemas = list(schemas)
         self.allowed_names = {
             str(schema.get("function", {}).get("name", "")) for schema in self.schemas
@@ -531,10 +565,12 @@ class _VaultToolGateway:
         self.terminal_completion = False
         self.required_notes = tuple(required_notes)
         self.errors: List[str] = []
-        self.read_notes: Dict[str, str] = {}
+        self._inspection_evidence = InspectionEvidence()
+        self.read_notes = self._inspection_evidence.notes
         self._read_window_hashes: Dict[tuple[str, str], str] = {}
         self._previous_tool_signature: Optional[str] = None
         self._consecutive_identical_call_count = 0
+        self._rejected_call_counts: Dict[str, int] = {}
         self._terminal_search_evidence_ids: set[str] = set()
         self._inspection_calls_since_mutation = 0
         self._max_inspection_calls_without_mutation = (
@@ -543,6 +579,7 @@ class _VaultToolGateway:
         self.call_count = 0
         self.max_tool_calls = max_tool_calls
         self.limit_error: Optional[str] = None
+        self.limit_kind = "budget_exhausted"
         self.close_error: Optional[str] = None
         # ``_closed`` fences admission immediately. ``_state_frozen`` is delayed
         # until admitted handlers drain (or the bounded drain expires), allowing
@@ -624,6 +661,9 @@ class _VaultToolGateway:
                     return
                 terminate = gateway.should_terminate(name, result)
                 response_payload: Dict[str, Any] = {"result": result}
+                available_tools = getattr(gateway.tools, "available_tools", None)
+                if available_tools is not None:
+                    response_payload["available_tools"] = available_tools
                 if terminate:
                     response_payload["terminate"] = True
                 self._send_json(200, response_payload)
@@ -730,12 +770,16 @@ class _VaultToolGateway:
 
             with self._state_lock:
                 self._state_frozen = True
+            if self._native_text_tools is not None:
+                self._native_text_tools.close()
 
     async def aclose(self) -> None:
         """Stop and drain the HTTP server without blocking the asyncio event loop."""
         await asyncio.to_thread(self._close)
 
-    def set_limit(self, reason: str, *, admitted: bool = False) -> None:
+    def set_limit(
+        self, reason: str, *, admitted: bool = False, kind: str = "budget_exhausted"
+    ) -> None:
         notify = False
         with self._state_lock:
             if (
@@ -744,12 +788,14 @@ class _VaultToolGateway:
                 and self.limit_error is None
             ):
                 self.limit_error = reason
+                self.limit_kind = kind
                 notify = True
         if notify and self._on_limit is not None:
             self._on_limit()
 
     def dispatch(self, name: str, arguments: Dict[str, Any]) -> str:
         limit_error: Optional[str] = None
+        limit_kind = "budget_exhausted"
         with self._state_lock:
             if self._closed:
                 return "Error: Pi vault gateway is closing"
@@ -776,6 +822,7 @@ class _VaultToolGateway:
                         "Pi repeated an identical tool call consecutively more than "
                         f"{self.max_identical_tool_calls} times"
                     )
+                    limit_kind = "repeated_tool_call"
                 if (
                     limit_error is None
                     and self._max_inspection_calls_without_mutation is not None
@@ -795,7 +842,7 @@ class _VaultToolGateway:
         if limit_error is not None:
             # This call passed the admission check above, so preserve its limit
             # outcome if shutdown starts between releasing the lock and recording it.
-            self.set_limit(limit_error, admitted=True)
+            self.set_limit(limit_error, admitted=True, kind=limit_kind)
             raise _PiLimitExceeded(limit_error)
         if name in self.mutating_names:
             return self._dispatch_serialized_mutation(name, arguments)
@@ -803,6 +850,14 @@ class _VaultToolGateway:
 
     def should_terminate(self, name: str, result: str) -> bool:
         """Return true only for a successful final verification with its record present."""
+
+        completion = getattr(self.tools, "is_complete", None)
+        if completion is not None and completion(name, result):
+            with self._state_lock:
+                if self._state_frozen:
+                    return False
+                self.terminal_completion = True
+            return True
 
         if (
             not self.terminate_on_verified
@@ -831,12 +886,37 @@ class _VaultToolGateway:
     ) -> str:
         """Dispatch one tool and preserve its result metadata when still relevant."""
         try:
+            privacy_guard = getattr(self, "privacy_guard", None)
+            if privacy_guard:
+                privacy_guard()
             result = self.tools.dispatch(name, arguments)
+            if privacy_guard:
+                privacy_guard()
+            inspection_path = str(arguments.get("path", "?"))
+            if name in INSPECTION_TOOLS:
+                resolve_path = getattr(self.tools, "inspection_path", None)
+                if resolve_path is not None:
+                    inspection_path = resolve_path(inspection_path)
         except VaultToolError as exc:
             error = f"{name}: {exc}"
+            repeated = False
             with self._state_lock:
                 if not self._state_frozen:
                     self.errors.append(error)
+                    signature = canonical_hash([name, arguments, str(exc)])
+                    count = self._rejected_call_counts.get(signature, 0) + 1
+                    self._rejected_call_counts[signature] = count
+                    repeated = (
+                        self.max_identical_tool_calls is not None
+                        and count > self.max_identical_tool_calls
+                    )
+            if repeated:
+                reason = (
+                    "Pi repeated an unchanged rejected tool call more than "
+                    f"{self.max_identical_tool_calls} times, including interleaved calls"
+                )
+                self.set_limit(reason, admitted=True, kind="repeated_tool_call")
+                raise _PiLimitExceeded(reason) from exc
             return f"Error: {exc}"
         except Exception as exc:  # noqa: BLE001 - surface unexpected tool failures
             error = f"{name}: {type(exc).__name__}: {exc}"
@@ -854,6 +934,7 @@ class _VaultToolGateway:
                 if not self._state_frozen:
                     self._terminal_search_evidence_ids.clear()
                     self._inspection_calls_since_mutation = 0
+                    self._rejected_call_counts.clear()
 
         terminal_match = _TERMINAL_SEARCH_EVIDENCE_RE.match(result)
         if terminal_match:
@@ -873,23 +954,14 @@ class _VaultToolGateway:
                 self.set_limit(limit_error, admitted=True)
                 raise _PiLimitExceeded(limit_error)
 
-        if name == "read_note":
-            path = str(arguments.get("path", "?"))
-            window_key = (
-                path,
-                canonical_hash(
-                    {
-                        "offset": arguments.get("offset"),
-                        "limit": arguments.get("limit"),
-                        "char_offset": arguments.get("char_offset"),
-                    }
-                ),
-            )
+        if name in INSPECTION_TOOLS:
+            path = inspection_path
+            window_key = (path, inspection_window(name, arguments))
             result_hash = canonical_hash(result)[:12]
             repeated = False
             with self._state_lock:
                 if not self._state_frozen:
-                    self.read_notes[path] = result
+                    self._inspection_evidence.record(name, arguments, result, path=path)
                     repeated = (
                         not bool(arguments.get("refresh", False))
                         and self._read_window_hashes.get(window_key) == result_hash
@@ -897,7 +969,7 @@ class _VaultToolGateway:
                     self._read_window_hashes[window_key] = result_hash
             if repeated:
                 return (
-                    f"[unchanged read_note window {result_hash}; content already "
+                    f"[unchanged {name} window {result_hash}; content already "
                     "returned earlier in this Pi run. Pass refresh=true only if you "
                     "need the same bytes repeated.]"
                 )
@@ -928,11 +1000,15 @@ def _extension_source(
     gateway_url: str,
     token: str,
     temperature: float = 0.2,
+    sampling: Optional[Dict[str, Any]] = None,
     response_format: Optional[Dict[str, Any]] = None,
     disable_thinking: bool = False,
     seed: Optional[int] = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
     max_tool_calls: int = MAX_PI_WRITE_TOOL_CALLS,
+    recover_repeated_tool_errors: bool = False,
+    result_repair_tools: Optional[Dict[str, str]] = None,
+    available_tools: Optional[List[str]] = None,
 ) -> str:
     """Generate a dependency-free ESM extension exposing only canonical schemas."""
     tool_defs = [schema["function"] for schema in schemas]
@@ -942,20 +1018,58 @@ const limitUrl = {json.dumps(gateway_url.removesuffix("/tool") + "/limit")};
 const bearerToken = {json.dumps(token)};
 const toolDefinitions = {json.dumps(tool_defs, separators=(",", ":"))};
 const temperature = {json.dumps(temperature)};
+const sampling = {json.dumps(sampling or {})};
 const responseFormat = {json.dumps(response_format, separators=(",", ":"))};
 const disableThinking = {json.dumps(disable_thinking)};
 const seed = {json.dumps(seed)};
 const maxToolRounds = {max_tool_rounds};
 const maxToolCalls = {max_tool_calls};
+const recoverRepeatedToolErrors = {json.dumps(recover_repeated_tool_errors)};
+const resultRepairTools = {json.dumps(result_repair_tools or {})};
+const initialAvailableTools = {json.dumps(available_tools)};
 
 export default function (pi) {{
   let toolRounds = 0;
   let toolCalls = 0;
   let roundHasTool = false;
   let limitReported = false;
+  let repeatRecoveryUsed = false;
+  let repeatRecoveryPending = false;
+  const rejectedReads = new Map();
+  const rejectedSubmissions = new Set();
+  let availableTools = initialAvailableTools;
+  function updateActiveTools() {{
+    if (rejectedSubmissions.size || availableTools !== null) {{
+      pi.setActiveTools(toolDefinitions.filter((tool) => !rejectedSubmissions.has(tool.name) && (availableTools === null || availableTools.includes(tool.name))).map((tool) => tool.name));
+    }}
+  }}
+
+  pi.on("session_start", (_event, context) => {{
+    repeatRecoveryUsed = context.sessionManager.getBranch().some(
+      (entry) => entry.type === "custom" && entry.customType === "chronicle-repeat-recovery"
+    );
+    for (const entry of context.sessionManager.getBranch()) {{
+      if (entry.type === "custom" && entry.customType === "chronicle-result-repair") {{
+        rejectedSubmissions.add(entry.data.tool);
+      }}
+    }}
+    updateActiveTools();
+  }});
+
+  pi.on("turn_end", (_event, context) => {{
+    if (!repeatRecoveryPending || repeatRecoveryUsed) return;
+    repeatRecoveryPending = false;
+    repeatRecoveryUsed = true;
+    pi.appendEntry("chronicle-repeat-recovery", {{ reason: "repeated rejected tool call" }});
+    pi.sendUserMessage(
+      "The last repeated tool requests were rejected and added no new evidence. Use the retained results, inspect a different passage if necessary, and complete the remaining task within the existing budget. Full sources remain available.",
+      {{ deliverAs: "steer" }},
+    );
+  }});
 
   pi.on("before_provider_request", (event) => ({{
     ...event.payload,
+    ...sampling,
     temperature,
     ...(responseFormat === null ? {{}} : {{ response_format: responseFormat }}),
     ...(seed === null ? {{}} : {{ seed }}),
@@ -1030,6 +1144,26 @@ export default function (pi) {{
         }}
         if (typeof payload.result !== "string") {{
           throw new Error("Chronicle vault gateway response omitted string result");
+        }}
+        if (Array.isArray(payload.available_tools)) {{
+          availableTools = payload.available_tools;
+          updateActiveTools();
+        }}
+        if (payload.result.trimStart().startsWith("Error:")) {{
+          if (resultRepairTools[definition.name] && !rejectedSubmissions.has(definition.name)) {{
+            // A saved rejected candidate is now edited in place. Retiring full
+            // submission prevents generation of the same large payload again.
+            rejectedSubmissions.add(definition.name);
+            pi.appendEntry("chronicle-result-repair", {{ tool: definition.name, repairTool: resultRepairTools[definition.name] }});
+            updateActiveTools();
+          }}
+          if (recoverRepeatedToolErrors && !repeatRecoveryUsed) {{
+            const signature = JSON.stringify([definition.name, params]);
+            const count = (rejectedReads.get(signature) ?? 0) + 1;
+            rejectedReads.set(signature, count);
+            if (count >= 2) repeatRecoveryPending = true;
+          }}
+          throw new Error(payload.result);
         }}
         return {{
           content: [{{ type: "text", text: payload.result }}],
@@ -1451,6 +1585,39 @@ async def _close_gateway(gateway: _VaultToolGateway) -> None:
         raise error
 
 
+async def _stream_pi_process(process, payload, on_event):
+    """Drain both pipes while forwarding complete JSON events, never cutting a response."""
+
+    async def stdout():
+        chunks, pending = [], b""
+        while chunk := await process.stdout.read(65536):
+            chunks.append(chunk)
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue  # The authoritative full-stream parser reports malformed output.
+                await on_event(event)
+        if pending:
+            try:
+                event = json.loads(pending)
+            except (ValueError, UnicodeDecodeError):
+                pass
+            else:
+                await on_event(event)
+        return b"".join(chunks)
+
+    if payload:
+        process.stdin.write(payload)
+        await process.stdin.drain()
+    process.stdin.close()
+    output, errors = await asyncio.gather(stdout(), process.stderr.read())
+    await process.wait()
+    return output, errors
+
+
 async def _invoke_pi(
     vault_root: Path,
     *,
@@ -1471,8 +1638,16 @@ async def _invoke_pi(
     terminate_on_verified: bool = False,
     max_identical_tool_calls: Optional[int] = None,
     images: Optional[List[Tuple[str, bytes]]] = None,
+    session_file: Optional[Path] = None,
+    on_event: Any = None,
+    yield_signal: Optional[asyncio.Event] = None,
+    recover_repeated_tool_errors: bool = False,
 ) -> tuple[_PiEventResult, _VaultToolGateway]:
     """Run Pi and preserve gateway audit state for every post-start failure."""
+
+    privacy_owner = privacy.processing_owner(user_id or Path(vault_root).name)
+    privacy_snapshot = await privacy.load_snapshot(privacy_owner)
+    privacy_paths = await privacy.quarantined_vault_paths(privacy_owner)
     started_ns = time.time_ns()
     max_tool_rounds = _positive_run_limit(max_tool_rounds, name="Pi max_tool_rounds")
     max_tool_calls = _positive_run_limit(max_tool_calls, name="Pi max_tool_calls")
@@ -1491,7 +1666,27 @@ async def _invoke_pi(
         user_id=user_id,
         tool_handler=tool_handler,
         terminate_on_verified=terminate_on_verified,
+        native_binary=config.binary,
     )
+    canonical_tools = getattr(gateway.tools, "vault_tools", gateway.tools)
+    if hasattr(canonical_tools, "privacy_excluded_paths"):
+        canonical_tools.privacy_excluded_paths = privacy_paths
+
+    await privacy.guard_payload(
+        privacy_owner,
+        {
+            "episode_keys": list(
+                getattr(canonical_tools, "allowed_source_episode_keys", ())
+            )
+        },
+    )
+
+    def check_privacy():
+        asyncio.run_coroutine_threadsafe(
+            privacy.assert_current(privacy_owner, privacy_snapshot), loop
+        ).result(timeout=10)
+
+    gateway.privacy_guard = check_privacy
     events: Optional[_PiEventResult] = None
     redaction_values = [
         *_pi_redaction_values(config),
@@ -1510,11 +1705,17 @@ async def _invoke_pi(
                     gateway_url=gateway.url,
                     token=gateway.token,
                     temperature=config.temperature,
+                    sampling=config.sampling,
                     response_format=config.response_format,
                     disable_thinking=not config.reasoning_allowed,
                     seed=config.seed,
                     max_tool_rounds=max_tool_rounds,
                     max_tool_calls=max_tool_calls,
+                    recover_repeated_tool_errors=recover_repeated_tool_errors,
+                    result_repair_tools=getattr(
+                        tool_handler, "result_repair_tools", None
+                    ),
+                    available_tools=getattr(tool_handler, "available_tools", None),
                 ),
                 encoding="utf-8",
             )
@@ -1546,7 +1747,6 @@ async def _invoke_pi(
                 config.thinking,
                 "--system-prompt",
                 str(system_prompt_path),
-                "--no-session",
                 "--offline",
                 "--no-context-files",
                 "--no-extensions",
@@ -1554,6 +1754,9 @@ async def _invoke_pi(
                 "--no-themes",
                 "--no-builtin-tools",
             ]
+            command.extend(
+                ["--session", str(session_file)] if session_file else ["--no-session"]
+            )
             if schemas and load_vault_skill:
                 # The vault's shape travels as a skill rather than more system prompt,
                 # so it is generated from the same templates the vault is scaffolded
@@ -1606,13 +1809,26 @@ async def _invoke_pi(
             except OSError as exc:
                 raise PiExecutorError(f"Pi failed to start: {exc}") from exc
 
-            communication_task = asyncio.create_task(process.communicate(stdin_payload))
+            communication_task = asyncio.create_task(
+                _stream_pi_process(process, stdin_payload, on_event)
+                if on_event is not None
+                else process.communicate(stdin_payload)
+            )
             limit_task = asyncio.create_task(limit_signal.wait())
+            yield_task = (
+                asyncio.create_task(yield_signal.wait())
+                if yield_signal is not None
+                else None
+            )
+            wait_tasks = {communication_task, limit_task}
+            if yield_task is not None:
+                wait_tasks.add(yield_task)
             failures: List[str] = []
             terminated_by_chronicle = False
+            yielded_at_checkpoint = False
             try:
                 done, _pending = await asyncio.wait(
-                    {communication_task, limit_task},
+                    wait_tasks,
                     timeout=config.timeout_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -1627,6 +1843,15 @@ async def _invoke_pi(
                 elif limit_task in done and gateway.limit_error:
                     terminated_by_chronicle = True
                     failures.append(gateway.limit_error)
+                    stdout_bytes, stderr_bytes, cleanup_error = await _kill_and_wait(
+                        process, communication_task
+                    )
+                    if cleanup_error:
+                        failures.append(cleanup_error)
+                elif yield_task in done and communication_task not in done:
+                    terminated_by_chronicle = True
+                    yielded_at_checkpoint = True
+                    failures.append("Pi yielded at a complete native checkpoint")
                     stdout_bytes, stderr_bytes, cleanup_error = await _kill_and_wait(
                         process, communication_task
                     )
@@ -1650,7 +1875,13 @@ async def _invoke_pi(
                 raise
             finally:
                 limit_task.cancel()
-                await asyncio.gather(limit_task, return_exceptions=True)
+                if yield_task is not None:
+                    yield_task.cancel()
+                await asyncio.gather(
+                    limit_task,
+                    *([yield_task] if yield_task is not None else []),
+                    return_exceptions=True,
+                )
 
             try:
                 stdout = stdout_bytes.decode("utf-8")
@@ -1678,11 +1909,24 @@ async def _invoke_pi(
             if gateway.terminal_completion:
                 events.terminated_after_tool = True
                 if not events.summary:
-                    events.summary = "Vault changes verified."
+                    events.summary = "Task completed."
             events.stdout = stdout
             events.stderr = stderr
             events.returncode = process.returncode
             events.terminated_by_chronicle = terminated_by_chronicle
+            events.failure_kind = (
+                gateway.limit_kind
+                if gateway.limit_error
+                else (
+                    "time_slice"
+                    if yielded_at_checkpoint or (terminated_by_chronicle and not done)
+                    else (
+                        "interrupted"
+                        if terminated_by_chronicle
+                        else "provider_failure" if process.returncode != 0 else None
+                    )
+                )
+            )
             if gateway.limit_error and gateway.limit_error not in failures:
                 failures.append(gateway.limit_error)
             events.fatal_errors.extend(failures)
@@ -1708,6 +1952,7 @@ async def _invoke_pi(
         events.truncated = True
     elif events.truncated:
         events.errors.append("Pi response was truncated")
+    await privacy.assert_current(privacy_owner, privacy_snapshot)
     visible_output = (
         {"completion": text_payload(events.summary)}
         if events.summary
@@ -1808,16 +2053,30 @@ class PiMemoryAgent:
         vault_summary: str = "",
         guidance: str = "",
         record: str = "conversation",
+        source_permissions: WriteSourcePermissions | None = None,
         images: Optional[List[Tuple[str, bytes]]] = None,
     ) -> MemoryAgentResult:
+
+        privacy_owner = privacy.processing_owner(self.root.name)
+        await privacy.guard_payload(
+            privacy_owner,
+            {
+                "conversation_id": conversation_id,
+                "episode_keys": (
+                    list(source_permissions.episode_keys) if source_permissions else []
+                ),
+            },
+        )
+        private_paths = await privacy.quarantined_vault_paths(privacy_owner)
+        if private_paths:
+            vault_summary = ""
         config = _resolve_pi_config(self.operation, force_fallback=self.force_fallback)
         date = date or datetime.now(timezone.utc).isoformat()
-        system_prompt = await _get_prompt(
-            AGENT_SYSTEM_PROMPT_ID, DEFAULT_AGENT_SYSTEM_PROMPT, vault_summary
-        )
+        system_prompt = await _get_prompt(*write_system_prompt(record), vault_summary)
         user_id = self.root.name
         operating_store = OperatingMemoryStore(user_id)
-        system_prompt = _apply_operating_guidance(system_prompt, operating_store)
+        if not private_paths:
+            system_prompt = _apply_operating_guidance(system_prompt, operating_store)
         task = build_write_task(
             transcript,
             conversation_id,
@@ -1862,16 +2121,18 @@ class PiMemoryAgent:
                 allow_new_categories=allow_new_categories(record),
                 user_id=user_id,
             )
-            episode_keys = set(
-                re.findall(r"(?m)^episode_key:\s*([^\s]+)\s*$", transcript)
+            permissions = write_source_permissions(
+                record, transcript, source_permissions
             )
-            vault_tools.allowed_source_episode_keys = episode_keys
-            vault_tools.require_source_episode_keys = record == "day" and bool(
-                episode_keys
-            )
+            vault_tools.allowed_source_episode_keys = set(permissions.episode_keys)
+            vault_tools.source_claims = permissions.claim_sources
+            vault_tools.require_source_episode_keys = record in {
+                "day",
+                "session",
+            } and bool(permissions.episode_keys)
             schemas = list(VAULT_TOOL_SCHEMAS)
             tool_handler: Any = vault_tools
-            if operating_store.has_active_skills():
+            if not private_paths and operating_store.has_active_skills():
                 schemas.append(RECALL_OPERATING_MEMORY_SCHEMA)
                 tool_handler = VaultWithOperatingMemoryTools(
                     vault_tools, operating_store
@@ -1905,16 +2166,22 @@ class PiMemoryAgent:
                 usage=events.usage,
                 truncated=events.truncated,
                 verified=gateway.tools.verified,
+                source_evidence_keys_by_path={
+                    path: sorted(keys)
+                    for path, keys in vault_tools.source_evidence_keys_by_path.items()
+                },
                 source_episode_keys_by_path={
                     path: sorted(keys)
                     for path, keys in vault_tools.source_episode_keys_by_path.items()
                 },
             )
             try:
-                artifact_stdout, stdout_compaction = _compact_artifact_stdout(
-                    events.stdout
+                artifact_stdout, stdout_compaction = (
+                    (events.stdout, {})
+                    if record == "session"
+                    else _compact_artifact_stdout(events.stdout)
                 )
-                await asyncio.to_thread(
+                request_hash, artifact_hash = await asyncio.to_thread(
                     persist_inference_run,
                     operation="pi_memory",
                     request={
@@ -1923,12 +2190,17 @@ class PiMemoryAgent:
                         "conversation_id": conversation_id,
                         "user_id": user_id,
                         "record": record,
+                        "source_permissions": {
+                            "episode_keys": list(permissions.episode_keys),
+                            "claim_sources": permissions.claim_sources,
+                        },
                         "vault_before_sha256": canonical_hash(gateway.tools.baseline()),
                         "operation": self.operation,
                         "model": config.model,
                         "provider": config.provider,
                         "thinking": config.thinking,
                         "temperature": config.temperature,
+                        "sampling": config.sampling,
                         "seed": config.seed,
                         "context_window": config.context_window,
                         "max_tokens": config.max_tokens,
@@ -1961,10 +2233,19 @@ class PiMemoryAgent:
                     },
                     reusable=False,
                 )
+                result.inference_artifacts.append(
+                    {
+                        "operation": "pi_memory",
+                        "request_hash": request_hash,
+                        "artifact_hash": artifact_hash,
+                    }
+                )
             except Exception:
                 # The inference has already run and may have mutated the vault. An
                 # unavailable audit volume must not trigger a second attempt.
                 logger.exception("Failed to persist Pi inference artifact")
+                if record == "session":
+                    raise
             set_safe_span_attributes(
                 span,
                 {
@@ -2009,18 +2290,26 @@ async def _search_vault_with_pi_impl(
     max_rounds: int = MAX_SEARCH_ROUNDS,
     vault_summary: str = "",
     user_id: str = "",
+    notes_only: bool = False,
 ) -> VaultSearchResult:
     """Run Chronicle's read-only retrieval agent through Pi."""
     root = Path(vault_root)
     root.mkdir(parents=True, exist_ok=True)
     max_rounds = _positive_run_limit(max_rounds, name="Pi search max_rounds")
     config = _resolve_pi_config(operation)
+
+    resolved_user_id = user_id or root.name
+    private_paths = await privacy.quarantined_vault_paths(
+        privacy.processing_owner(resolved_user_id)
+    )
+    if private_paths:
+        vault_summary = ""
     system_prompt = await _get_prompt(
         "memory.search_system", SEARCH_SYSTEM_PROMPT, vault_summary
     )
-    resolved_user_id = user_id or root.name
     operating_store = OperatingMemoryStore(resolved_user_id)
-    system_prompt = _apply_operating_guidance(system_prompt, operating_store)
+    if not private_paths:
+        system_prompt = _apply_operating_guidance(system_prompt, operating_store)
     prompt = (
         f"{query}\n\n"
         f"Use at most {max_rounds} tool rounds. Return the answer when you have enough evidence."
@@ -2029,7 +2318,16 @@ async def _search_vault_with_pi_impl(
         root,
         prompt=prompt,
         system_prompt=system_prompt,
-        schemas=VAULT_SEARCH_TOOL_SCHEMAS,
+        schemas=(
+            [
+                schema
+                for schema in VAULT_SEARCH_TOOL_SCHEMAS
+                if schema["function"]["name"]
+                in {"grep", "glob", "read_note", "read_slice"}
+            ]
+            if notes_only
+            else VAULT_SEARCH_TOOL_SCHEMAS
+        ),
         config=config,
         max_tool_rounds=max_rounds,
         max_tool_calls=max_rounds * _PI_TOOL_CALLS_PER_SEARCH_ROUND,
@@ -2133,6 +2431,7 @@ async def _search_vault_with_pi_impl(
                 "provider": config.provider,
                 "thinking": config.thinking,
                 "temperature": config.temperature,
+                "sampling": config.sampling,
                 "context_window": config.context_window,
                 "max_tokens": config.max_tokens,
                 "max_tool_rounds": max_rounds,
@@ -2175,6 +2474,7 @@ async def search_vault_with_pi(
     max_rounds: int = MAX_SEARCH_ROUNDS,
     vault_summary: str = "",
     user_id: str = "",
+    notes_only: bool = False,
 ) -> VaultSearchResult:
     """Trace one complete Pi retrieval, including optional cap synthesis."""
 
@@ -2204,6 +2504,8 @@ async def search_vault_with_pi(
             operation=operation,
             max_rounds=max_rounds,
             vault_summary=vault_summary,
+            user_id=user_id,
+            **({"notes_only": True} if notes_only else {}),
         )
         set_safe_span_attributes(
             span,

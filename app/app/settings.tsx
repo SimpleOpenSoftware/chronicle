@@ -4,6 +4,7 @@ import AuthSection from '@/components/AuthSection';
 import BackendStatus from '@/components/BackendStatus';
 import NetworkOverview from '@/components/NetworkOverview';
 import NotificationsSection from '@/components/NotificationsSection';
+import PhoneAudioDiagnosticsSection from '@/components/PhoneAudioDiagnosticsSection';
 import SystemAdminControls from '@/components/SystemAdminControls';
 import { Screen, SectionLabel } from '@/components/ui';
 import { useSharedAppSettings } from '@/contexts/AppSettingsContext';
@@ -28,6 +29,12 @@ export default function SettingsScreen() {
       <NotificationsSection
         backendUrl={settings.webSocketUrl}
         authenticated={settings.isAuthenticated}
+      />
+
+      <SectionLabel>Diagnostics</SectionLabel>
+      <PhoneAudioDiagnosticsSection
+        backendUrl={settings.webSocketUrl}
+        jwtToken={settings.jwtToken}
       />
 
       <SectionLabel>Administration</SectionLabel>

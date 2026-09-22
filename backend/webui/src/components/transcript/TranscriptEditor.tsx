@@ -624,7 +624,7 @@ export default function TranscriptEditor({
     <div className="space-y-3">
       {showAudio && (
         <div className="flex flex-wrap items-center justify-between gap-2 sm:gap-3">
-          <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-700 p-1" aria-label="Annotation mode">
+          <div className="inline-flex max-w-full rounded-lg bg-gray-100 dark:bg-gray-700 p-1" aria-label="Annotation mode">
             <button
               onClick={() => setAnnotationMode('transcript')}
               className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium sm:px-3 ${annotationMode === 'transcript' ? 'bg-white dark:bg-gray-800 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-300'}`}
@@ -637,9 +637,9 @@ export default function TranscriptEditor({
                 setEditingSegment(null)
                 setInsertOpen(null)
               }}
-              className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium sm:px-3 ${annotationMode === 'speakers' ? 'bg-white dark:bg-gray-800 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-300'}`}
+              className={`inline-flex min-w-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-xs font-medium sm:px-3 ${annotationMode === 'speakers' ? 'bg-white dark:bg-gray-800 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-300'}`}
             >
-              <Users className="h-3.5 w-3.5" /> Edit speakers & timing
+              <Users className="h-3.5 w-3.5 shrink-0" /> Edit speakers & timing
             </button>
           </div>
           {annotationMode === 'speakers' && (

@@ -17,6 +17,8 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['semantic-timeline', day, timezone] }),
         queryClient.invalidateQueries({ queryKey: ['timeline-memory-selections', day, timezone] }),
+        queryClient.invalidateQueries({ queryKey: ['timeline-sessions', day, timezone] }),
+        queryClient.invalidateQueries({ queryKey: ['recording-context'] }),
       ])
     },
   })
@@ -27,6 +29,8 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['semantic-timeline', day, timezone] }),
         queryClient.invalidateQueries({ queryKey: ['timeline-memory-selections', day, timezone] }),
+        queryClient.invalidateQueries({ queryKey: ['timeline-sessions', day, timezone] }),
+        queryClient.invalidateQueries({ queryKey: ['recording-context'] }),
       ])
     },
   })
@@ -42,7 +46,7 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
         <div>
           <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Potential memory changes</h4>
           <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-            Only accepted vault notes informed this proposal. Chronicle checks for relevant changes before applying it.
+            Sources and accepted notes are checked again before applying changes.
           </p>
         </div>
         <Button
@@ -58,7 +62,7 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
         const checked = selected.has(change.change_id)
         const diff = computeWordDiff(change.before_text ?? '', change.after_text ?? '')
         return (
-          <article key={change.change_id} className={`rounded-lg border ${checked ? 'border-blue-300 bg-blue-50/50 dark:border-blue-800 dark:bg-blue-950/20' : 'border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-900'}`}>
+          <article key={change.change_id} className={`rounded-lg border ${checked ? 'border-[var(--tape-focus)] bg-[var(--tape-selected)]' : 'border-[var(--tape-line)] bg-[var(--tape-paper-raised)]'}`}>
             <label className="flex cursor-pointer items-start gap-3 p-3">
               <input
                 type="checkbox"
@@ -84,7 +88,7 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
                         key={episodeKey}
                         to={`/timeline/key/${encodeURIComponent(episodeKey)}`}
                         onClick={event => event.stopPropagation()}
-                        className="rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-700 hover:underline dark:bg-blue-950 dark:text-blue-300"
+                        className="rounded-full bg-[var(--tape-chip)] px-2 py-0.5 text-[11px] font-medium text-[var(--tape-focus)] hover:underline"
                         title={`Open source episode ${episodeKey}`}
                       >
                         Source episode{change.source_episode_keys.length > 1 ? ` ${index + 1}` : ''}
@@ -94,6 +98,8 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
                 )}
               </span>
             </label>
+            {change.before_text == null && change.after_text && <p className="whitespace-pre-wrap break-words px-3 pb-3 text-sm leading-relaxed text-gray-700 dark:text-gray-200">{change.after_text.replace(/^---\n[\s\S]*?\n---\n/, '').split(/\n## (?:Conversations|Mentions)/)[0].replace(/^## .+\n/, '').trim().slice(0, 1000)}</p>}
+            {!!change.source_evidence_keys?.length && <details className="px-3 pb-2"><summary className="cursor-pointer text-xs text-[var(--tape-focus)]">Supporting source quotations</summary><div className="mt-2 space-y-2">{proposal.account?.claims.filter(claim => claim.source_keys.some(key => change.source_evidence_keys?.includes(key))).map((claim, index) => <div key={index} className="rounded bg-[var(--tape-chip)] p-2 text-xs text-gray-900 dark:text-gray-100"><p>{claim.text}</p>{claim.citations.map((citation, i) => <blockquote key={i} className="mt-1 border-l-2 border-[var(--tape-line)] pl-2 text-gray-600 dark:text-gray-300">{citation.quote}</blockquote>)}</div>)}</div></details>}
             <details className="border-t border-gray-100 px-3 py-2 dark:border-gray-800">
               <summary className="cursor-pointer text-xs font-medium text-gray-600 dark:text-gray-300">Inspect highlighted changes</summary>
               <div className="mt-2 grid gap-2 lg:grid-cols-2">
@@ -134,6 +140,7 @@ export function CandidateChanges({ proposal, day, timezone }: { proposal: Memory
       <div className="flex flex-wrap items-center gap-2 pt-1">
         <Button
           size="sm"
+          variant="primary"
           disabled={!selected.size || resolve.isPending}
           onClick={() => resolve.mutate([...selected])}
           icon={resolve.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
@@ -177,25 +184,24 @@ export default function ReviewDesk({ day, timezone }: {
     mutationFn: (id: string) => timelineApi.correctMemoryProposal(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['timeline-memory-selections', day, timezone] }),
   })
-  return <Card className="space-y-4">
+  return <Card className="space-y-4 text-gray-900 dark:text-gray-100">
     <div>
-      <h2 className="text-sm font-semibold">Memory proposals · {day}</h2>
-      <p className="mt-1 text-xs text-gray-500">Choose any date. Unselected episodes stay available for later.</p>
+      <h2 className="text-sm font-semibold">Review date · {day}</h2>
       <Link className="mt-2 inline-block text-sm text-[var(--tape-focus)] hover:underline" to={`/timeline?date=${day}`}>Select episodes in Timeline</Link>
     </div>
     {selections.isLoading && <p role="status">Loading proposals…</p>}
     {selections.isError && <p role="alert">Could not load memory proposals. {(selections.error as Error).message}</p>}
     {selections.data?.proposals.length === 0 && <p className="text-sm text-gray-500">No memory selections for this day yet.</p>}
     {selections.data?.proposals.map(proposal => <section key={proposal.proposal_id} className="border-t border-[var(--tape-line)] pt-3">
-      <h3 className="text-sm font-semibold">{proposal.selected_episodes.length} selected episode{proposal.selected_episodes.length === 1 ? '' : 's'} · {proposal.local_date}</h3>
+      <h3 className="text-sm font-semibold">{proposal.selected_episodes.length} source episode{proposal.selected_episodes.length === 1 ? '' : 's'} · Proposal day {proposal.local_date}</h3>
       <p className="mt-1 text-xs text-gray-500" aria-live="polite">{proposal.state === 'checking' ? 'Checking changes in the accepted vault…' : proposal.state.replace(/_/g, ' ')} · revision {proposal.generation}</p>
       {proposal.freshness && <p className="mt-1 text-xs">{proposal.freshness.reason}</p>}
-      {proposal.replacement_proposal_id && <p className="mt-1 text-xs">A replacement proposal follows. Review its new diff before accepting.</p>}
+      {proposal.replacement_proposal_id && <p className="mt-1 text-xs">Replaced by a newer proposal below.</p>}
       {proposal.error && <p role="alert" className="mt-1 text-xs text-red-700 dark:text-red-300">{proposal.error}</p>}
       <CandidateChanges proposal={proposal} day={day} timezone={timezone} />
       {proposal.state === 'correction_required' && <Button size="sm" onClick={() => correct.mutate(proposal.proposal_id)} disabled={correct.isPending}>Review correction from current evidence</Button>}
       {proposal.state === 'failed' && <Button size="sm" onClick={() => regenerate.mutate(proposal.proposal_id)} disabled={regenerate.isPending}>Retry generation</Button>}
-      {['applied', 'rejected', 'no_changes'].includes(proposal.state) && <p className="mt-2 text-xs">{proposal.accepted_change_ids.length} changes accepted · {proposal.rejected_change_ids.length} rejected. Other episodes remain undecided.</p>}
+      {['applied', 'rejected', 'no_changes'].includes(proposal.state) && <p className="mt-2 text-xs">{proposal.accepted_change_ids.length} changes accepted · {proposal.rejected_change_ids.length} rejected. Unselected episodes remain available.</p>}
       {proposal.changes?.length && proposal.state !== 'pending' ? <details className="mt-2 text-xs"><summary>Previous diff and decisions</summary>{proposal.changes.map(c => <div key={c.change_id} className="mt-2"><strong>{c.note_path}</strong><pre className="max-h-48 overflow-auto whitespace-pre-wrap">{c.after_text ?? '(deleted)'}</pre></div>)}</details> : null}
     </section>)}
     {correct.isError && <p role="alert">Could not prepare correction. {(correct.error as Error).message}</p>}

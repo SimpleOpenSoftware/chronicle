@@ -1,3 +1,4 @@
+import AskAboutSource from "../components/AskAboutSource"
 import { useState, useRef, useMemo, useEffect } from 'react'
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -15,6 +16,7 @@ import {
 import ConversationVersionHeader from '../components/ConversationVersionHeader'
 import MemoryAuditCard from '../components/MemoryAuditCard'
 import ConversationContextLens from '../components/ConversationContextLens'
+import RecordingMemoryContext from '../components/RecordingMemoryContext'
 import BackgroundSuppressionCard from '../components/BackgroundSuppressionCard'
 import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
 import { AUDIO_FORMAT } from '../utils/audioFormat'
@@ -23,7 +25,7 @@ import TranscriptEditor from '../components/transcript/TranscriptEditor'
 import { useWaveformZoomDisabled } from '../components/transcript/useWaveformZoom'
 import SplitConversationModal from '../components/dataAudit/SplitConversationModal'
 import { getStorageKey } from '../utils/storage'
-import { Button } from '../components/ui'
+import { Button, IconButton } from '../components/ui'
 
 interface Segment {
   text: string
@@ -53,10 +55,12 @@ interface Conversation {
   starred?: boolean
   starred_at?: string
   speaker_recognition?: any
+  processing_status?: string
+  failure_stage?: string
   diarization_source?: 'provider' | 'pyannote'
 }
 
-export default function RecordingDetail() {
+export default function RecordingDetail({ dataset = false }: { dataset?: boolean }) {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const location = useLocation()
@@ -64,9 +68,9 @@ export default function RecordingDetail() {
 
   // Pages that link here pass their own path in location.state.from so "Back"
   // returns to where the user actually came from (e.g. Data Audit).
-  const backTo: string = location.state?.from || '/recordings'
+  const backTo: string = location.state?.from || (dataset ? '/data-audit' : '/recordings')
   const backLabel =
-    backTo === '/data-audit'
+    backTo.startsWith('/data-audit')
       ? 'Back to Data Audit'
       : backTo.startsWith('/timeline')
         ? 'Back to Timeline'
@@ -87,7 +91,7 @@ export default function RecordingDetail() {
     isLoading: loading,
     error: queryError,
     refetch,
-  } = useConversationDetail(id ?? null)
+  } = useConversationDetail(id ?? null, dataset)
 
   const conversation = conversationData as Conversation | undefined
   const isLive = conversation?.active_transcript_version === 'live-v0'
@@ -188,10 +192,10 @@ export default function RecordingDetail() {
       const isoString = timestamp.endsWith('Z') || timestamp.includes('+') || (timestamp.includes('T') && timestamp.split('T')[1].includes('-'))
         ? timestamp
         : timestamp + 'Z'
-      return new Date(isoString).toLocaleString()
+      return new Date(isoString).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
     }
     if (timestamp === 0) return 'Unknown date'
-    return new Date(timestamp * 1000).toLocaleString()
+    return new Date(timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
   }
 
   const formatDuration = (seconds: number) => {
@@ -453,13 +457,15 @@ export default function RecordingDetail() {
               <BarChart3 className="h-5 w-5 text-gray-400 dark:text-gray-500 hover:text-blue-500 dark:hover:text-blue-400" />
             </a>
           )}
-          <button
+          {!dataset && (
+            <button
             onClick={handleToggleStar}
             className="p-2 rounded-full hover:bg-yellow-100 dark:hover:bg-yellow-900/30 transition-colors"
             title={conversation.starred ? 'Unstar conversation' : 'Star conversation'}
           >
             <Star className={`h-5 w-5 ${conversation.starred ? 'fill-yellow-400 text-yellow-400' : 'text-gray-400 dark:text-gray-500'}`} />
-          </button>
+            </button>
+          )}
         <div className="relative">
           <button
             onClick={(e) => {
@@ -482,14 +488,16 @@ export default function RecordingDetail() {
                 {reprocessingTranscript ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
                 <span>Reprocess Transcript</span>
               </button>
-              <button
+              {!dataset && (
+                <button
                 onClick={handleReprocessMemory}
                 disabled={reprocessingMemory}
                 className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50"
               >
                 {reprocessingMemory ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
                 <span>Reprocess Memory</span>
-              </button>
+                </button>
+          )}
               <div className="relative group/speakers">
                 <button
                   disabled={reprocessingSpeakers}
@@ -553,13 +561,15 @@ export default function RecordingDetail() {
                 </>
               )}
               <div className="border-t border-gray-200 dark:border-gray-600 my-1"></div>
-              <button
+              {!dataset && (
+                <button
                 onClick={handleDelete}
                 className="w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center space-x-2"
               >
                 <Trash2 className="h-4 w-4" />
                 <span>Delete Conversation</span>
-              </button>
+                </button>
+          )}
             </div>
           )}
         </div>
@@ -582,6 +592,12 @@ export default function RecordingDetail() {
         <div className="lg:col-span-3 space-y-6">
           {/* Title */}
           <div id="transcript" className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 sm:p-6 scroll-mt-6">
+            {dataset && (
+              <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-[var(--tape-line)] pb-3 text-xs text-[var(--tape-activity)]" role="note">
+                <span className="font-medium text-[var(--tape-ink)]">Recording audit</span>
+                <span>Audio · Transcripts · Speaker labels</span>
+              </div>
+            )}
             {editingTitle ? (
               <div className="space-y-2">
                 <div className="flex items-center space-x-2">
@@ -616,25 +632,32 @@ export default function RecordingDetail() {
                 )}
               </div>
             ) : (
-              <h1
-                className="text-2xl font-bold text-gray-900 dark:text-gray-100 group cursor-pointer hover:bg-yellow-100 dark:hover:bg-yellow-900/30 px-1 rounded transition-colors inline-flex items-center gap-2"
-                onClick={handleStartTitleEdit}
-                title="Click to edit title"
-              >
-                {conversation.title || TITLE_NOT_GENERATED}
-                <Pencil className="w-4 h-4 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-              </h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
+                  {conversation.title && conversation.title !== TITLE_NOT_GENERATED ? conversation.title : 'Untitled recording'}
+                </h1>
+                <IconButton label="Rename recording" onClick={handleStartTitleEdit}>
+                  <Pencil className="h-4 w-4" />
+                </IconButton>
+              </div>
             )}
 
+    <AskAboutSource source={{ kind: "recording", key: conversation.conversation_id }} />
             {/* Summary */}
-            {conversation.summary && (
+            {conversation.processing_status === 'failed' && (
+              <p className="mt-2 text-sm text-red-700 dark:text-red-300">
+                {conversation.failure_stage === 'summarization' ? 'Summary failed' : 'Processing failed'}
+              </p>
+            )}
+            {conversation.processing_status === 'active' && <p role="status" className="mt-2 text-sm text-[var(--tape-activity)]">Processing</p>}
+            {!dataset && conversation.summary && !/^Transcribing detected speech\.{0,3}$/.test(conversation.summary) && (
               <p className="mt-3 text-gray-600 dark:text-gray-400 italic">
                 {conversation.summary}
               </p>
             )}
 
             {/* Detailed Summary */}
-            {conversation.detailed_summary && (
+            {!dataset && conversation.detailed_summary && (
               <div className="mt-3">
                 <button
                   onClick={() => setShowDetailedSummary(!showDetailedSummary)}
@@ -661,8 +684,7 @@ export default function RecordingDetail() {
                 Transcript
                 {isLive && (
                   <span className="inline-flex items-center gap-1.5 ml-2">
-                    <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                    <span className="text-xs text-red-600 dark:text-red-400 font-medium">LIVE</span>
+                    <span className="text-xs text-[var(--tape-activity)]">Streaming transcript</span>
                   </span>
                 )}
                 {segments.length > 0 && (
@@ -682,6 +704,7 @@ export default function RecordingDetail() {
                 }}
               />
             </div>
+            <span id="recording-transcript" />
             <TranscriptEditor
               conversationId={conversation.conversation_id!}
               segments={segments}
@@ -696,6 +719,7 @@ export default function RecordingDetail() {
             />
           </div>
 
+          {!dataset && <RecordingMemoryContext recordingId={conversation.conversation_id} />}
         </div>
 
         {/* Right Column - Sidebar */}
@@ -753,9 +777,9 @@ export default function RecordingDetail() {
                   </button>
                 </dd>
               </div>
-              <div className="flex justify-between items-start">
-                <dt className="text-gray-600 dark:text-gray-400 flex items-center gap-1.5">
-                  <Calendar className="w-3.5 h-3.5" /> Date
+              <div className="flex justify-between items-start gap-3">
+                <dt className="shrink-0 text-gray-600 dark:text-gray-400 flex items-center gap-1.5">
+                  <Calendar className="w-3.5 h-3.5" /> Created
                 </dt>
                 <dd className="text-gray-900 dark:text-gray-100 text-right">
                   {formatDate(conversation.created_at || '')}
@@ -802,13 +826,15 @@ export default function RecordingDetail() {
             </dl>
           </div>
 
-          <a
+          {!dataset && (
+            <a
             href="#memory-history"
             className="flex items-center gap-1.5 px-1 text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
           >
             <span>Memory history</span>
             <span aria-hidden="true">↓</span>
-          </a>
+            </a>
+          )}
 
         </div>
       </div>
@@ -823,8 +849,8 @@ export default function RecordingDetail() {
 
       {/* Memory change history is intentionally full-width: paths, summaries, and
           timestamps become unreadable in the narrow metadata rail. */}
-      <ConversationContextLens conversationId={conversation.conversation_id} />
-      <MemoryAuditCard conversationId={conversation.conversation_id} />
+      {!dataset && <ConversationContextLens conversationId={conversation.conversation_id} />}
+      {!dataset && <MemoryAuditCard conversationId={conversation.conversation_id} />}
 
       {/* Split modal — on success the conversation is soft-deleted, so leave */}
       {showSplitModal && (

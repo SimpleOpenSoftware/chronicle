@@ -8,11 +8,8 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
-from backend.llm_client import async_generate
-from backend.services.inference_artifacts import (
-    load_reusable_result,
-    persist_inference_run,
-)
+import backend.services.timeline.memory_sources as memory_sources
+import backend.services.timeline.pi_tasks as pi_tasks
 
 OPERATION = "timeline_episode_merge"
 PROMPT_VERSION = "timeline-merge-v2"
@@ -65,6 +62,7 @@ async def synthesize_merged_episode_account(
     existing Timeline untouched. Identical inputs reuse a durable inference artifact.
     """
 
+    episodes = list(episodes)
     source = [_episode_source(episode) for episode in episodes]
     # Widening repeated slices with the same semantic account does not make that
     # account stale. This also keeps purely structural merges off the inference path.
@@ -77,37 +75,13 @@ async def synthesize_merged_episode_account(
             title=title,
             summary=summary or f"Merged episode: {title}.",
         )
-    request = {"prompt_version": PROMPT_VERSION, "episodes": source}
-    cached = load_reusable_result(OPERATION, request)
-    if cached is not None:
-        return MergedEpisodeAccount.model_validate(cached)
 
-    prompt = f"""You maintain a semantic personal timeline. A person selected the
-following adjacent episode accounts and declared that they are one real-world event.
-Write a fresh account of the whole merged event rather than preserving the first
-segment's framing.
-
-Return JSON with exactly:
-- title: a concise, specific event-level title; identify an interview, meeting, call,
-  journey, work session, or other event type when the evidence supports it
-- summary: one coherent paragraph covering every materially distinct topic or outcome,
-  no more than 1,000 characters
-
-Do not invent facts. Do not call organizations or products conversation participants.
-Prefer named human participants when they are supported by the supplied accounts.
-
-EPISODES (chronological):
-{json.dumps(source, ensure_ascii=False, default=str, indent=2)}
-"""
-    raw = await async_generate(prompt, operation="timeline_merge")
-    account = MergedEpisodeAccount.model_validate(_json_object(raw))
-    persist_inference_run(
-        operation=OPERATION,
-        request=request,
-        stdout=raw,
-        stderr="",
-        result=account.model_dump(),
-        metadata={"prompt_version": PROMPT_VERSION},
-        reusable=True,
+    outcome = await pi_tasks.run_task(
+        stage="episode_merge",
+        instruction="The user grouped these episode accounts as one event. Produce a coherent title and summary grounded in their evidence and relevant accepted knowledge.",
+        payload={"episodes": source},
+        result_type=MergedEpisodeAccount,
+        sources=memory_sources.evidence_sources(episodes),
+        user_id=getattr(episodes[0], "user_id", None),
     )
-    return account
+    return outcome.result

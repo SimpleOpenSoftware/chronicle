@@ -61,6 +61,10 @@ class InteractionIngress:
             return InteractionIngressResult(consumed=False, reason="empty")
 
         active = await self.store.get_active(user_id, client_id, now=received_at)
+        if active is not None and active.mode_id == "voice_conversation":
+            return InteractionIngressResult(
+                consumed=True, reason="voice_requires_committed_audio"
+            )
         match = self.registry.match(text) if active is None else None
         if active is None and match is None:
             return InteractionIngressResult(consumed=False, reason="no_mode")

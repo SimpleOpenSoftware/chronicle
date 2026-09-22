@@ -1,5 +1,6 @@
 """Conversation-grouped cross-validation for human-labeled speaker clips."""
 
+import asyncio
 import hashlib
 import math
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from rq import get_current_job
 from backend.config import get_diarization_settings
 from backend.models.conversation import Conversation
 from backend.models.job import async_job
+from backend.services import privacy
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
 
@@ -40,7 +42,10 @@ def _active_segments(doc: dict) -> list:
     return (version or (versions[-1] if versions else {})).get("segments") or []
 
 
-async def _labeled_clips(user_id: str) -> tuple[List[dict], Dict[str, int]]:
+async def _labeled_clips(
+    user_id: str, *, visibility=None
+) -> tuple[List[dict], Dict[str, int]]:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
     db = Conversation.get_pymongo_collection().database
     clips: List[dict] = []
     exclusions = {
@@ -48,6 +53,7 @@ async def _labeled_clips(user_id: str) -> tuple[List[dict], Dict[str, int]]:
         "missing_bounds": 0,
         "too_short": 0,
         "duplicate": 0,
+        "privacy_held": 0,
     }
 
     async for review in db["enrollment_reviews"].find(
@@ -62,6 +68,9 @@ async def _labeled_clips(user_id: str) -> tuple[List[dict], Dict[str, int]]:
             "segment_end": 1,
         },
     ):
+        if not await visibility.filter([review]):
+            exclusions["privacy_held"] += 1
+            continue
         if review.get("decision") not in ("accept", "another_speaker"):
             exclusions["bad_or_mixed"] += 1
             continue
@@ -94,6 +103,9 @@ async def _labeled_clips(user_id: str) -> tuple[List[dict], Dict[str, int]]:
             "corrected_speaker": 1,
         },
     ):
+        if not await visibility.filter([annotation]):
+            exclusions["privacy_held"] += 1
+            continue
         doc = await Conversation.get_pymongo_collection().find_one(
             {"conversation_id": annotation.get("conversation_id")},
             {"active_transcript_version": 1, "transcript_versions": 1},
@@ -136,12 +148,17 @@ async def _labeled_clips(user_id: str) -> tuple[List[dict], Dict[str, int]]:
             continue
         clip["key"] = key
         unique[key] = clip
+    await visibility.assert_current()
     return list(unique.values()), exclusions
 
 
 async def _embed_clips(
-    clips: List[dict], user_id: str, embedding_model: str
+    clips: List[dict], user_id: str, embedding_model: str, *, visibility=None
 ) -> tuple[List[dict], int, List[dict]]:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    if len(await visibility.filter(clips)) != len(clips):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     db = Conversation.get_pymongo_collection().database
     cache = db["speaker_evaluation_embeddings"]
     client = SpeakerRecognitionClient()
@@ -150,6 +167,7 @@ async def _embed_clips(
     cache_hits = 0
     job = get_current_job()
     for index, clip in enumerate(clips):
+        await visibility.assert_current()
         cached = await cache.find_one(
             {
                 "user_id": user_id,
@@ -157,6 +175,7 @@ async def _embed_clips(
                 "embedding_model": embedding_model,
             }
         )
+        await visibility.assert_current()
         if cached:
             result = cached
             cache_hits += 1
@@ -165,28 +184,38 @@ async def _embed_clips(
                 wav = await reconstruct_audio_segment(
                     clip["conversation_id"], clip["start"], clip["end"]
                 )
+                await visibility.assert_current()
                 result = await client.extract_speaker_embedding(wav)
+                await visibility.assert_current()
                 if result.get("error"):
-                    raise RuntimeError(str(result))
-                await cache.update_one(
-                    {"user_id": user_id, "clip_key": clip["key"]},
-                    {
-                        "$set": {
-                            **clip,
-                            **result,
+                    raise RuntimeError("Speaker embedding failed")
+                async with visibility.publication():
+                    await cache.update_one(
+                        {
                             "user_id": user_id,
-                            "created_at": datetime.now(timezone.utc),
-                        }
-                    },
-                    upsert=True,
-                )
+                            "clip_key": clip["key"],
+                            "embedding_model": embedding_model,
+                        },
+                        {
+                            "$set": {
+                                **clip,
+                                **result,
+                                "user_id": user_id,
+                                "embedding_model": embedding_model,
+                                "created_at": datetime.now(timezone.utc),
+                            }
+                        },
+                        upsert=True,
+                    )
+            except privacy.PrivacyHeld:
+                raise
             except Exception as exc:
-                failures.append({"clip_key": clip["key"], "error": str(exc)})
+                failures.append({"clip_key": clip["key"], "error": type(exc).__name__})
                 continue
         try:
             embedded.append({**clip, "embedding": _unit(result["embedding"])})
         except Exception as exc:
-            failures.append({"clip_key": clip["key"], "error": str(exc)})
+            failures.append({"clip_key": clip["key"], "error": type(exc).__name__})
         if job and (index % 5 == 0 or index + 1 == len(clips)):
             job.meta["batch_progress"] = {
                 "current": index + 1,
@@ -194,6 +223,7 @@ async def _embed_clips(
                 "message": f"Embedding labeled clips {index + 1}/{len(clips)}",
             }
             job.save_meta()
+    await visibility.assert_current()
     return embedded, cache_hits, failures
 
 
@@ -359,15 +389,27 @@ def _evaluate(samples: List[dict], threshold: float) -> dict:
 @async_job(redis=False, beanie=True, timeout=7200)
 async def run_speaker_benchmark_job(user_id: str) -> Dict[str, Any]:
     started_at = datetime.now(timezone.utc)
-    clips, exclusions = await _labeled_clips(user_id)
+    visibility = privacy.ConversationPrivacyFilter()
+    # Bind even an empty report to the requesting user's policy.
+    visibility.snapshots[user_id] = await privacy.load_snapshot(user_id)
+    clips, exclusions = await _labeled_clips(user_id, visibility=visibility)
     client = SpeakerRecognitionClient()
     embedding_info = await client.get_embedding_info()
     if embedding_info.get("error") or not embedding_info.get("embedding_model"):
-        raise RuntimeError(f"Cannot determine embedding model: {embedding_info}")
+        raise RuntimeError("Cannot determine embedding model")
     embedding_model = embedding_info["embedding_model"]
-    embedded, cache_hits, failures = await _embed_clips(clips, user_id, embedding_model)
+    embedded, cache_hits, failures = await _embed_clips(
+        clips, user_id, embedding_model, visibility=visibility
+    )
     threshold = float(get_diarization_settings().get("similarity_threshold", 0.5))
+    await visibility.assert_current()
+    evaluation = await asyncio.to_thread(_evaluate, embedded, threshold)
+    await visibility.assert_current()
     report = {
+        "evidence_conversation_ids": sorted(
+            {clip["conversation_id"] for clip in clips}
+        ),
+        "privacy_revisions": visibility.revision_receipt(),
         "user_id": user_id,
         "created_at": started_at,
         "protocol": "5-fold conversation-grouped cross-validation",
@@ -382,11 +424,12 @@ async def run_speaker_benchmark_job(user_id: str) -> Dict[str, Any]:
             "embedding_failures": len(failures),
             "exclusions": exclusions,
         },
-        **_evaluate(embedded, threshold),
+        **evaluation,
         "failures": failures[:20],
     }
     db = Conversation.get_pymongo_collection().database
-    await db["speaker_benchmark_runs"].insert_one(report)
-    report.pop("_id", None)
-    report["created_at"] = started_at.isoformat()
-    return report
+    async with visibility.publication():
+        saved = await db["speaker_benchmark_runs"].insert_one(report)
+    # Queue results outlive policy changes. The report route resolves current
+    # evidence/privacy; Redis stores only an opaque reference and completion state.
+    return {"status": "complete", "report_id": str(saved.inserted_id)}

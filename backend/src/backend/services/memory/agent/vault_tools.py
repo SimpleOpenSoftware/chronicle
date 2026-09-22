@@ -9,8 +9,9 @@ markdown vault:
 
 Search is modelled on Claude Code: a ripgrep-backed ``grep`` (full regex, glob filter,
 output modes) and a ``glob`` (filename patterns) that the LLM drives by formulating
-patterns — no query preprocessing. Editing uses exact string-replace (see
-:mod:`edit_engine`). ``rename_person`` renames a person note and rewrites every
+patterns — no query preprocessing. Pi injects native text computation through
+:mod:`text_operations`; Direct uses :mod:`edit_engine`. Vault policy and writes
+stay here. ``rename_person`` renames a person note and rewrites every
 ``[[wikilink]]`` across the vault (via notesmd-cli ``move`` when present, else Python).
 
 Frontmatter is edited as text via ``edit_note`` — never through notesmd-cli's
@@ -59,11 +60,18 @@ from ..vault_verify import (
 )
 from .edit_engine import Edit, EditError, apply_edits
 from .section_edit import SectionEditError, apply_section_edit
+from .text_operations import (
+    DEFAULT_READ_LINES,
+    DEFAULT_SLICE_CHARS,
+    MAX_READ_CHARS,
+    MAX_READ_LINES,
+    TextOperations,
+)
 
 logger = logging.getLogger("memory_service.agent.tools")
 
 _GREP_MAX_LINES = 200  # default head limit, like Claude Code's grep
-_TOOL_RESULT_MAX_CHARS = 8000
+_TOOL_RESULT_MAX_CHARS = MAX_READ_CHARS
 _GREP_RESULT_COMPACTION_ENV = "CHRONICLE_GREP_RESULT_COMPACTION"
 
 
@@ -79,8 +87,8 @@ def _assert_parseable_frontmatter(path: str, content: str) -> None:
 # A note has no bound on its length, so a read of one needs its own. Sized so a full
 # window is about two thousand tokens: enough to inspect one note, small enough that a
 # model can inspect several candidates without crowding the transcript out of context.
-_READ_DEFAULT_LINES = 200
-_READ_MAX_LINES = 2000
+_READ_DEFAULT_LINES = DEFAULT_READ_LINES
+_READ_MAX_LINES = MAX_READ_LINES
 
 
 class VaultToolError(Exception):
@@ -273,9 +281,11 @@ class VaultTools:
         immutable_sections: Sequence[tuple[str, str]] = (),
         allow_new_categories: bool = True,
         user_id: str = "",
+        text_operations: TextOperations | None = None,
     ):
         # Whose vault this is. Only search_images needs it — the visual index is a
         # separate service keyed by user, not a path under the vault root.
+        self.text_operations = text_operations
         self.user_id = user_id
         # Notes this run must create or edit; verify_vault reports any that it has not.
         self.required_notes = tuple(required_notes)
@@ -307,11 +317,14 @@ class VaultTools:
         self._trace_context = trace_context
         self._trace_attempt = current_memory_attempt()
         self.touched: set = set()  # vault-relative paths created/edited this run
+        self.privacy_excluded_paths: set[str] = set()
         # Day writes attach durable Timeline episode keys to each semantic mutation.
         # This stays out of Markdown and follows the note into the review/audit UI.
         self.allowed_source_episode_keys: set[str] = set()
         self.require_source_episode_keys = False
         self.source_episode_keys_by_path: Dict[str, set[str]] = {}
+        self.source_claims: Dict[str, list[str]] = {}
+        self.source_evidence_keys_by_path: Dict[str, set[str]] = {}
         self.verified = False  # whether the agent called verify_vault before finishing
         # Unlike ``touched``, this is monotonic: editing the same note twice must
         # still mark both tool observations as mutating.
@@ -399,6 +412,10 @@ class VaultTools:
 
     def _confined_path(self, rel: str) -> Path:
         self._assert_root_safe()
+        if rel.casefold() in {p.casefold() for p in self.privacy_excluded_paths}:
+            raise VaultToolError(
+                "This note contains held evidence and is unavailable for processing."
+            )
         try:
             return confined_vault_path(self.root, rel)
         except VaultPathError as exc:
@@ -474,6 +491,8 @@ class VaultTools:
         paths: List[Path] = []
         for path in self.root.rglob("*"):
             rel = path.relative_to(self.root).as_posix()
+            if rel.casefold() in {p.casefold() for p in self.privacy_excluded_paths}:
+                continue
             if path.is_symlink():
                 raise VaultToolError(
                     f"Vault contains a symbolic link and cannot be mutated safely: {rel!r}."
@@ -513,6 +532,10 @@ class VaultTools:
         # The vault is a semantic datastore, not a Git working tree. Parent or local
         # ignore files must not make valid notes disappear from the agent's view.
         args = [self._rg, "--no-ignore", "--no-messages", "--color=never"]
+        for excluded in sorted(self.privacy_excluded_paths):
+            # Quarantined names are internal, never returned as search matches.
+            escaped = re.sub(r"([\\*?{}\[\]])", r"\\\1", excluded)
+            args.extend(["--glob", "!" + escaped])
         if ignore_case:
             args.append("-i")
         if glob:
@@ -644,80 +667,95 @@ class VaultTools:
 
     # --- read / write -------------------------------------------------------
 
+    def _read_path(self, path: str) -> Path:
+        """Resolve notes and read-only .base references through the same policy."""
+        if isinstance(path, str) and path.strip().lower().endswith(".base"):
+            try:
+                rel = safe_vault_relative_path(path.strip())
+            except VaultPathError as exc:
+                raise VaultToolError(str(exc)) from exc
+            fp = self._confined_path(self._resolve_ci(rel))
+        else:
+            fp = self._abs(path)
+        if not fp.is_file():
+            raise VaultToolError(
+                f"Note '{path}' does not exist. Use glob or grep to find the right path."
+            )
+        return fp
+
+    def inspection_path(self, path: str) -> str:
+        return self._read_path(path).relative_to(self.root).as_posix()
+
+    @staticmethod
+    def _read_integer(value: Any, name: str, minimum: int = 0) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise VaultToolError(f"{name} must be an integer >= {minimum}.")
+        return value
+
     def read_note(
         self,
         path: str,
         offset: int = 0,
         limit: int = _READ_DEFAULT_LINES,
-        char_offset: int = 0,
     ) -> str:
-        """Read a window of a note, numbered from ``offset``.
-
-        Returning whole files is what broke the settled-day write: ``Daily/<date>.md``
-        had grown to 215 KB (~55k tokens) and one call consumed 84% of a 65k context,
-        so every attempt failed on context size before it could edit anything. A note
-        has no bound on its length, so a read of one must have its own.
-
-        Windowed rather than simply truncated: the agent can page to the part it needs.
-        Most of the time it needs none of this — ``edit_section`` appends by heading
-        without reading the note at all.
-        """
-        fp = self._abs(path)
-        if not fp.exists():
-            raise VaultToolError(
-                f"Note '{path}' does not exist. Use glob or grep to find the right "
-                f"path, or write_note to create it."
-            )
-        try:
-            offset = max(0, int(offset))
-            limit = int(limit)
-            char_offset = max(0, int(char_offset))
-        except (TypeError, ValueError):
-            raise VaultToolError(
-                "read_note offset, limit, and char_offset must be integers."
-            )
-        if limit <= 0:
-            limit = _READ_DEFAULT_LINES
-        limit = min(limit, _READ_MAX_LINES)
-
-        # keepends, so an unwindowed read returns the file byte-for-byte — edit_note
-        # matches old_text exactly, and a silently dropped trailing newline would make
-        # an edit copied from a read fail to apply.
-        lines = fp.read_text(encoding="utf-8").splitlines(keepends=True)
-        total = len(lines)
-        window = lines[offset : offset + limit]
-
-        # A single very long line can still blow the window, so cap the characters too.
-        window_body = "".join(window)
-        if char_offset > len(window_body):
-            raise VaultToolError(
-                f"read_note char_offset {char_offset} exceeds this window's "
-                f"{len(window_body)} characters."
-            )
-        body = window_body[char_offset:]
-        char_capped = False
+        """Bounded line inspection; Pi injects native mechanics after confinement."""
+        fp = self._read_path(path)
+        offset = self._read_integer(offset, "offset")
+        limit = min(self._read_integer(limit, "limit", 1), _READ_MAX_LINES)
+        content = fp.read_text(encoding="utf-8")
+        if self.text_operations is not None:
+            try:
+                return self.text_operations.read(content, path, offset, limit)
+            except EditError as exc:
+                raise VaultToolError(str(exc)) from exc
+        # The Direct executor has no Node/Pi dependency. Its reader shares the
+        # same range-tool contract and output budget as the Pi adapter.
+        lines = content.splitlines(keepends=True)
+        body = "".join(lines[offset : offset + limit])
         if len(body) > _TOOL_RESULT_MAX_CHARS:
-            body = body[:_TOOL_RESULT_MAX_CHARS]
-            char_capped = True
+            cursor = sum(map(len, lines[:offset])) + _TOOL_RESULT_MAX_CHARS
+            return body[:_TOOL_RESULT_MAX_CHARS] + (
+                f"\n\n[Truncated at {_TOOL_RESULT_MAX_CHARS} characters. "
+                f"Continue with read_slice(path, char_offset={cursor}).]"
+            )
+        if offset + limit < len(lines):
+            return body + (
+                f"\n\n[showing lines {offset + 1}-{offset + limit} of {len(lines)}; "
+                f"continue with read_note(path, offset={offset + limit})]"
+            )
+        return body
 
-        shown_to = offset + len(window)
-        if offset == 0 and char_offset == 0 and shown_to >= total and not char_capped:
+    def read_slice(
+        self,
+        path: str,
+        char_offset: int = 0,
+        max_chars: int = DEFAULT_SLICE_CHARS,
+    ) -> str:
+        """Minimal inspection primitive for text inside very long lines.
+
+        Offsets count Unicode characters in the complete decoded note, starting at
+        zero. The continuation is absolute, independent of any preceding line read.
+        """
+        fp = self._read_path(path)
+        start = self._read_integer(char_offset, "char_offset")
+        size = min(
+            self._read_integer(max_chars, "max_chars", 1), _TOOL_RESULT_MAX_CHARS
+        )
+        content = fp.read_text(encoding="utf-8")
+        if start > len(content):
+            raise VaultToolError(
+                f"char_offset {start} exceeds this note's {len(content)} characters."
+            )
+        end = min(start + size, len(content))
+        body = content[start:end]
+        if start == 0 and end == len(content):
             return body
-        notes = [f"[showing lines {offset + 1}-{shown_to} of {total}]"]
-        if char_capped:
-            notes.append(f"[truncated at {_TOOL_RESULT_MAX_CHARS} characters]")
-            notes.append(
-                "[continue this window with "
-                f"read_note(path, offset={offset}, limit={limit}, "
-                f"char_offset={char_offset + _TOOL_RESULT_MAX_CHARS})]"
+        notice = f"[showing characters {start}-{end} of {len(content)} (end exclusive)"
+        if end < len(content):
+            notice += (
+                f"; continue with read_slice(path, char_offset={end}, max_chars={size})"
             )
-        elif shown_to < total:
-            notes.append(
-                f"[continue with read_note(path, offset={shown_to}) — or prefer "
-                f"grep to find the part you need, and edit_section to append without "
-                f"reading the whole note]"
-            )
-        return f"{body}\n\n" + "\n".join(notes)
+        return body + "\n\n" + notice + "]"
 
     def edit_note(self, path: str, edits: List[Dict[str, str]]) -> str:
         parsed = [Edit(e["old_text"], e["new_text"]) for e in edits]
@@ -729,7 +767,11 @@ class VaultTools:
                 )
             content = fp.read_text(encoding="utf-8")
             try:
-                new_content = apply_edits(content, parsed, path)
+                new_content = (
+                    self.text_operations.edit(content, parsed, path)
+                    if self.text_operations is not None
+                    else apply_edits(content, parsed, path)
+                )
             except EditError as e:
                 raise VaultToolError(str(e))
             _assert_parseable_frontmatter(path, new_content)
@@ -1058,7 +1100,32 @@ class VaultTools:
                 input={"arguments": text_payload(serialized_args)},
             )
             source_keys: list[str] = []
+            evidence_keys: set[str] = set()
             if name in {"edit_note", "edit_section", "write_note"}:
+                path = _safe_relpath(args.get("path", ""))
+                if any(
+                    Path(path).parts[0].casefold() == folder.casefold()
+                    for folder in self.forbidden_folders
+                ):
+                    raise VaultToolError(
+                        f"{Path(path).parts[0]}/ is not a writable destination for this memory task"
+                    )
+                if self.source_claims:
+                    claim_ids = args.get("source_claim_ids", [])
+                    if (
+                        not isinstance(claim_ids, list)
+                        or not claim_ids
+                        or any(
+                            not isinstance(key, str) or key not in self.source_claims
+                            for key in claim_ids
+                        )
+                    ):
+                        raise VaultToolError(
+                            "Session mutations require source_claim_ids from the supplied account"
+                        )
+                    evidence_keys = {
+                        key for claim in claim_ids for key in self.source_claims[claim]
+                    }
                 raw_keys = args.get("source_episode_keys", [])
                 if not isinstance(raw_keys, list) or not all(
                     isinstance(key, str) and key.strip() for key in raw_keys
@@ -1083,6 +1150,11 @@ class VaultTools:
                 )
 
             result = self._dispatch(name, args)
+            if evidence_keys:
+                rel = self._resolve_ci(_safe_relpath(args["path"]))
+                self.source_evidence_keys_by_path.setdefault(rel, set()).update(
+                    evidence_keys
+                )
             if source_keys:
                 rel = self._resolve_ci(_safe_relpath(args["path"]))
                 self.source_episode_keys_by_path.setdefault(rel, set()).update(
@@ -1120,7 +1192,12 @@ class VaultTools:
                 args["path"],
                 offset=args.get("offset", 0),
                 limit=args.get("limit", _READ_DEFAULT_LINES),
-                char_offset=args.get("char_offset", 0),
+            )
+        if name == "read_slice":
+            return self.read_slice(
+                args["path"],
+                args.get("char_offset", 0),
+                args.get("max_chars", DEFAULT_SLICE_CHARS),
             )
         if name == "edit_note":
             return self.edit_note(args["path"], args["edits"])
@@ -1256,9 +1333,11 @@ _READ_TOOL = {
     "function": {
         "name": "read_note",
         "description": (
-            "Read a window of a note by vault-relative path (e.g. 'People/Alice.md'). "
+            "Read a window of a note or an existing .base view definition by vault-relative path. "
+            "View definitions are read-only presentation references, not personal memory evidence. "
             f"Returns up to {_READ_DEFAULT_LINES} lines from `offset`; long notes are "
-            "reported with their total length and how to page on. To ADD a fact you do "
+            "bounded to 8000 source characters with continuation instructions. Use read_slice "
+            "for character ranges inside very long lines. To ADD a fact you do "
             "not need to read the note at all — `edit_section` appends by heading. Use "
             "`grep` to locate the part you care about rather than paging a long note."
         ),
@@ -1277,13 +1356,6 @@ _READ_TOOL = {
                         f"{_READ_MAX_LINES})."
                     ),
                 },
-                "char_offset": {
-                    "type": "integer",
-                    "description": (
-                        "0-based character cursor within the selected line window; "
-                        "use the continuation value returned for a very long line."
-                    ),
-                },
                 "refresh": {
                     "type": "boolean",
                     "description": (
@@ -1296,6 +1368,42 @@ _READ_TOOL = {
         },
     },
 }
+
+_SLICE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_slice",
+        "description": (
+            "Read a character range from a note or read-only .base reference. "
+            "Use to inspect very long lines that read_note cannot return. "
+            "Offsets count Unicode characters from the start of the whole note, "
+            "not bytes or a previous line window. Follow returned continuation cursors."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "char_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based absolute character offset (default 0).",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "description": "Maximum source characters (default 2000, cap 8000).",
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "Repeat an unchanged window in Pi (default false).",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+}
+
 
 _EDIT_TOOL = {
     "type": "function",
@@ -1321,6 +1429,11 @@ _EDIT_TOOL = {
                         },
                         "required": ["old_text", "new_text"],
                     },
+                },
+                "source_claim_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For session writes, claim_id values supporting this note change.",
                 },
                 "source_episode_keys": {
                     "type": "array",
@@ -1364,6 +1477,11 @@ _EDIT_SECTION_TOOL = {
                     "type": "string",
                     "enum": ["append", "prepend", "replace"],
                 },
+                "source_claim_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For session writes, claim_id values supporting this note change.",
+                },
                 "source_episode_keys": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1388,6 +1506,11 @@ _WRITE_TOOL = {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
                 "overwrite": {"type": "boolean"},
+                "source_claim_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For session writes, claim_id values supporting this note change.",
+                },
                 "source_episode_keys": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1494,6 +1617,7 @@ VAULT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _GREP_TOOL,
     _GLOB_TOOL,
     _READ_TOOL,
+    _SLICE_TOOL,
     _SEARCH_IMAGES_TOOL,
     _EDIT_TOOL,
     _EDIT_SECTION_TOOL,
@@ -1509,5 +1633,6 @@ VAULT_SEARCH_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _GREP_TOOL,
     _GLOB_TOOL,
     _READ_TOOL,
+    _SLICE_TOOL,
     _SEARCH_IMAGES_TOOL,
 ]

@@ -18,6 +18,7 @@ from typing import Literal, Optional
 import numpy as np
 
 from backend.models.conversation import Conversation
+from backend.services import privacy
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,8 @@ async def get_subject_override(user_id: str, conversation_id: str) -> Optional[d
     ``cluster_signature: None`` means the whole conversation is exempt from
     background marking (the rescue path writes these).
     """
-    return await _overrides_collection().find_one(
+    visibility = await require_recording(conversation_id)
+    result = await _overrides_collection().find_one(
         {
             "user_id": user_id,
             "conversation_id": conversation_id,
@@ -122,6 +124,16 @@ async def get_subject_override(user_id: str, conversation_id: str) -> Optional[d
             "cluster_signature": None,
         }
     )
+    await visibility.assert_current()
+    return result
+
+
+async def require_recording(conversation_id, visibility=None):
+    visibility = visibility or privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
+    return visibility
 
 
 async def load_sticky_segments(user_id: str, conversation_id: str) -> dict[float, dict]:
@@ -131,20 +143,28 @@ async def load_sticky_segments(user_id: str, conversation_id: str) -> dict[float
     re-marked background; "confirmed" segments must always BE background (the
     user endorsed the removal), regardless of what a fresh score would say.
     """
-    return {
-        doc["segment_start"]: {
-            "status": doc["status"],
-            "bucket_type": doc.get("bucket_type"),
-        }
-        async for doc in _ledger_collection().find(
+    visibility = await require_recording(conversation_id)
+    docs = (
+        await _ledger_collection()
+        .find(
             {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "status": {"$in": sorted(STICKY_STATUSES)},
-            },
-            {"segment_start": 1, "status": 1, "bucket_type": 1},
+            }
         )
+        .to_list(None)
+    )
+    docs = await visibility.filter(docs)
+    result = {
+        doc["segment_start"]: {
+            "status": doc["status"],
+            "bucket_type": doc.get("bucket_type"),
+        }
+        for doc in docs
     }
+    await visibility.assert_current()
+    return result
 
 
 async def record_conversation_suppressions(
@@ -153,6 +173,8 @@ async def record_conversation_suppressions(
     records: list[dict],
     source: str,
     prune: bool = True,
+    *,
+    privacy_visibility: privacy.ConversationPrivacyFilter | None = None,
 ) -> int:
     """Upsert ledger entries for one conversation's scored segments.
 
@@ -167,7 +189,9 @@ async def record_conversation_suppressions(
     removed. "applied" entries survive pruning: they mirror a relabel that is
     actually in the transcript, and deleting them would orphan the restore path.
     """
+    visibility = await require_recording(conversation_id, privacy_visibility)
     assign_cluster_signatures(records)
+    reference_receipt = await visibility.reference_receipt(user_id)
     now = datetime.now(timezone.utc)
     written = 0
     kept_keys: list[float] = []
@@ -186,12 +210,15 @@ async def record_conversation_suppressions(
             "segment_start": segment_key(record["segment_start"]),
         }
         existing = await _ledger_collection().find_one(key, {"status": 1})
+        await visibility.assert_current()
         if existing and existing.get("status") in STICKY_STATUSES:
             continue
+        await visibility.assert_current()
         await _ledger_collection().update_one(
             key,
             {
                 "$set": {
+                    "privacy_reference_receipt": reference_receipt,
                     "segment_end": segment_key(record["segment_end"]),
                     "text": record.get("text"),
                     "cluster_signature": record.get("cluster_signature"),
@@ -213,8 +240,10 @@ async def record_conversation_suppressions(
             },
             upsert=True,
         )
+        await visibility.assert_current()
         written += 1
     if prune:
+        await visibility.assert_current()
         result = await _ledger_collection().delete_many(
             {
                 "user_id": user_id,
@@ -223,6 +252,7 @@ async def record_conversation_suppressions(
                 "status": {"$in": ["shadow", "queued"]},
             }
         )
+        await visibility.assert_current()
         if result.deleted_count:
             logger.info(
                 "Background suppression ledger: pruned %d stale entries for %s",
@@ -236,4 +266,5 @@ async def record_conversation_suppressions(
             conversation_id[:8],
             source,
         )
+    await visibility.assert_current()
     return written

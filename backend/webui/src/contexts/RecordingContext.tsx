@@ -1,9 +1,15 @@
 import { createContext, useContext, useState, useRef, useCallback, useEffect, useMemo, ReactNode } from 'react'
-import { BACKEND_URL } from '../services/api'
+import { api, BACKEND_URL } from '../services/api'
 import { getStorageKey } from '../utils/storage'
 import { useAuth } from './AuthContext'
 import { setActiveWakeClientId } from '../hooks/useWakeFeedback'
 import { WebAudioV2Session } from '../protocol/webAudioV2Session'
+import { create } from '@bufbuild/protobuf'
+import { CaptureCapabilitiesSchema, ConversationPhase, DuplexMode, EffectStatusSchema, InputRoute, OutputRoute, SpeechEngine, type ConversationState } from '../protocol/audioV2'
+import { checkOpusSupport, conversationSupportError, createCaptureWorklet, WorkletPlaybackRenderer } from '../protocol/browserAudio'
+import { type PlaybackActivity } from '../protocol/incrementalAudioPlayer'
+import { type VoiceProcessingUpdate } from '../protocol/audioV2'
+import { VoiceTimingTrace } from '../protocol/voiceTimingTrace'
 
 const log = import.meta.env.DEV ? console.log.bind(console) : () => {}
 
@@ -26,7 +32,6 @@ export const isLoopbackDevice = (label: string) =>
   /monitor of|loopback|blackhole|soundflower|stereo mix|what ?u ?hear/i.test(label)
 
 export type RecordingStep = 'idle' | 'mic' | 'display-audio' | 'websocket' | 'audio-start' | 'streaming' | 'stopping' | 'error'
-export type RecordingMode = 'batch' | 'streaming'
 export type AudioSource = 'mic' | 'meeting' | 'tab'
 
 export interface DebugStats {
@@ -44,15 +49,29 @@ export interface RecordingContextType {
   isRecording: boolean
   recordingDuration: number
   error: string | null
-  mode: RecordingMode
   liveTranscript: string
 
   // Actions
   startRecording: (memorySpaceId?: string) => Promise<void>
   stopRecording: () => void
-  setMode: (mode: RecordingMode) => void
   audioSource: AudioSource
   setAudioSource: (source: AudioSource) => void
+
+  // Conversation shares this recording owner; ending it never stops capture.
+  headphonesConfirmed: boolean
+  setHeadphonesConfirmed: (confirmed: boolean) => void
+  voiceEngine: SpeechEngine
+  setVoiceEngine: (engine: SpeechEngine) => void
+  voiceProcessing: VoiceProcessingUpdate | null
+  playbackActivity: PlaybackActivity
+  conversationState: ConversationState | null
+  conversationError: string | null
+  conversationStarting: boolean
+  conversationReady: boolean
+  conversationUnavailableReason: string | null
+  startConversation: (memorySpaceId?: string, threadId?: string) => Promise<void>
+  endConversation: () => void
+  cancelVoiceTask: (taskId: string) => void
 
   // Microphone selection
   availableDevices: MediaDeviceInfo[]
@@ -79,7 +98,6 @@ export interface RecordingContextType {
 }
 
 const RecordingContext = createContext<RecordingContextType | undefined>(undefined)
-const RESPONSE_DRAIN_TIMEOUT_MS = 15_000
 
 export function RecordingProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth()
@@ -89,10 +107,18 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
   const [isRecording, setIsRecording] = useState(false)
   const [recordingDuration, setRecordingDuration] = useState(0)
   const [error, setError] = useState<string | null>(null)
-  const [mode, setMode] = useState<RecordingMode>('streaming')
   const [liveTranscript, setLiveTranscript] = useState('')
   const [analyserState, setAnalyserState] = useState<AnalyserNode | null>(null)
   const [audioSource, setAudioSource] = useState<AudioSource>('mic')
+  const [headphonesConfirmed, setHeadphonesConfirmed] = useState(false)
+  const [voiceEngine, setVoiceEngine] = useState(SpeechEngine.MODULAR)
+  const [voiceProcessing, setVoiceProcessing] = useState<VoiceProcessingUpdate | null>(null)
+  const [playbackActivity, setPlaybackActivity] = useState<PlaybackActivity>('idle')
+  const [conversationState, setConversationState] = useState<ConversationState | null>(null)
+  const [conversationError, setConversationError] = useState<string | null>(null)
+  const [conversationStarting, setConversationStarting] = useState(false)
+  const [conversationReady, setConversationReady] = useState(false)
+  const conversationUnavailableReason = conversationSupportError()
 
   // Microphone selection
   const [availableDevices, setAvailableDevices] = useState<MediaDeviceInfo[]>([])
@@ -137,16 +163,16 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
 
   // Refs for direct access
   const audioSessionRef = useRef<WebAudioV2Session | null>(null)
+  const voiceTimingRef = useRef<VoiceTimingTrace | null>(null)
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
-  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const processorRef = useRef<AudioWorkletNode | null>(null)
   const displayStreamRef = useRef<MediaStream | null>(null)
   const durationIntervalRef = useRef<ReturnType<typeof setInterval>>()
-  const keepAliveIntervalRef = useRef<ReturnType<typeof setInterval>>()
   const systemAudioWatchRef = useRef<ReturnType<typeof setInterval>>()
-  const responseDrainTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
-  const responseDrainActiveRef = useRef(false)
+  const startingRef = useRef(false)
+  const stoppingRef = useRef(false)
   const chunkCountRef = useRef(0)
   const audioProcessingStartedRef = useRef(false)
 
@@ -216,6 +242,9 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       displayStreamRef.current = null
     }
 
+    processorRef.current?.port.close()
+    processorRef.current?.disconnect()
+
     // Clean up audio context
     if (audioContextRef.current?.state !== 'closed') {
       audioContextRef.current?.close()
@@ -244,20 +273,12 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
   const cleanupTransport = useCallback(() => {
     log('Cleaning up audio-v2 transport')
     setActiveWakeClientId(null)
-    responseDrainActiveRef.current = false
-
-    if (responseDrainTimeoutRef.current) {
-      clearTimeout(responseDrainTimeoutRef.current)
-      responseDrainTimeoutRef.current = undefined
-    }
-
-    void audioSessionRef.current?.stop().catch(() => undefined)
+    audioSessionRef.current?.dispose()
     audioSessionRef.current = null
-
-    if (keepAliveIntervalRef.current) {
-      clearInterval(keepAliveIntervalRef.current)
-      keepAliveIntervalRef.current = undefined
-    }
+    setVoiceProcessing(null)
+    setPlaybackActivity('idle')
+    setConversationReady(false)
+    setConversationStarting(false)
   }, [])
 
   const cleanup = useCallback(() => {
@@ -267,8 +288,15 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
 
   const handleAudioSessionFailure = useCallback((failure: Error) => {
     audioProcessingStartedRef.current = false
+    const session = audioSessionRef.current
     audioSessionRef.current = null
+    session?.dispose()
     setActiveWakeClientId(null)
+    setVoiceProcessing(null)
+    setPlaybackActivity('idle')
+    setConversationReady(false)
+    setConversationStarting(false)
+    setConversationState(null)
     setError(failure.message)
     setCurrentStep('error')
     setIsRecording(false)
@@ -312,7 +340,7 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     stream.getTracks().forEach(track => {
       track.onended = () => {
         log('Microphone track ended (permission revoked or device disconnected)')
-        if (isRecording) {
+        if (audioProcessingStartedRef.current || startingRef.current) {
           setError('Microphone disconnected or permission revoked')
           setCurrentStep('error')
           cleanup()
@@ -429,23 +457,58 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
     base.pathname = `${base.pathname.replace(/\/$/, '')}/ws/audio`
     base.search = ''
+    const voiceEnabled = headphonesConfirmed && audioSource === 'mic'
+    const context = audioContextRef.current!
+    const settings = mediaStreamRef.current?.getAudioTracks()[0]?.getSettings?.()
+    const renderer = voiceEnabled ? await WorkletPlaybackRenderer.create(context) : undefined
+    const timing = voiceEnabled ? new VoiceTimingTrace(4096, () => performance.now(), body => {
+      // Best-effort, authenticated metadata upload; never delays or fails capture.
+      void api.post('/api/client-diagnostics', body, { timeout: 5000, headers: {
+        'Content-Type': 'text/plain; charset=utf-8', 'X-Chronicle-Platform': 'web',
+      } }).catch(() => undefined)
+    }) : undefined
+    voiceTimingRef.current = timing ?? null
+    timing?.observeContext(context)
+    const capabilities = voiceEnabled ? create(CaptureCapabilitiesSchema, {
+      duplexMode: DuplexMode.ISOLATED,
+      // Browsers do not reliably expose physical routes. Headphones are a user assertion.
+      inputRoute: InputRoute.UNKNOWN,
+      outputRoute: OutputRoute.HEADPHONES,
+      nativeSampleRateHz: settings?.sampleRate ?? context.sampleRate,
+      incrementalPlayback: true,
+      acousticEchoCancellation: create(EffectStatusSchema, { requested: true, available: settings?.echoCancellation === true, enabled: settings?.echoCancellation === true }),
+      noiseSuppression: create(EffectStatusSchema, { requested: true, available: settings?.noiseSuppression === true, enabled: settings?.noiseSuppression === true }),
+    }) : undefined
     const session = new WebAudioV2Session(
       base.toString(),
       token,
       clientId => setActiveWakeClientId(clientId || null),
       text => setLiveTranscript(text),
       handleAudioSessionFailure,
+      renderer && capabilities ? {
+        renderer, capabilities, timing,
+        onProcessing: setVoiceProcessing,
+        onPlaybackActivity: setPlaybackActivity,
+        onState: state => {
+          setConversationState(state)
+          if (state.engine !== SpeechEngine.UNSPECIFIED && state.phase !== ConversationPhase.ENDED && state.phase !== ConversationPhase.UNSPECIFIED) setVoiceEngine(state.engine)
+          setConversationStarting(false)
+          setConversationError(null)
+        },
+        onPlaybackError: failure => { setConversationStarting(false); setVoiceProcessing(null); setPlaybackActivity('idle'); setConversationError(failure.message) },
+      } : undefined,
     )
-    await session.connect()
     audioSessionRef.current = session
+    await session.connect()
     setDebugStats(prev => ({ ...prev, connectionAttempts: prev.connectionAttempts + 1, sessionStartTime: new Date() }))
     return session
-  }, [handleAudioSessionFailure])
+  }, [handleAudioSessionFailure, headphonesConfirmed, audioSource])
 
   // Step 3: Open a source-native capture under the V2 binding.
   const startAudioSession = useCallback(async (session: WebAudioV2Session, memorySpaceId?: string): Promise<void> => {
     await session.start(memorySpaceId)
-  }, [])
+    setConversationReady(headphonesConfirmed && audioSource === 'mic')
+  }, [headphonesConfirmed, audioSource])
 
   // Step 4: Start audio streaming
   const startAudioStreaming = useCallback(async (micStream: MediaStream | null, session: WebAudioV2Session): Promise<void> => {
@@ -467,16 +530,17 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     analyserRef.current = analyser
     setAnalyserState(analyser)
 
-    // Wait brief moment for backend to process audio-start
-    await new Promise(resolve => setTimeout(resolve, 100))
-
-    // ScriptProcessor only supports power-of-two buffers. Select one from the
-    // actual context rate that satisfies the protocol's 20-100 ms frame contract.
-    const processor = audioContext.createScriptProcessor(
-      1024,
-      1,
-      1,
-    )
+    const processor = await createCaptureWorklet(audioContext, (samples, clock) => {
+      if (!audioProcessingStartedRef.current) return
+      try {
+        voiceTimingRef.current?.capture(samples.length, clock)
+        session.push(samples)
+        chunkCountRef.current++
+        if (chunkCountRef.current % 25 === 0) setDebugStats(prev => ({ ...prev, chunksSent: chunkCountRef.current }))
+      } catch (cause) {
+        handleAudioSessionFailure(cause instanceof Error ? cause : new Error('Opus encode failed'))
+      }
+    })
 
     // Connect mic source if available
     if (micStream) {
@@ -522,50 +586,16 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
 
     processor.connect(audioContext.destination)
 
-    let processCallCount = 0
-    processor.onaudioprocess = (event) => {
-      processCallCount++
-
-      // Calculate audio level for first few chunks
-      const inputData = event.inputBuffer.getChannelData(0)
-      let sum = 0
-      for (let i = 0; i < inputData.length; i++) {
-        sum += Math.abs(inputData[i])
-      }
-      const avgLevel = sum / inputData.length
-
-      // Log first few calls to debug
-      if (processCallCount <= 3) {
-        log(`Audio process callback #${processCallCount}`, {
-          transport: 'chronicle.audio.v2',
-          audioProcessingStarted: audioProcessingStartedRef.current,
-          audioLevel: avgLevel.toFixed(6),
-          hasAudio: avgLevel > 0.001
-        })
-      }
-
-      if (!audioProcessingStartedRef.current) return
-      try {
-        session.push(inputData)
-        chunkCountRef.current++
-        setDebugStats(prev => ({ ...prev, chunksSent: chunkCountRef.current }))
-      } catch (error) {
-        setDebugStats(prev => ({
-          ...prev,
-          lastError: error instanceof Error ? error.message : 'Opus encode failed',
-          lastErrorTime: new Date(),
-        }))
-      }
-    }
-
     processorRef.current = processor
     audioProcessingStartedRef.current = true
 
     log('Audio streaming started')
-  }, [])
+  }, [handleAudioSessionFailure])
 
   // Main start recording function - sequential flow
   const startRecording = useCallback(async (memorySpaceId?: string) => {
+    if (startingRef.current || stoppingRef.current || audioProcessingStartedRef.current) return
+    startingRef.current = true
     const needsMic = audioSource !== 'tab'
     const needsDisplayAudio = audioSource !== 'mic'
 
@@ -575,6 +605,16 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       cleanupTransport()
       setError(null)
       setLiveTranscript('')
+      setConversationState(null)
+      setConversationError(null)
+      if (!globalThis.AudioWorkletNode) throw new Error('This browser needs AudioWorklet support to record audio.')
+      if (headphonesConfirmed && audioSource === 'mic' && conversationUnavailableReason) throw new Error(conversationUnavailableReason)
+      // Unlock playback within the user gesture, before permission/network awaits.
+      const audioContext = new AudioContext()
+      audioContextRef.current = audioContext
+      const unlocked = audioContext.resume()
+      if (headphonesConfirmed && audioSource === 'mic') await checkOpusSupport()
+      await unlocked
 
       // Step 1: Get microphone access (skip for tab-only)
       let micStream: MediaStream | null = null
@@ -582,12 +622,6 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
         setCurrentStep('mic')
         micStream = await getMicrophoneAccess()
       }
-
-      // Create AudioContext at 16kHz to match the backend pipeline expectation.
-      // The browser will internally resample from the mic's native rate (e.g. 48kHz).
-      const audioContext = new AudioContext({ sampleRate: 16000 })
-      audioContextRef.current = audioContext
-      log(`AudioContext created, sample rate: ${audioContext.sampleRate}Hz`)
 
       // Step 1b: Get display/tab audio if needed. Try the share picker first and
       // fall back to a loopback input only if it produced no audio track — feature
@@ -634,12 +668,13 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
         lastErrorTime: new Date()
       }))
       cleanup()
-    }
-  }, [getMicrophoneAccess, getDisplayAudio, getMonitorAudio, monitorDeviceId, audioSource, connectAudioSession, startAudioSession, startAudioStreaming, cleanup, cleanupTransport])
+    } finally { startingRef.current = false }
+  }, [headphonesConfirmed, conversationUnavailableReason, getMicrophoneAccess, getDisplayAudio, getMonitorAudio, monitorDeviceId, audioSource, connectAudioSession, startAudioSession, startAudioStreaming, cleanup, cleanupTransport])
 
   // Stop recording function
   const stopRecording = useCallback(() => {
-    if (!isRecording) return
+    if (!isRecording || stoppingRef.current) return
+    stoppingRef.current = true
 
     log('Stopping recording')
     setCurrentStep('stopping')
@@ -647,24 +682,61 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     // Stop audio processing
     audioProcessingStartedRef.current = false
 
-    void audioSessionRef.current?.stop().catch(error => setError(error instanceof Error ? error.message : 'Audio V2 stop failed'))
-
-    // Stop privacy-sensitive capture immediately, but keep the protocol
-    // transport alive long enough for the just-finalized turn to respond.
+    const session = audioSessionRef.current
+    const stopped = session?.stop()
     cleanupCapture()
-    responseDrainActiveRef.current = true
-    responseDrainTimeoutRef.current = setTimeout(() => {
-      responseDrainTimeoutRef.current = undefined
-      cleanupTransport()
-    }, RESPONSE_DRAIN_TIMEOUT_MS)
+    setActiveWakeClientId(null)
+    setVoiceProcessing(null)
+    setPlaybackActivity('idle')
+    setConversationReady(false)
+    setConversationStarting(false)
+    setConversationState(null)
 
-    // Reset state
-    setIsRecording(false)
-    setRecordingDuration(0)
-    setCurrentStep('idle')
+    // Keep the busy state and unload guard until buffered audio has drained and
+    // the server acknowledges captureStopped. The microphone is already off.
+    void Promise.resolve(stopped).then(() => {
+      setCurrentStep('idle')
+      log('Recording stopped')
+    }).catch(error => {
+      setError(error instanceof Error ? error.message : 'Audio V2 stop failed')
+      setCurrentStep('error')
+    }).finally(() => {
+      if (audioSessionRef.current === session) audioSessionRef.current = null
+      stoppingRef.current = false
+      setIsRecording(false)
+      setRecordingDuration(0)
+    })
+  }, [isRecording, cleanupCapture])
 
-    log('Recording stopped')
-  }, [isRecording, cleanupCapture, cleanupTransport])
+  const startConversation = useCallback(async (memorySpaceId?: string, threadId?: string) => {
+    if (stoppingRef.current) return
+    setConversationError(null)
+    if (!headphonesConfirmed || audioSource !== 'mic') {
+      setConversationError('Confirm headphones and select microphone capture before starting a conversation.')
+      return
+    }
+    if (conversationUnavailableReason) { setConversationError(conversationUnavailableReason); return }
+    try {
+      if (!audioSessionRef.current) await startRecording(memorySpaceId)
+      const session = audioSessionRef.current
+      if (!session) return
+      await audioContextRef.current?.resume()
+      setConversationStarting(true)
+      session.startConversation(voiceEngine, threadId)
+    } catch (cause) {
+      setConversationStarting(false)
+      setConversationError(cause instanceof Error ? cause.message : 'Conversation could not start')
+    }
+  }, [headphonesConfirmed, audioSource, conversationUnavailableReason, startRecording, voiceEngine])
+
+  const endConversation = useCallback(() => {
+    try { audioSessionRef.current?.endConversation() }
+    catch (cause) { setConversationError(cause instanceof Error ? cause.message : 'Conversation could not end') }
+  }, [])
+  const cancelVoiceTask = useCallback((taskId: string) => {
+    try { audioSessionRef.current?.cancelTask(taskId) }
+    catch (cause) { setConversationError(cause instanceof Error ? cause.message : 'Task cancellation could not be sent') }
+  }, [])
 
   // Stop recording when user logs out
   useEffect(() => {
@@ -689,21 +761,22 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload)
   }, [isRecording])
 
-  // NOTE: No cleanup on unmount - recording persists across navigation
-  // This is intentional for the global recording feature
+  // The global provider survives navigation; actual owner disposal must release audio.
+  useEffect(() => () => cleanup(), [cleanup])
 
   const contextValue = useMemo<RecordingContextType>(() => ({
     currentStep,
     isRecording,
     recordingDuration,
     error,
-    mode,
     liveTranscript,
     startRecording,
     stopRecording,
-    setMode,
     audioSource,
     setAudioSource,
+    headphonesConfirmed, setHeadphonesConfirmed, voiceEngine, setVoiceEngine,
+    voiceProcessing, playbackActivity, conversationState, conversationError, conversationStarting, conversationReady, conversationUnavailableReason,
+    startConversation, endConversation, cancelVoiceTask,
     availableDevices,
     selectedDeviceId,
     setSelectedDeviceId,
@@ -718,9 +791,11 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     canAccessMicrophone,
     likelyLacksDisplayAudio
   }), [
-    currentStep, isRecording, recordingDuration, error, mode, liveTranscript,
-    startRecording, stopRecording, setMode,
+    currentStep, isRecording, recordingDuration, error, liveTranscript,
+    startRecording, stopRecording,
     audioSource, setAudioSource,
+    headphonesConfirmed, voiceEngine, voiceProcessing, playbackActivity, conversationState, conversationError, conversationStarting, conversationReady, conversationUnavailableReason,
+    startConversation, endConversation, cancelVoiceTask,
     availableDevices, selectedDeviceId, setSelectedDeviceId,
     monitorDeviceId, setMonitorDeviceId, requestDeviceAccess, systemAudioLabel, systemAudioStatus,
     analyserState, debugStats, formatDuration, canAccessMicrophone

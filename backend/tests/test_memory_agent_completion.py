@@ -173,8 +173,9 @@ async def test_tool_chat_falls_back_when_latency_sensitive_primary_never_returns
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inspection_tool", ["read_note", "read_slice"])
 async def test_search_uses_one_no_tool_synthesis_after_tool_round_cap(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, inspection_tool
 ):
     note = tmp_path / "Topics" / "Synthetic.md"
     note.parent.mkdir()
@@ -182,7 +183,7 @@ async def test_search_uses_one_no_tool_synthesis_after_tool_round_cap(
     tool_call = SimpleNamespace(
         id="tool-1",
         function=SimpleNamespace(
-            name="read_note",
+            name=inspection_tool,
             arguments='{"path":"Topics/Synthetic.md"}',
         ),
     )
@@ -381,6 +382,9 @@ async def test_direct_search_caps_all_tool_calls_in_multi_call_turn(
         def dispatch(self, name, args):
             dispatched.append((name, args))
             return f"Evidence from {args['path']}"
+
+        def inspection_path(self, path):
+            return path
 
     async def fake_prompt(*_args, **_kwargs):
         return "search system"

@@ -34,7 +34,7 @@ function humanCron(expr: string): string {
 
 function formatTs(iso: string | null): string {
   if (!iso) return 'Never'
-  return new Date(iso).toLocaleString()
+  return `${new Date(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' })} IST`
 }
 
 export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
@@ -96,7 +96,7 @@ export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
         Automation &amp; Schedules
       </h3>
       <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-        Whether each background job runs, and when. Trigger any of them on demand with Run; model training also has a run button on the Training page.
+        Next runs are shown in IST. Enabling or disabling a job takes effect immediately.
       </p>
 
       {error && (
@@ -137,12 +137,19 @@ export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
                   </div>
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{job.description}</p>
 
+                  <p className="mt-1.5 text-xs text-gray-700 dark:text-gray-300">
+                    Next: {job.enabled ? (job.next_run ? formatTs(job.next_run) : 'Not scheduled') : 'Paused'}
+                  </p>
+                  <details className="mt-1.5 text-xs">
+                    <summary className="cursor-pointer text-gray-600 dark:text-gray-400">Schedule and last run</summary>
                   <div className="mt-1.5 flex items-center gap-2 text-xs">
                     <Clock className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
                     {editing === job.job_id ? (
                       <div className="flex items-center gap-1">
+                        <span>Cron (UTC)</span>
                         <input
                           type="text"
+                          aria-label="Cron schedule (UTC)"
                           value={scheduleInput}
                           onChange={(e) => setScheduleInput(e.target.value)}
                           onKeyDown={(e) => {
@@ -157,7 +164,7 @@ export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
                       </div>
                     ) : (
                       <>
-                        <span className="text-gray-700 dark:text-gray-300">{humanCron(job.schedule)}</span>
+                        <span className="text-gray-700 dark:text-gray-300">{humanCron(job.schedule)} (UTC)</span>
                         <span className="font-mono text-gray-400">({job.schedule})</span>
                         <IconButton
                           label="Edit schedule"
@@ -169,9 +176,11 @@ export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
                     )}
                   </div>
                   <div className="mt-1 text-[11px] text-gray-400">
-                    Last: {formatTs(job.last_run)} · Next: {job.enabled ? formatTs(job.next_run) : 'paused'}
+                    Last run: {formatTs(job.last_run)}
                     {job.last_error && <span className="text-red-500"> · error: {String(job.last_error).slice(0, 60)}</span>}
                   </div>
+
+                  </details>
 
                   {/* Suggestion-review controls (this job produces AI suggestions to review). */}
                   {job.job_id === 'annotation_suggestions' && (

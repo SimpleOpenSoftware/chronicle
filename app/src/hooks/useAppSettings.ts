@@ -11,6 +11,7 @@ import {
 } from '../utils/storage';
 import { recoverBackendUrl } from '../services/serviceManager';
 import { httpUrlToWebSocketUrl } from '../utils/urlConversion';
+import { onTokenRefreshed } from '../services/auth';
 
 const DEFAULT_WS_URL = 'ws://localhost:8000/ws/audio';
 
@@ -34,6 +35,8 @@ export const useAppSettings = (): AppSettings => {
   const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(null);
   const [jwtToken, setJwtToken] = useState<string | null>(null);
   const [autoReconnectEnabled, setAutoReconnectEnabled] = useState<boolean>(true);
+
+  useEffect(() => onTokenRefreshed(setJwtToken), []);
 
   useEffect(() => {
     const loadSettings = async () => {

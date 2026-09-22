@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Application from 'expo-application';
 import * as Updates from 'expo-updates';
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
@@ -139,9 +140,13 @@ export async function initLogger(): Promise<void> {
       `sessionId=${sessionId}`,
       `time=${ts()}`,
       `platform=${Platform.OS} ${Platform.Version}`,
-      `appVersion=${Constants.expoConfig?.version ?? 'unknown'}`,
-      `nativeAppVersion=${(Constants as any).nativeAppVersion ?? 'unknown'}`,
-      `nativeBuildVersion=${(Constants as any).nativeBuildVersion ?? 'unknown'}`,
+      `appVersion=${Application.nativeApplicationVersion ?? 'unknown'}`,
+      `nativeAppVersion=${Application.nativeApplicationVersion ?? 'unknown'}`,
+      `nativeBuildVersion=${Application.nativeBuildVersion ?? 'unknown'}`,
+      `applicationId=${Application.applicationId ?? 'unknown'}`,
+      `applicationName=${Application.applicationName ?? 'unknown'}`,
+      `configuredAppVersion=${Constants.expoConfig?.version ?? 'unknown'}`,
+      `executionEnvironment=${Constants.executionEnvironment ?? 'unknown'}`,
       `updates: ${describeUpdatesState()}`,
       '=====================================================',
       '',

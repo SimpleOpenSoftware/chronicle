@@ -4,6 +4,8 @@
 
 @layer base {
   :root {
+    --chronicle-navigation: #f2ece2;
+    --chronicle-border-subtle: #ded5c7;
     --tape-paper: #fbf8f1;
     --tape-paper-raised: #fffdf8;
     --tape-ink: #322d28;
@@ -21,20 +23,27 @@
   }
 
   .dark {
-    --tape-paper: #211f1b;
-    --tape-paper-raised: #292620;
+    --chronicle-navigation: #211b15;
+    --chronicle-border-subtle: #3b332a;
+    --tape-paper: #252019;
+    --tape-paper-raised: #302a22;
     --tape-ink: #f3eadc;
-    --tape-line: #4b4439;
+    --tape-line: #5d5142;
     --tape-grid: rgba(239, 226, 207, 0.13);
     --tape-track: #353128;
     --tape-chip: #3b362d;
     --tape-chip-hover: #494238;
     --tape-media: #e2763f;
     --tape-conversation: #65a6c7;
-    --tape-activity: #c4b8a7;
+    --tape-activity: #c9bfae;
     --tape-background: #8f806d;
     --tape-focus: #ef8a55;
     --tape-selected: #3b2a20;
+  }
+
+  :where(button, a, input, select, textarea, summary):focus-visible {
+    outline: 2px solid var(--tape-focus);
+    outline-offset: 3px;
   }
 
   html {

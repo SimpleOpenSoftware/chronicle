@@ -28,9 +28,9 @@ export default function MemorySelectionPanel({ day, timezone, snapshotId, episod
     },
   })
   const error = submit.error as { response?: { data?: { detail?: string } }; message?: string } | null
-  return <section className="rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper)] p-3" aria-label="Select episodes for memory">
+  return <section className="rounded-lg border border-[var(--tape-line)] bg-[var(--tape-paper)] p-3 text-[var(--tape-ink)]" aria-label="Select episodes for memory">
     <div className="flex flex-wrap items-center justify-between gap-2">
-      <div><h2 className="text-sm font-semibold">Remember selected episodes</h2><p className="mt-1 text-xs text-gray-500">Review what matters now. Everything else stays available for later.</p></div>
+      <div><h2 className="text-sm font-semibold">Remember selected episodes</h2><p className="mt-1 text-xs text-gray-500 dark:text-gray-300">Review what matters now. Everything else stays available for later.</p></div>
       <Link to={`/memory-ledger?view=review&date=${day}`} className="text-sm font-semibold text-[var(--tape-focus)] hover:underline">Review memory proposals</Link>
     </div>
     <details className="mt-3" open={selected.size > 0 || undefined}>
@@ -42,7 +42,7 @@ export default function MemorySelectionPanel({ day, timezone, snapshotId, episod
           const busy = selections.data?.proposals.some(p => p.active && p.selected_episodes.some(r => `${r.episode_key}:${r.revision}` === token))
           return <label key={token} className="flex items-start gap-2 rounded p-2 hover:bg-[var(--tape-paper-raised)]">
             <input type="checkbox" className="mt-1" disabled={busy || submit.isPending} checked={selected.has(token)} onChange={() => setSelected(value => { const next = new Set(value); next.has(token) ? next.delete(token) : next.add(token); return next })} />
-            <span className="min-w-0 text-sm"><span className="font-medium">{episode.title}</span><span className="mt-0.5 block text-xs text-gray-500">{new Date(episode.started_at).toLocaleString('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })} · {outcome?.state.replace(/_/g, ' ') || 'undecided'}{episode.memory_policy === 'reference' ? ' · reference only' : ''}{outcome && ` · ${outcome.accepted_changes} accepted, ${outcome.rejected_changes} rejected${outcome.daily_recorded ? ' · in Daily' : ''}`}</span></span>
+            <span className="min-w-0 text-sm"><span className="font-medium">{episode.title}</span><span className="mt-0.5 block text-xs text-gray-500 dark:text-gray-300">{new Date(episode.started_at).toLocaleString('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })} · {outcome?.state.replace(/_/g, ' ') || 'undecided'}{episode.memory_policy === 'reference' ? ' · reference only' : ''}{outcome && ` · ${outcome.accepted_changes} accepted, ${outcome.rejected_changes} rejected${outcome.daily_recorded ? ' · in Daily' : ''}`}</span></span>
           </label>
         })}
       </div>

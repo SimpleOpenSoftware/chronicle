@@ -1,10 +1,12 @@
+import ServiceDeployments from '../components/ServiceDeployments'
+import PrivacyScreeningStatus from '../components/PrivacyScreeningStatus'
 import { useState } from 'react'
 import { Network as NetworkIcon, RefreshCw, CheckCircle, XCircle, Wifi, WifiOff, Radio, Search, Server, Smartphone, Pencil, Trash2, Check, X, Monitor, Link2, Copy } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
 import { systemApi, clientsApi, deviceInputApi } from '../services/api'
 import { timeAgo } from '../utils/timeAgo'
-import { Button, IconButton } from '../components/ui'
+import { Alert, Button, IconButton } from '../components/ui'
 
 interface DiscoveredService {
   name: string
@@ -104,7 +106,7 @@ export default function Network() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draftName, setDraftName] = useState('')
 
-  const { data, isLoading, refetch, dataUpdatedAt } = useQuery<NetworkData>({
+  const { data, isLoading, isError: networkError, refetch, dataUpdatedAt } = useQuery<NetworkData>({
     queryKey: ['system', 'network'],
     queryFn: async () => {
       const response = await systemApi.getNetworkDiscovery()
@@ -184,7 +186,7 @@ export default function Network() {
         <div className="flex items-center space-x-4">
           {lastUpdated && (
             <span className="text-sm text-gray-600 dark:text-gray-400">
-              Last scan: {lastUpdated.toLocaleTimeString()}
+              Last scan: {lastUpdated.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
             </span>
           )}
           <Button
@@ -199,8 +201,10 @@ export default function Network() {
         </div>
       </div>
 
+      <ServiceDeployments />
+
       {/* Capture inputs */}
-      <section className="mb-6 rounded-lg border border-gray-200 bg-white p-6 dark:border-gray-700 dark:bg-gray-800">
+      <section className="mb-6 rounded-lg border border-gray-200 bg-white p-4 sm:p-6 dark:border-gray-700 dark:bg-gray-800">
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="flex items-center text-lg font-semibold text-gray-900 dark:text-gray-100">
@@ -226,7 +230,7 @@ export default function Network() {
           <div className="mb-4 flex flex-wrap items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-gray-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-gray-200">
             <span>
               Pairing code <code className="mx-1 font-mono font-bold">{pairing.data.code}</code>
-              expires {new Date(pairing.data.expires_at).toLocaleTimeString()}.
+              expires {new Date(pairing.data.expires_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.
             </span>
             <IconButton label="Copy pairing code" onClick={() => navigator.clipboard.writeText(pairing.data!.code)}>
               <Copy className="h-4 w-4" />
@@ -240,27 +244,39 @@ export default function Network() {
 
         <div className="divide-y divide-gray-100 rounded-md border border-gray-200 dark:divide-gray-700 dark:border-gray-700">
           {(sources.data || []).map(source => (
-            <div key={source.source_id} className="flex items-center gap-3 px-4 py-3">
+            <div key={source.source_id} className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 px-3 py-3 sm:flex sm:items-start sm:px-4">
               <Monitor className="h-5 w-5 shrink-0 text-gray-400" />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-medium text-gray-900 dark:text-gray-100">{source.name}</div>
                 <div className="text-xs text-gray-500 dark:text-gray-400">{source.provider} · {source.platform}</div>
+                {source.provider === 'screenpipe' && <div className={`text-xs ${source.privacy_enabled_from ? 'text-gray-500 dark:text-gray-400' : 'text-amber-700 dark:text-amber-400'}`}>
+                  {source.privacy_waiting_from
+                    ? 'Waiting for local screening · processing held'
+                    : source.privacy_enabled_from
+                      ? 'Privacy screening enabled · unresolved captures held'
+                      : 'Privacy screening not active · source unprotected'}
+                </div>}
+                {source.provider === 'screenpipe' && <PrivacyScreeningStatus value={source.health.privacy_screening} />}
               </div>
-              <div className={`shrink-0 text-right text-xs ${source.status === 'online' ? 'text-green-600 dark:text-green-400' : source.status === 'error' ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
+              <div className={`col-start-2 shrink-0 text-xs sm:text-right ${source.status === 'online' ? 'text-green-600 dark:text-green-400' : source.status === 'error' ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'}`}>
                 <div className="font-medium">{sourceStatusLabel(source.status)}</div>
-                {source.last_seen_at && <div>{timeAgo(source.last_seen_at)}</div>}
+                {source.last_seen_at && <div>Last seen {timeAgo(source.last_seen_at)}</div>}
               </div>
             </div>
           ))}
+          {sources.isError && <div className="px-4 py-5 text-sm text-red-600 dark:text-red-400">Capture sources could not be loaded.</div>}
           {sources.isLoading && (
             <div className="px-4 py-5 text-sm text-gray-500 dark:text-gray-400">Loading capture sources…</div>
           )}
-          {!sources.isLoading && !sources.data?.length && (
+          {!sources.isLoading && !sources.isError && !sources.data?.length && (
             <div className="px-4 py-5 text-sm text-gray-500 dark:text-gray-400">No capture sources paired.</div>
           )}
         </div>
       </section>
 
+      {networkError && <Alert tone="warning" className="mb-6">Network discovery is unavailable. Scan again to retry.</Alert>}
+
+      {(!networkError || data) && <>
       {/* Tailscale Status */}
       <div className={`rounded-lg p-4 border mb-6 ${
         loading && !data
@@ -286,7 +302,7 @@ export default function Network() {
               <div>
                 <span className="font-medium text-green-800 dark:text-green-200">Tailscale Connected</span>
                 <p className="text-sm text-green-600 dark:text-green-400">
-                  Service discovery via minidisc is active. Services on your Tailnet can find each other automatically.
+                  Service discovery is available.
                 </p>
               </div>
             </>
@@ -294,9 +310,9 @@ export default function Network() {
             <>
               <WifiOff className="h-5 w-5 text-yellow-600 dark:text-yellow-400" />
               <div>
-                <span className="font-medium text-yellow-800 dark:text-yellow-200">Tailscale Not Detected</span>
+                <span className="font-medium text-yellow-800 dark:text-yellow-200">{networkError ? 'Tailscale status unavailable' : 'Tailscale Not Detected'}</span>
                 <p className="text-sm text-yellow-600 dark:text-yellow-400">
-                  {data?.error
+                  {networkError ? 'The discovery request failed.' : data?.error
                     ? data.error
                     : 'Install Tailscale and mount the socket to enable automatic service discovery across machines.'}
                 </p>
@@ -365,12 +381,12 @@ export default function Network() {
                       <span className="font-medium text-gray-900 dark:text-gray-100 font-mono text-sm">{host}</span>
                       {nodeEntry && (
                         <span className="text-xs px-1.5 py-0.5 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 rounded">
-                          node
+                          managed node
                         </span>
                       )}
                       {hasEdge && (
                         <span className="text-xs px-1.5 py-0.5 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300 rounded">
-                          edge
+                          discovery only
                         </span>
                       )}
                       {arch && (
@@ -402,7 +418,7 @@ export default function Network() {
                                 </span>
                                 {hb && (
                                   <span className={`text-xs px-1.5 py-0.5 rounded ${hb.cls}`}>
-                                    {hb.text}
+                                    Node: {hb.text}
                                   </span>
                                 )}
                                 {isLocal && svc.url && (
@@ -424,11 +440,10 @@ export default function Network() {
                             </div>
                             <div className="ml-3 flex-shrink-0">
                               {svc.url ? (
-                                svc.reachable ? (
-                                  <CheckCircle className="h-5 w-5 text-green-500" />
-                                ) : (
-                                  <XCircle className="h-5 w-5 text-yellow-500" />
-                                )
+                                <span className="inline-flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300" title={svc.error || undefined}>
+                                  {svc.reachable ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-yellow-500" />}
+                                  Backend probe: {svc.reachable ? 'reachable' : 'unreachable'}
+                                </span>
                               ) : (
                                 <span className="text-xs text-gray-400 dark:text-gray-500">not found</span>
                               )}
@@ -528,36 +543,7 @@ export default function Network() {
         )}
       </div>
 
-      {/* Legend */}
-      <div className="bg-gray-50 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600 p-4">
-        <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Status Legend</h4>
-        <div className="flex flex-wrap gap-4 text-sm text-gray-600 dark:text-gray-400">
-          <div className="flex items-center space-x-1.5">
-            <CheckCircle className="h-4 w-4 text-green-500" />
-            <span>Reachable (this backend's probe)</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <XCircle className="h-4 w-4 text-yellow-500" />
-            <span>Found but /health unreachable</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="text-xs px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300">healthy</span>
-            <span>Source node's own health (live)</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="text-xs px-1.5 py-0.5 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 rounded">node</span>
-            <span>Full node agent (control + advertise)</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="text-xs px-1.5 py-0.5 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300 rounded">edge</span>
-            <span>Advertise-only edge node</span>
-          </div>
-          <div className="flex items-center space-x-1.5">
-            <span className="text-xs px-1.5 py-0.5 bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300 rounded">GPU</span>
-            <span>NVIDIA GPU present</span>
-          </div>
-        </div>
-      </div>
+      </>}
     </div>
   )
 }

@@ -41,6 +41,7 @@ dependencies = [
     "minidisc-python>=0.1.0",
     "ten-vad @ git+https://github.com/TEN-framework/ten-vad.git@22a3bcd4509d0faaa8eef4881e8af5f39c178950",
     "pillow>=11,<13",
+    "num2words==0.5.14",
 ]
 
 [project.optional-dependencies]
@@ -62,6 +63,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"backend.services.memory.agent" = ["*.mjs"]
 
 [tool.isort]
 profile = "black"
@@ -133,6 +137,7 @@ directory = "coverage-reports/html"
 
 [dependency-groups]
 dev = [
+    "mongomock-motor>=0.0.36,<1",
     "black>=25.1.0",
     "isort>=6.0.1",
     "pre-commit>=4.2.0",

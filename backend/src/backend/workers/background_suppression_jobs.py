@@ -15,6 +15,7 @@ import logging
 import numpy as np
 
 from backend.models.conversation import Conversation
+from backend.services import privacy
 from backend.workers import background_suppression
 
 logger = logging.getLogger(__name__)
@@ -32,22 +33,45 @@ def _normalise(rows: list[list[float]]) -> np.ndarray:
     return matrix
 
 
-async def _exemplar_matrices(user_id: str) -> tuple[dict[str, np.ndarray], np.ndarray]:
+async def _exemplar_matrices(
+    user_id: str, *, visibility: privacy.ConversationPrivacyFilter | None = None
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    visibility = visibility or privacy.ConversationPrivacyFilter()
     database = _database()
     by_type: dict[str, list[list[float]]] = {}
-    async for doc in database["background_clips"].find(
-        {"user_id": user_id, "embedding": {"$ne": None}},
-        {"embedding": 1, "bucket_type": 1},
-    ):
+    references = [
+        doc
+        async for doc in database["background_clips"].find(
+            {"user_id": user_id, "embedding": {"$ne": None}},
+            {
+                "embedding": 1,
+                "bucket_type": 1,
+                "conversation_id": 1,
+                "user_id": 1,
+                "privacy_reference_receipt": 1,
+            },
+        )
+    ]
+    for doc in await visibility.filter_embeddings(references):
         bucket_type = doc.get("bucket_type")
         if bucket_type:
             by_type.setdefault(bucket_type, []).append(doc["embedding"])
-    foreground = [
-        doc["embedding"]
+    foreground_rows = [
+        doc
         async for doc in database["background_foreground_clips"].find(
-            {"requested_by": user_id, "embedding": {"$ne": None}}, {"embedding": 1}
+            {"requested_by": user_id, "embedding": {"$ne": None}},
+            {
+                "embedding": 1,
+                "conversation_id": 1,
+                "requested_by": 1,
+                "privacy_reference_receipt": 1,
+            },
         )
     ]
+    foreground = [
+        doc["embedding"] for doc in await visibility.filter_embeddings(foreground_rows)
+    ]
+    await visibility.assert_current()
     return (
         {kind: _normalise(rows) for kind, rows in by_type.items()},
         _normalise(foreground) if foreground else np.zeros((0, 1), dtype=np.float32),
@@ -69,6 +93,10 @@ async def backfill_conversation_suppressions(
     user_id: str, conversation_id: str
 ) -> dict:
     """Score one conversation's indexed clips against the current buckets."""
+    visibility = privacy.ConversationPrivacyFilter()
+    if not await visibility.filter([{"conversation_id": conversation_id}]):
+        raise privacy.PrivacyHeld()
+    await visibility.assert_current()
     if await _is_upload_conversation(conversation_id):
         return {"conversation_id": conversation_id, "skipped": "upload"}
     if await background_suppression.get_subject_override(user_id, conversation_id):
@@ -86,10 +114,12 @@ async def backfill_conversation_suppressions(
             {"_id": 0},
         )
     ]
+    rows = await visibility.filter_embeddings(rows)
     if not rows:
         return {"conversation_id": conversation_id, "skipped": "no_indexed_clips"}
 
-    buckets, foreground = await _exemplar_matrices(user_id)
+    buckets, foreground = await _exemplar_matrices(user_id, visibility=visibility)
+    await visibility.assert_current()
     if not buckets:
         return {"conversation_id": conversation_id, "skipped": "no_exemplars"}
 
@@ -129,8 +159,13 @@ async def backfill_conversation_suppressions(
             }
         )
     written = await background_suppression.record_conversation_suppressions(
-        conversation_id, user_id, records, source="backfill"
+        conversation_id,
+        user_id,
+        records,
+        source="backfill",
+        privacy_visibility=visibility,
     )
+    await visibility.assert_current()
     return {"conversation_id": conversation_id, "written": written}
 
 
@@ -139,9 +174,13 @@ async def backfill_all_suppressions(user_id: str, limit: int = 500) -> dict:
     conversation_ids = await _database()["background_corpus_embeddings"].distinct(
         "conversation_id", {"requested_by": user_id}
     )
-    results = {"conversations": 0, "written": 0, "skipped": 0}
+    results = {"conversations": 0, "written": 0, "skipped": 0, "privacy_held": 0}
     for conversation_id in conversation_ids[:limit]:
-        outcome = await backfill_conversation_suppressions(user_id, conversation_id)
+        try:
+            outcome = await backfill_conversation_suppressions(user_id, conversation_id)
+        except privacy.PrivacyHeld:
+            results["privacy_held"] += 1
+            continue
         results["conversations"] += 1
         if "written" in outcome:
             results["written"] += outcome["written"]

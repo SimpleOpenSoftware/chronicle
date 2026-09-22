@@ -22,6 +22,7 @@ from rq import get_current_job
 from rq.exceptions import NoSuchJobError
 from rq.job import Dependency, Job
 
+import backend.services.privacy as privacy
 from backend.config import (
     get_batch_chunk_seconds,
     get_diarization_settings,
@@ -79,10 +80,7 @@ from backend.services.transcription import (
     get_transcription_provider,
     is_transcription_available,
 )
-from backend.services.transcription.context import (
-    gather_transcription_context,
-    get_asr_context,
-)
+from backend.services.transcription.context import gather_transcription_context
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.utils.audio_chunk_utils import (
     reconstruct_audio_segment,
@@ -400,6 +398,7 @@ async def transcribe_audio_range(
     progress_callback=None,
     audio_ranges: list[AudioRangeRef] | None = None,
     provider_model_name: str | None = None,
+    context_privacy_checks: list | None = None,
 ) -> dict:
     """
     Reconstruct audio for a time range and transcribe it.
@@ -421,6 +420,20 @@ async def transcribe_audio_range(
     Returns:
         Dict with text, segments, words, provider_name, provider_capabilities, wav_size, sample_rate
     """
+
+    privacy_checks = list(context_privacy_checks or [])
+    for owner, snapshot in privacy_checks:
+        await privacy.assert_current(owner, snapshot)
+    privacy_checks.extend(
+        await privacy.require_audio_ranges(audio_ranges) if audio_ranges else []
+    )
+    if conversation_id:
+        checked = await privacy.require_conversation(conversation_id)
+        if checked:
+            owner_row = await Conversation.find_one(
+                Conversation.conversation_id == conversation_id
+            )
+            privacy_checks.append((owner_row.user_id, checked))
     provider = (
         RegistryBatchTranscriptionProvider(model_name=provider_model_name)
         if provider_model_name
@@ -549,7 +562,12 @@ async def transcribe_audio_range(
             transcribe_kwargs["context_info"] = context_info
 
         try:
+            for privacy_owner, privacy_snapshot in privacy_checks:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
+            transcribe_kwargs["privacy_checks"] = privacy_checks
             result = await provider.transcribe(**transcribe_kwargs)
+            for privacy_owner, privacy_snapshot in privacy_checks:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
         except ConnectionError as e:
             raise RuntimeError(str(e))
         except RuntimeError:
@@ -579,11 +597,16 @@ async def transcribe_audio_range(
             wav_data,
             actual_sample_rate,
             diarize=diarize,
+            context_info=context_info,
         )
+        for privacy_owner, privacy_snapshot in privacy_checks:
+            await privacy.assert_current(privacy_owner, privacy_snapshot)
         if cached_result is not None:
             cached_result = await _align_result_words(cached_result, wav_data)
             if condense_map:
                 cached_result = remap_condensed_result(cached_result, condense_map)
+            for privacy_owner, privacy_snapshot in privacy_checks:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
             return {
                 "text": cached_result.get("text", ""),
                 "segments": cached_result.get("segments", []),
@@ -648,7 +671,12 @@ async def transcribe_audio_range(
             transcribe_kwargs["context_info"] = context_info
 
         try:
+            for privacy_owner, privacy_snapshot in privacy_checks:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
+            transcribe_kwargs["privacy_checks"] = privacy_checks
             result = await provider.transcribe(**transcribe_kwargs)
+            for privacy_owner, privacy_snapshot in privacy_checks:
+                await privacy.assert_current(privacy_owner, privacy_snapshot)
         except ConnectionError as e:
             raise RuntimeError(str(e))
         except RuntimeError:
@@ -730,6 +758,7 @@ async def process_transcription_result(
     user_id: str | None = None,
     client_id: str | None = None,
     transcript_artifact: TranscriptArtifact | None = None,
+    context_reference_receipt: list[str] | None = None,
 ) -> dict:
     """
     Post-transcription processing: plugin dispatch, speech validation, segment processing,
@@ -738,6 +767,8 @@ async def process_transcription_result(
     Returns:
         Dict with processing results including transcript data for downstream jobs
     """
+
+    await privacy.require_conversation(conversation_id)
     conversation = await Conversation.find_one(
         Conversation.conversation_id == conversation_id
     )
@@ -746,6 +777,13 @@ async def process_transcription_result(
 
     if user_id is None:
         user_id = str(conversation.user_id) if conversation.user_id else None
+    context_visibility = privacy.ConversationPrivacyFilter()
+    context_provenance = {}
+    if context_reference_receipt:
+        await context_visibility.require_reference_receipt(
+            str(user_id), context_reference_receipt
+        )
+        context_provenance = {"privacy_reference_receipt": context_reference_receipt}
     if client_id is None:
         client_id = (
             conversation.client_id if hasattr(conversation, "client_id") else None
@@ -805,6 +843,7 @@ async def process_transcription_result(
             words=words,
             segments=segments,
             raw_response={
+                **context_provenance,
                 "provider_capabilities": provider_capabilities,
                 "trigger": trigger,
                 "wav_size": wav_size,
@@ -850,6 +889,7 @@ async def process_transcription_result(
         }
 
     # Trigger transcript-level plugins BEFORE speech validation
+    await context_visibility.assert_current()
     if transcript_text and not conversation.memory_excluded:
         try:
             await dispatch_or_defer_space_event(
@@ -865,9 +905,11 @@ async def process_transcription_result(
                     "segments": segments,
                     "word_count": len(words),
                 },
-                metadata={"client_id": client_id},
+                metadata={"client_id": client_id, **context_provenance},
                 description=f"conversation={conversation_id[:12]}, words={len(words)}",
             )
+        except privacy.PrivacyHeld:
+            raise
         except Exception as e:
             logger.exception(
                 f"⚠️ Error triggering transcript plugins in batch mode: {e}"
@@ -1026,6 +1068,7 @@ async def process_transcription_result(
     ]
 
     metadata = {
+        **context_provenance,
         "trigger": trigger,
         "audio_file_size": wav_size,
         "word_count": len(words),
@@ -1053,7 +1096,8 @@ async def process_transcription_result(
         conversation.title = TITLE_NOT_GENERATED
         conversation.summary = "No speech detected"
 
-    await conversation.save()
+    async with context_visibility.publication():
+        await conversation.save()
     await _settle_audio_evidence_span(conversation, len(words), "transcribed")
 
     # Trim the conversation's silence now that its transcript is attached and active.
@@ -1095,13 +1139,14 @@ async def process_transcription_result(
         raise ValueError(
             f"Transcript version {version_id} disappeared after transcription"
         )
-    revision = await persist_conversation_revision(
-        conversation,
-        revision_version,
-        retry_key=f"transcript-projection:{conversation_id}:{version_id}",
-        transcript_artifact_ids=[transcript_artifact.artifact_id],
-    )
-    await conversation.save()
+    async with context_visibility.publication():
+        revision = await persist_conversation_revision(
+            conversation,
+            revision_version,
+            retry_key=f"transcript-projection:{conversation_id}:{version_id}",
+            transcript_artifact_ids=[transcript_artifact.artifact_id],
+        )
+        await conversation.save()
 
     await note_conversation_dirty(
         conversation_id,
@@ -1141,12 +1186,12 @@ async def process_transcription_result(
     }
     set_trace_io(
         output={
-            "transcript": transcript_text,
             "word_count": len(words),
             "segment_count": len(speaker_segments),
             "provider": provider_name,
         }
     )
+    await context_visibility.assert_current()
     return result
 
 
@@ -1210,14 +1255,16 @@ async def transcribe_full_audio_job(
 
     # Build ASR context
     context_info = None
+    context_privacy_checks = []
+    context_reference_receipt = []
     try:
         asr_ctx = await gather_transcription_context(user_id=user_id)
         context_info = asr_ctx.combined
+        context_privacy_checks = asr_ctx.privacy_checks
+        context_reference_receipt = asr_ctx.reference_receipt
 
         # Log ASR context as span attributes
         set_span_attrs(
-            asr_hot_words=asr_ctx.hot_words[:200] if asr_ctx.hot_words else "",
-            asr_user_jargon=asr_ctx.user_jargon[:200] if asr_ctx.user_jargon else "",
             asr_context_length=len(context_info),
         )
     except Exception as e:
@@ -1271,6 +1318,7 @@ async def transcribe_full_audio_job(
             conversation_id=conversation_id,
             diarize=request_provider_diarization,
             context_info=context_info,
+            context_privacy_checks=context_privacy_checks,
             progress_callback=_on_batch_progress,
             provider_model_name=provider_model_name,
         )
@@ -1285,6 +1333,7 @@ async def transcribe_full_audio_job(
     processing_time = time.time() - start_time_wall
 
     return await process_transcription_result(
+        context_reference_receipt=context_reference_receipt,
         conversation_id=conversation_id,
         version_id=version_id,
         trigger=trigger,
@@ -1448,8 +1497,13 @@ async def transcription_fallback_check_job(
 
     # Build ASR context
     context_info = None
+    context_privacy_checks = []
+    context_reference_receipt = []
     try:
-        context_info = await get_asr_context(user_id=user_id)
+        asr_ctx = await gather_transcription_context(user_id=user_id)
+        context_info = asr_ctx.combined
+        context_privacy_checks = asr_ctx.privacy_checks
+        context_reference_receipt = asr_ctx.reference_receipt
     except Exception as e:
         logger.warning(f"Failed to build ASR context: {e}")
 
@@ -1460,6 +1514,7 @@ async def transcription_fallback_check_job(
         None,
         diarize=diarization_settings.get("diarization_source") == "provider",
         context_info=context_info,
+        context_privacy_checks=context_privacy_checks,
         audio_ranges=fallback_ranges,
     )
 
@@ -1487,6 +1542,11 @@ async def transcription_fallback_check_job(
         words=words,
         segments=segments,
         raw_response={
+            **(
+                {"privacy_reference_receipt": context_reference_receipt}
+                if context_reference_receipt
+                else {}
+            ),
             "provider_capabilities": result["provider_capabilities"],
             "trigger": "batch_fallback",
             "wav_size": result["wav_size"],
@@ -1517,6 +1577,7 @@ async def transcription_fallback_check_job(
     conv_id = conversation.conversation_id
 
     processing_result = await process_transcription_result(
+        context_reference_receipt=context_reference_receipt,
         conversation_id=conv_id,
         version_id=version_id,
         trigger="batch_fallback",

@@ -2,10 +2,12 @@ import json
 import sqlite3
 import time
 import wave
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from chronicle_screenpipe import collector as collector_module
 from chronicle_screenpipe.collector import (
@@ -17,6 +19,98 @@ from chronicle_screenpipe.collector import (
     infer_audio_track_id,
 )
 from chronicle_screenpipe.meeting import CaptureApp, MeetingTracker, RecorderMeetingLog
+
+
+def test_run_diagnostics_do_not_forward_capture_exception_text(
+    tmp_path, monkeypatch, caplog
+):
+    collector = Collector(
+        Config(
+            backend_url="http://backend",
+            source_id="synthetic-source",
+            token="synthetic-token",
+            screenpipe_dir=tmp_path,
+            privacy_screening=False,
+            poll_seconds=0,
+        ),
+        tmp_path / "state",
+    )
+    posted = []
+
+    def heartbeat_post(_url, json):
+        posted.append(json)
+        raise RuntimeError("PRIVATE_HEARTBEAT_SENTINEL")
+
+    collector.client.close()
+    collector.client = SimpleNamespace(post=heartbeat_post)
+    monkeypatch.setattr(
+        collector_module, "open_screenpipe_db", lambda _: nullcontext(object())
+    )
+    monkeypatch.setattr(collector, "collect_meetings", lambda _: None)
+    monkeypatch.setattr(collector, "collect_observations", lambda _: None)
+
+    def fail_capture(_connection):
+        raise PermissionError(13, "denied", "/synthetic/PRIVATE_CAPTURE_SENTINEL.wav")
+
+    def fail_shutdown():
+        raise ValueError("PRIVATE_SHUTDOWN_SENTINEL")
+
+    def stop(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(collector, "collect_audio", fail_capture)
+    monkeypatch.setattr(collector, "close_observation", fail_shutdown)
+    monkeypatch.setattr(collector_module.time, "sleep", stop)
+    collector.run()
+
+    assert len(posted) == 1
+    assert posted[0]["status"] == "error"
+    diagnostics = caplog.text + json.dumps(posted)
+    assert "PRIVATE_" not in diagnostics
+    assert posted[0]["health"]["error"] == "PermissionError"
+    assert "RuntimeError" in caplog.text
+    assert "ValueError" in caplog.text
+
+
+def test_preview_job_failure_does_not_forward_exception_message_or_url(
+    tmp_path, monkeypatch
+):
+    collector = Collector(
+        Config(
+            backend_url="http://backend",
+            source_id="synthetic-source",
+            token="synthetic-token",
+            screenpipe_dir=tmp_path,
+            privacy_screening=False,
+        ),
+        tmp_path / "state",
+    )
+    job = {"id": "synthetic-job", "kind": "source_media", "payload": {"frame_ids": [1]}}
+    posted = []
+    collector.client.close()
+    collector.client = SimpleNamespace(
+        get=lambda _: SimpleNamespace(
+            raise_for_status=lambda: None, json=lambda: {"job": job}
+        ),
+        post=lambda _url, json: (
+            posted.append(json) or SimpleNamespace(raise_for_status=lambda: None)
+        ),
+    )
+
+    def fail_preview(_job):
+        request = httpx.Request(
+            "GET", "http://recorder.invalid/?query=PRIVATE_URL_SENTINEL"
+        )
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError(
+            "PRIVATE_BODY_SENTINEL", request=request, response=response
+        )
+
+    monkeypatch.setattr(collector, "_serve_preview_batch", fail_preview)
+    assert collector.process_job()
+    assert posted == [
+        {"success": False, "items": [], "error": "HTTPStatusError (HTTP 503)"}
+    ]
 
 
 def test_checkpoints_are_atomic(tmp_path: Path):
@@ -124,7 +218,9 @@ def test_collect_audio_tags_chunks_with_the_active_meeting(tmp_path: Path):
     assert posted["track_id"] == "Microphone (input)"
 
 
-def test_collect_audio_keeps_checkpoint_when_backend_rejects_contract(tmp_path: Path):
+def test_collect_audio_keeps_checkpoint_when_backend_rejects_contract(
+    tmp_path: Path, caplog
+):
     chunk = tmp_path / "Microphone (input)_1.wav"
     with wave.open(str(chunk), "wb") as audio:
         audio.setnchannels(1)
@@ -141,7 +237,10 @@ def test_collect_audio_keeps_checkpoint_when_backend_rejects_contract(tmp_path: 
 
     class RejectingClient:
         def post(self, _url, data=None, files=None):
-            return SimpleNamespace(status_code=422, text="missing track_id")
+            return SimpleNamespace(
+                status_code=422,
+                text='{"detail": "rejected input: PRIVATE_CAPTURE_SENTINEL"}',
+            )
 
     collector = object.__new__(Collector)
     collector.config = Config(
@@ -156,13 +255,18 @@ def test_collect_audio_keeps_checkpoint_when_backend_rejects_contract(tmp_path: 
     collector._recorder_meetings = None
     collector.client = RejectingClient()
 
-    with pytest.raises(RuntimeError, match="checkpoint retained"):
+    with pytest.raises(RuntimeError, match="checkpoint retained") as failure:
         collector.collect_audio(db)
 
     assert collector.checkpoints.get("audio") == 0
     rejection = json.loads(collector.rejections_path.read_text().splitlines()[0])
     assert rejection["source_item_id"] == 1
     assert rejection["status"] == 422
+    assert rejection["detail"] == "backend rejected audio; checkpoint retained"
+    assert "HTTP 422" in caplog.text
+    assert "PRIVATE_CAPTURE_SENTINEL" not in (
+        caplog.text + collector.rejections_path.read_text() + str(failure.value)
+    )
 
 
 def test_collect_meetings_reads_the_recorders_meetings_table(tmp_path: Path):
@@ -573,7 +677,10 @@ def test_an_interval_with_no_frames_yields_an_empty_shortlist(monkeypatch):
     )
 
 
-def test_collect_observations_keeps_interleaved_displays_independent(tmp_path: Path):
+@pytest.mark.parametrize("screening", [False, True])
+def test_collect_observations_keeps_interleaved_displays_independent(
+    tmp_path: Path, screening
+):
     db = sqlite3.connect(":memory:")
     db.row_factory = sqlite3.Row
     db.execute(
@@ -611,7 +718,17 @@ def test_collect_observations_keeps_interleaved_displays_independent(tmp_path: P
     }
     collector.client = FakeClient()
 
+    if screening:
+        from chronicle_screenpipe.screening import ScreeningStore
+
+        collector.screening_store = ScreeningStore(tmp_path / "privacy.sqlite")
+
     assert collector.collect_observations(db) == 2
+    if screening:
+        assert {job["track"] for job in collector.screening_store.jobs()} == {
+            "Display 1",
+            "Display 2",
+        }
     state = json.loads(collector.observations_path.read_text())
     assert state["schema"] == 2
     assert set(state["tracks"]) == {"Display 1", "Display 2"}

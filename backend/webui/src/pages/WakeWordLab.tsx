@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Mic, Radio, Trash2, Check, X, RefreshCw, Target, AlertTriangle, Square, Volume2, ShieldCheck, Eye, HelpCircle, CopyX, ArrowRightLeft, ChevronLeft } from 'lucide-react'
+import { Mic, Radio, Trash2, Check, X, RefreshCw, Target, AlertTriangle, Square, Volume2, Play, CopyX, ArrowRightLeft, ChevronLeft } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { wakewordApi, WakeStream, WakeSample, WakeWordConfig, WakeStats } from '../services/api'
 import { useAuth } from '../contexts/AuthContext'
 import { Alert, Button, Card, IconButton, StatCard, Tabs } from '../components/ui'
+
+import VoiceLatencyReport from '../components/VoiceLatencyReport'
 
 type Bucket = 'pending' | 'positive' | 'negative'
 
@@ -27,6 +29,8 @@ export default function WakeWordLab() {
   const [stats, setStats] = useState<Record<string, WakeStats>>({})
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [modelsError, setModelsError] = useState(false)
+  const [streamsKnown, setStreamsKnown] = useState(false)
   // Bumped after any mutation (label/move/delete/dedupe); every section re-fetches
   // its clips when it changes, so a moved clip appears in the target section with
   // no manual refresh.
@@ -46,9 +50,11 @@ export default function WakeWordLab() {
     try {
       const [s, st] = await Promise.all([wakewordApi.getStreams(), wakewordApi.getStats()])
       setStreams(s.data.streams)
+      setStreamsKnown(true)
       setStats(st.data)
       setError(null)
     } catch (e: any) {
+      setStreamsKnown(false)
       setError(e?.response?.data?.detail || 'Wake-word service unreachable')
     }
   }, [])
@@ -90,8 +96,9 @@ export default function WakeWordLab() {
     try {
       const { data } = await wakewordApi.getModels()
       setWords(data.wakewords)
+      setModelsError(false)
     } catch {
-      setWords([])
+      setModelsError(true)
     }
     await refreshMeta()
     setDataVersion((v) => v + 1)
@@ -148,9 +155,7 @@ export default function WakeWordLab() {
       </button>
 
       <p className="mb-4 text-sm text-gray-600 dark:text-gray-400">
-        Close the training loop, per wake word: review false positives the model fired on,
-        and capture clips of yourself saying that word (false negatives). Each section below
-        is one wake word — labeled clips roll straight into that word's next retrain.
+        Listen to clips and label the exact wake word.
       </p>
 
       {error && (
@@ -159,15 +164,18 @@ export default function WakeWordLab() {
         </Alert>
       )}
 
+      <VoiceLatencyReport />
+
       {/* Shared active-streams indicator */}
       <Card className="mb-6">
         <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-800 dark:text-gray-200">
           <Radio className="h-4 w-4" /> Active streams
         </h2>
-        {streams.length === 0 ? (
+        {!streamsKnown ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">Stream status unavailable.</p>
+        ) : streams.length === 0 ? (
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            No live streams. Start a recording (Live Record) and it will appear here — then use
-            an “I'll say it now” button in a wake-word section below.
+            No live streams. Start Live Record to capture an example.
           </p>
         ) : (
           <ul className="flex flex-wrap gap-2">
@@ -187,7 +195,11 @@ export default function WakeWordLab() {
       </Card>
 
       {/* One section per wake word */}
-      {words.length === 0 ? (
+      {modelsError ? (
+        <Alert tone="danger">Wake-word configuration could not be loaded. Refresh to try again.</Alert>
+      ) : loading && words.length === 0 ? (
+        <p role="status">Loading wake words…</p>
+      ) : words.length === 0 ? (
         <p className="py-8 text-center text-sm text-gray-500 dark:text-gray-400">
           No wake words configured.
         </p>
@@ -241,24 +253,39 @@ function WakeWordSection({
   onError: (msg: string | null) => void
 }) {
   const [bucket, setBucket] = useState<Bucket>('pending')
-  const [samples, setSamples] = useState<WakeSample[]>([])
+  const [sampleList, setSampleList] = useState<{ bucket: Bucket; samples: WakeSample[] } | null>(null)
+  const [samplesLoading, setSamplesLoading] = useState(false)
+  const [samplesError, setSamplesError] = useState<string | null>(null)
+  const [visibleLimit, setVisibleLimit] = useState(20)
+  const sampleRequest = useRef(0)
+  const activeBucket = useRef(bucket)
+  activeBucket.current = bucket
+  const samples = sampleList?.bucket === bucket ? sampleList.samples : []
   const [primedMsg, setPrimedMsg] = useState<string | null>(null)
 
   // Is any stream currently being primed/enrolled for THIS word?
   const primingStream = streams.find((s) => s.priming && s.prime_wakeword === word.name)
 
   const refreshSamples = useCallback(async (b: Bucket) => {
+    if (b !== activeBucket.current) return
+    const request = ++sampleRequest.current
+    setSamplesLoading(true)
+    setSamplesError(null)
     try {
       const { data } = await wakewordApi.getSamples(word.name, b)
-      setSamples(data.samples)
+      if (request === sampleRequest.current && b === activeBucket.current) setSampleList({ bucket: b, samples: data.samples })
     } catch {
-      setSamples([])
+      if (request === sampleRequest.current && b === activeBucket.current) setSamplesError('Clips could not be loaded.')
+    } finally {
+      if (request === sampleRequest.current) setSamplesLoading(false)
     }
   }, [word.name])
 
-  // Re-fetch on bucket change AND whenever any section mutates data (dataVersion),
-  // so a clip moved here from another section shows up without a page refresh.
-  useEffect(() => { refreshSamples(bucket) }, [bucket, refreshSamples, dataVersion])
+  useEffect(() => {
+    refreshSamples(bucket)
+    return () => { sampleRequest.current += 1 }
+  }, [bucket, refreshSamples, dataVersion])
+  useEffect(() => { setVisibleLimit(20) }, [bucket])
 
   // When this word's prime session ends, pull pending so the clip shows up.
   const wasPriming = useRef(false)
@@ -359,71 +386,24 @@ function WakeWordSection({
         <span className="rounded bg-gray-100 dark:bg-gray-800 px-2 py-0.5 font-mono text-xs text-gray-600 dark:text-gray-400">
           {word.model}
         </span>
-        {!word.verifier ? (
-          <span className="rounded bg-gray-100 dark:bg-gray-800 px-2 py-0.5 text-xs text-gray-500 dark:text-gray-400">
-            no verifier
-          </span>
-        ) : isAdmin ? (
-          <button
-            onClick={() => onToggleVerifier(word.name, !word.verifier_enabled)}
-            title={
-              word.verifier_enabled
-                ? 'Second-stage verifier is ON — each arm is confirmed by the verifier before it dispatches; arms it judges false are dropped. Click to disable (fall back to the stage-1 model alone).'
-                : 'Verifier is OFF — arms dispatch on the stage-1 acoustic model alone (no second-stage check). The verifier is still loaded. Click to re-enable it.'
-            }
-            className={`flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors ${
-              word.verifier_enabled
-                ? 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 hover:bg-green-200 dark:hover:bg-green-900'
-                : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
-            }`}
-          >
-            <ShieldCheck className="h-3.5 w-3.5" /> verifier {word.verifier_enabled ? 'on' : 'off'}
-          </button>
-        ) : (
-          <span
-            className={`flex items-center gap-1 rounded px-2 py-0.5 text-xs ${
-              word.verifier_enabled
-                ? 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300'
-                : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
-            }`}
-            title={
-              word.verifier_enabled
-                ? 'Second-stage verifier active — arms are confirmed before dispatch'
-                : 'Verifier loaded but disabled — arms dispatch on the stage-1 model alone'
-            }
-          >
-            <ShieldCheck className="h-3.5 w-3.5" /> verifier {word.verifier_enabled ? 'on' : 'off'}
-          </span>
-        )}
-        {isAdmin ? (
-          <button
-            onClick={() => onToggleCollectOnly(word.name, !word.collect_only)}
-            title={
-              word.collect_only
-                ? 'Collect-only is ON — this word fires live to gather false-positive review data but does NOT trigger the assistant. Click to make it a normal wake word again.'
-                : 'Normal wake word — fires trigger the assistant. Click to switch to collect-only (shadow): fires live to gather review data without dispatching, playing a tone, or blocking other words.'
-            }
-            className={`flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors ${
-              word.collect_only
-                ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900'
-                : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
-            }`}
-          >
-            <Eye className="h-3.5 w-3.5" /> collect-only {word.collect_only ? 'on' : 'off'}
-          </button>
-        ) : (
-          word.collect_only && (
-            <span
-              className="flex items-center gap-1 rounded bg-amber-100 dark:bg-amber-900/40 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300"
-              title="Collect-only: fires to gather false-positive review data but does not trigger the assistant"
-            >
-              <Eye className="h-3.5 w-3.5" /> collect-only
-            </span>
-          )
-        )}
         <span className="text-xs text-gray-500 dark:text-gray-400">
-          thr {word.threshold} · patience {word.patience}
+          {word.collect_only ? 'Review only' : 'Assistant dispatch enabled'} · {word.verifier && word.verifier_enabled ? 'Verifier enabled' : 'Verifier disabled'}
         </span>
+        {isAdmin && <details className="text-sm text-gray-700 dark:text-gray-200">
+          <summary className="cursor-pointer">Detection settings</summary>
+          <div className="space-y-3 py-3">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={!word.collect_only} onChange={(e) => onToggleCollectOnly(word.name, !e.target.checked)} />
+              Allow assistant dispatch
+            </label>
+            <p className="text-xs text-gray-500 dark:text-gray-400">When off, detections are collected for review only.</p>
+            {word.verifier && <label className="flex items-center gap-2">
+              <input type="checkbox" checked={word.verifier_enabled} onChange={(e) => onToggleVerifier(word.name, e.target.checked)} />
+              Verify detections before dispatch
+            </label>}
+            <p className="text-xs text-gray-500 dark:text-gray-400">Threshold {word.threshold} · Patience {word.patience}</p>
+          </div>
+        </details>}
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={dedupe}
@@ -462,10 +442,10 @@ function WakeWordSection({
 
         {/* Stats */}
         <div className="mb-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <StatCard label="Pending" value={stats?.pending ?? 0} tone="amber" />
-          <StatCard label="Positives" value={stats?.positive ?? 0} tone="green" />
-          <StatCard label="Negatives" value={stats?.negative ?? 0} tone="red" />
-          <StatCard label="False negatives" value={stats?.false_negatives ?? 0} tone="blue" />
+          <StatCard label="Pending" value={stats?.pending ?? "Unknown"} tone="amber" />
+          <StatCard label="Positives" value={stats?.positive ?? "Unknown"} tone="green" />
+          <StatCard label="Negatives" value={stats?.negative ?? "Unknown"} tone="red" />
+          <StatCard label="Captured examples" value={stats?.false_negatives ?? "Unknown"} />
         </div>
 
         {/* Bucket tabs + labeling help */}
@@ -482,13 +462,17 @@ function WakeWordSection({
         </div>
 
         {/* Clip list */}
-        {samples.length === 0 ? (
+        {samplesLoading || (!samplesError && sampleList?.bucket !== bucket) ? (
+          <p role="status" className="py-6 text-sm text-gray-500 dark:text-gray-400">Loading clips…</p>
+        ) : samplesError ? (
+          <Alert tone="danger">{samplesError} <button onClick={() => refreshSamples(bucket)} className="underline">Retry clips</button></Alert>
+        ) : samples.length === 0 ? (
           <p className="py-6 text-center text-sm text-gray-500 dark:text-gray-400">
             No clips in “{BUCKET_LABELS[bucket]}” for “{pretty(word.name)}”.
           </p>
         ) : (
           <ul className="space-y-2">
-            {samples.map((s) => (
+            {samples.slice(0, visibleLimit).map((s) => (
               <ClipRow
                 key={s.id}
                 sample={s}
@@ -501,6 +485,11 @@ function WakeWordSection({
               />
             ))}
           </ul>
+        )}
+        {!samplesLoading && !samplesError && samples.length > visibleLimit && (
+          <Button variant="secondary" onClick={() => setVisibleLimit((limit) => limit + 20)} className="mt-3">
+            Show more clips ({visibleLimit} of {samples.length})
+          </Button>
         )}
       </div>
     </section>
@@ -602,47 +591,12 @@ function MoveCopyMenu({
   )
 }
 
-// Hover help explaining the three-way labeling decision — crucial when wake words
-// overlap acoustically (e.g. "hermes" ⊂ "hey hermes").
 function LabelGuide({ word }: { word: string }) {
   return (
-    <div className="relative inline-flex group">
-      <button
-        type="button"
-        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
-        aria-label="How to label these clips"
-      >
-        <HelpCircle className="h-4 w-4" /> How to label
-      </button>
-      <div
-        role="tooltip"
-        className="invisible opacity-0 group-hover:visible group-hover:opacity-100 transition-opacity absolute right-0 top-full z-20 mt-1 w-96 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 text-xs text-gray-700 dark:text-gray-200 shadow-lg"
-      >
-        <p className="mb-1.5">
-          Each clip is audio the model <span className="font-semibold">fired</span> on. Decide what you actually hear:
-        </p>
-        <ul className="space-y-1.5">
-          <li>
-            <span className="font-semibold text-green-600 dark:text-green-400">Wake</span> —
-            a clean, standalone “{word}” was really said. A true positive.
-          </li>
-          <li>
-            <span className="font-semibold text-red-600 dark:text-red-400">Not</span> —
-            it fired but <span className="font-semibold">no “{word}” was said</span> (other speech,
-            noise, a near-miss). This is the real false positive — it's what trains the verifier.
-          </li>
-          <li>
-            <span className="font-semibold text-gray-600 dark:text-gray-300">Delete</span> —
-            ambiguous, or a <span className="italic">different overlapping</span> wake word
-            (e.g. “hey hermes” while reviewing “hermes”). Exclude it.
-          </li>
-        </ul>
-        <p className="mt-2 rounded bg-amber-50 dark:bg-amber-900/30 px-2 py-1 text-amber-800 dark:text-amber-300">
-          ⚠ Don't mark an overlapping word “Not” — it contains the real “{word}” sound, so a
-          negative would teach the model to reject genuine wakes. Delete it instead.
-        </p>
-      </div>
-    </div>
+    <details className="text-xs text-gray-500 dark:text-gray-400">
+      <summary className="cursor-pointer">Labeling guide</summary>
+      <p className="mt-2">Wake: exactly “{word}”. Not: the word was absent. Leave ambiguous or overlapping phrases unlabelled; do not mark them Not.</p>
+    </details>
   )
 }
 
@@ -669,22 +623,34 @@ function ClipRow({
   const ctxRef = useRef<AudioContext | null>(null)
   const gainRef = useRef<GainNode | null>(null)
 
+  const [audioLoading, setAudioLoading] = useState(false)
+  const [audioError, setAudioError] = useState(false)
+  const mounted = useRef(true)
+
+  const loadAudio = async () => {
+    if (audioLoading) return
+    setAudioLoading(true)
+    setAudioError(false)
+    try {
+      const response = await wakewordApi.getAudioBlob(sample.id)
+      if (!mounted.current) return
+      const url = URL.createObjectURL(response.data)
+      urlRef.current = url
+      setAudioUrl(url)
+    } catch {
+      if (mounted.current) setAudioError(true)
+    } finally {
+      if (mounted.current) setAudioLoading(false)
+    }
+  }
+
   useEffect(() => {
-    let cancelled = false
-    wakewordApi
-      .getAudioBlob(sample.id)
-      .then((res) => {
-        if (cancelled) return
-        const url = URL.createObjectURL(res.data)
-        urlRef.current = url
-        setAudioUrl(url)
-      })
-      .catch(() => {})
+    mounted.current = true
     return () => {
-      cancelled = true
+      mounted.current = false
       if (urlRef.current) URL.revokeObjectURL(urlRef.current)
     }
-  }, [sample.id])
+  }, [])
 
   // Lazily route the <audio> element through a gain node — createMediaElementSource
   // requires a user gesture, so we build the graph on first play.
@@ -712,7 +678,7 @@ function ClipRow({
   // Release the AudioContext when the row unmounts.
   useEffect(() => () => { ctxRef.current?.close() }, [])
 
-  const when = new Date(sample.created_at_ms).toLocaleString()
+  const when = new Date(sample.created_at_ms).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
 
   return (
     <li className="flex flex-wrap items-center gap-3 rounded-md border border-gray-200 dark:border-gray-700 px-3 py-2">
@@ -721,7 +687,7 @@ function ClipRow({
       </span>
       {sample.false_negative && (
         <span className="rounded bg-blue-100 dark:bg-blue-900 px-1.5 py-0.5 text-xs text-blue-700 dark:text-blue-300">
-          missed
+          captured example
         </span>
       )}
       <MoveCopyMenu
@@ -737,7 +703,12 @@ function ClipRow({
       {audioUrl ? (
         <audio ref={audioElRef} onPlay={handlePlay} controls src={audioUrl} className="h-8 max-w-[220px]" />
       ) : (
-        <span className="text-xs text-gray-400">loading…</span>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" size="sm" disabled={audioLoading} onClick={loadAudio} icon={<Play className="h-3.5 w-3.5" />}>
+            {audioLoading ? 'Loading audio…' : audioError ? 'Retry audio' : 'Load audio'}
+          </Button>
+          {audioError && <span role="alert" className="text-xs text-red-600 dark:text-red-400">Audio unavailable</span>}
+        </div>
       )}
       <div className="ml-auto flex items-center gap-1.5">
         <button

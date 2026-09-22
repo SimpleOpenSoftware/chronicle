@@ -250,7 +250,10 @@ def _apply(session, result):
 async def _runtime_for_session(plugin, session, services=None):
     redis_client = fake_aioredis.FakeRedis(decode_responses=True)
     router = PluginRouter()
-    router.register_plugin("swiggy_instamart", plugin)
+    # Exercise generic processor fences with the real callback. Production
+    # Instamart routing through Mongo is covered in test_dialogue.py.
+    session.owner_plugin_id = "fixture_shopping"
+    router.register_plugin("fixture_shopping", plugin)
     router.set_services(services)
     responses = ResponseCoordinator(
         redis_client,

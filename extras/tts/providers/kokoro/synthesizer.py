@@ -10,12 +10,16 @@ Environment variables:
     TTS_VOICE: Preset voice name (default: af_heart)
     TTS_LANG_CODE: Kokoro language code (default: a = American English)
     TTS_SPEED: Speech speed multiplier (default: 1.0)
+    TTS_DEVICE: auto, cpu, or cuda (default: auto)
+    TTS_CPU_THREADS: Torch CPU inference threads (default: 4, CPU mode only)
 """
 
 import asyncio
 import io
 import logging
+import math
 import os
+import re
 import wave
 from typing import Optional
 
@@ -44,10 +48,40 @@ class KokoroSynthesizer:
         self.speed = float(
             speed if speed is not None else os.getenv("TTS_SPEED", "1.0")
         )
+        if self.lang_code not in {"a", "b", "e", "f", "h", "i", "j", "p", "z"}:
+            raise ValueError("Invalid Kokoro language code")
+        self.hindi_voice = os.getenv("TTS_HINDI_VOICE", "hf_alpha")
+        self.english_voice = os.getenv("TTS_ENGLISH_VOICE") or (
+            self.voice if self.lang_code in {"a", "b"} else "af_heart"
+        )
+        self.english_code = (
+            self.lang_code if self.lang_code in {"a", "b"} else self.english_voice[0]
+        )
+        self._validate_voice(self.voice, self.lang_code)
+        self._validate_voice(self.hindi_voice, "h")
+        self._validate_voice(
+            self.english_voice,
+            self.english_voice[:1] if self.english_voice[:1] in {"a", "b"} else "a",
+        )
+        if not math.isfinite(self.speed) or not 0.5 <= self.speed <= 2:
+            raise ValueError("TTS_SPEED must be between 0.5 and 2")
+        self.pipelines = {}
         self.pipeline = None
         self._is_loaded = False
         self._lock = asyncio.Lock()
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = os.getenv("TTS_DEVICE", "auto").strip().lower()
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("TTS_DEVICE must be auto, cpu, or cuda")
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("TTS_DEVICE=cuda requires an available CUDA device")
+        self._device = device
+        if device == "cpu":
+            threads = int(os.getenv("TTS_CPU_THREADS", "4"))
+            if threads < 1:
+                raise ValueError("TTS_CPU_THREADS must be positive")
+            torch.set_num_threads(threads)
 
         logger.info(
             f"KokoroSynthesizer initialized: model={self.model_id}, "
@@ -70,6 +104,17 @@ class KokoroSynthesizer:
             repo_id=self.model_id,
             device=self._device,
         )
+        self.pipelines[self.lang_code] = self.pipeline
+        for code, configured_voice in (
+            (self.english_code, self.english_voice),
+            ("h", self.hindi_voice),
+        ):
+            if code not in self.pipelines:
+                self.pipelines[code] = KPipeline(
+                    lang_code=code, repo_id=self.model_id, model=self.pipeline.model
+                )
+            self.pipelines[code].load_voice(configured_voice)
+        self.pipeline.load_voice(self.voice)
         self._is_loaded = True
         logger.info("Kokoro pipeline loaded successfully")
 
@@ -90,25 +135,51 @@ class KokoroSynthesizer:
         if not self._is_loaded or self.pipeline is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        voice = kwargs.get("voice") or self.voice
-        speed = float(kwargs.get("speed") or self.speed)
+        language = kwargs.get("language")
+        if language not in {None, "en", "hi"}:
+            raise ValueError("Kokoro request language must be en or hi")
+        code = (
+            "h"
+            if language == "hi"
+            else self.english_code if language == "en" else self.lang_code
+        )
+        voice = kwargs.get("voice") or (
+            self.hindi_voice
+            if code == "h"
+            else self.english_voice if language == "en" else self.voice
+        )
+        self._validate_voice(voice, code)
+        speed = float(kwargs.get("speed", self.speed))
+        if not math.isfinite(speed) or not 0.5 <= speed <= 2:
+            raise ValueError("Speech speed must be between 0.5 and 2")
 
         logger.info(f"Synthesizing {len(text)} chars (voice={voice}, speed={speed})")
 
         async with self._lock:
             loop = asyncio.get_event_loop()
             wav_bytes = await loop.run_in_executor(
-                None, self._synthesize_sync, text, voice, speed
+                None, self._synthesize_sync, text, voice, speed, code
             )
 
         return wav_bytes, KOKORO_SAMPLE_RATE
 
-    def _synthesize_sync(self, text: str, voice: str, speed: float) -> bytes:
+    @staticmethod
+    def _validate_voice(voice: str, code: str):
+        if (
+            not isinstance(voice, str)
+            or not re.fullmatch(r"[a-z][fm]_[a-z]+", voice)
+            or not (voice[0] == code or {voice[0], code} <= {"a", "b"})
+        ):
+            raise ValueError("Voice must be a preset matching its Kokoro language")
+        if code == "h" and voice not in {"hf_alpha", "hf_beta", "hm_omega", "hm_psi"}:
+            raise ValueError("Unknown Hindi Kokoro voice")
+
+    def _synthesize_sync(self, text: str, voice: str, speed: float, code: str) -> bytes:
         """Synchronous synthesis (runs in a thread pool)."""
         # KPipeline splits longer text into sentence chunks and yields one audio
         # tensor per chunk; concatenate them into a single waveform.
         chunks: list[np.ndarray] = []
-        for _gs, _ps, audio in self.pipeline(text, voice=voice, speed=speed):
+        for _gs, _ps, audio in self.pipelines[code](text, voice=voice, speed=speed):
             if audio is None:
                 continue
             if isinstance(audio, torch.Tensor):

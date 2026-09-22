@@ -22,6 +22,7 @@ from simple_speaker_recognition.api.core.utils import (
 from simple_speaker_recognition.constants import DEFAULT_SIMILARITY_THRESHOLD
 from simple_speaker_recognition.core.backend_client import BackendClient
 from simple_speaker_recognition.core.cluster_identify import assign_clusters_to_speakers
+from simple_speaker_recognition.core.gallery_privacy import allowed_speakers
 from simple_speaker_recognition.core.models import (
     DiarizeAndIdentifyRequest,
     IdentifyBatchItemResponse,
@@ -1487,7 +1488,10 @@ async def analyze_segments_with_enrolled_speakers(
             db_session = get_db_session()
             try:
                 enrolled_speakers = (
-                    db_session.query(Speaker).filter(Speaker.user_id == user_id).all()
+                    db_session.query(Speaker)
+                    .filter(allowed_speakers())
+                    .filter(Speaker.user_id == user_id)
+                    .all()
                 )
 
                 for speaker in enrolled_speakers:

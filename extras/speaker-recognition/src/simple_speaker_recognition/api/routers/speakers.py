@@ -13,6 +13,10 @@ from fastapi.responses import FileResponse
 
 from simple_speaker_recognition.api.core.utils import require_speaker_owner
 from simple_speaker_recognition.constants import DEFAULT_SIMILARITY_THRESHOLD
+from simple_speaker_recognition.core.gallery_privacy import (
+    allowed_speakers,
+    require_available,
+)
 from simple_speaker_recognition.core.unified_speaker_db import UnifiedSpeakerDB
 from simple_speaker_recognition.database import get_db_session
 from simple_speaker_recognition.database.models import Speaker
@@ -54,11 +58,14 @@ async def list_speakers(
         if user_id is not None:
             # Filter by user
             query_speakers = (
-                db_session.query(Speaker).filter(Speaker.user_id == user_id).all()
+                db_session.query(Speaker)
+                .filter(allowed_speakers())
+                .filter(Speaker.user_id == user_id)
+                .all()
             )
         else:
             # Return all speakers
-            query_speakers = db_session.query(Speaker).all()
+            query_speakers = db_session.query(Speaker).filter(allowed_speakers()).all()
 
         speakers = [
             {
@@ -113,10 +120,13 @@ async def get_speakers_analysis(
         # Get speakers, optionally filtered by user
         if user_id is not None:
             query_speakers = (
-                db_session.query(Speaker).filter(Speaker.user_id == user_id).all()
+                db_session.query(Speaker)
+                .filter(allowed_speakers())
+                .filter(Speaker.user_id == user_id)
+                .all()
             )
         else:
-            query_speakers = db_session.query(Speaker).all()
+            query_speakers = db_session.query(Speaker).filter(allowed_speakers()).all()
 
         if not query_speakers:
             return {
@@ -352,7 +362,7 @@ async def export_speakers(
     db_session = get_db_session()
     try:
         # Query speakers based on user_id
-        query = db_session.query(Speaker)
+        query = db_session.query(Speaker).filter(allowed_speakers())
         if user_id:
             query = query.filter(Speaker.user_id == user_id)
 
@@ -450,6 +460,7 @@ async def import_speakers(
     try:
         for speaker_data in import_data["speakers"]:
             try:
+                require_available(db_session, speaker_data["id"])
                 # Check if speaker exists
                 existing_speaker = (
                     db_session.query(Speaker)

@@ -697,6 +697,8 @@ async def test_batch_materialization_creates_detected_claim_after_speech(monkeyp
 
 @pytest.mark.asyncio
 async def test_batch_fallback_entrypoint_materializes_all_capture_ranges(monkeypatch):
+    from backend.services.transcription.context import TranscriptionContext
+
     first_range = SimpleNamespace(
         range_id="range-1", duration_seconds=20.0, chunk_ids=["chunk-1", "chunk-2"]
     )
@@ -723,7 +725,9 @@ async def test_batch_fallback_entrypoint_materializes_all_capture_ranges(monkeyp
         AsyncMock(return_value=[first_range, second_range]),
     )
     monkeypatch.setattr(
-        transcription_jobs, "get_asr_context", AsyncMock(return_value=None)
+        transcription_jobs,
+        "gather_transcription_context",
+        AsyncMock(return_value=TranscriptionContext()),
     )
     monkeypatch.setattr(
         transcription_jobs,

@@ -12,6 +12,15 @@ defaults:
   tts: tts-http
 
 models:
+  - name: openai-realtime
+    description: Optional native audio engine for engaged browser conversations
+    model_type: llm
+    model_provider: openai
+    api_family: openai
+    model_name: gpt-realtime-2.1
+    model_url: https://api.openai.com/v1
+    api_key: ${oc.env:OPENAI_API_KEY,''}
+    model_params: {}
   # ===========================
   # LLM Models
   # ===========================
@@ -108,9 +117,12 @@ models:
     discovery_default: http://llama-cpp-llm:8080/v1
     api_key: ${oc.env:LLAMA_API_KEY,no-key}
     model_params:
-      temperature: 1.0
-      top_p: 0.95
+      temperature: 0.7
+      top_p: 0.8
       top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      repeat_penalty: 1.0
       max_tokens: 2000
     model_output: json
 
@@ -758,6 +770,12 @@ chat:
 # Parameters (temperature, max_tokens, response_format) override
 # the model's model_params for that operation only.
 llm_operations:
+  voice_realtime:
+    model: openai-realtime
+  voice_conversation:
+    temperature: 0.3
+    reasoning_effort: none
+    max_tokens: 256
   memory_extraction:
     temperature: 0.1
     max_tokens: 2000
@@ -807,6 +825,13 @@ llm_operations:
     reasoning_effort: low
     max_tokens: 4096
     response_format: json
+  # Session accounts include source quotations and can be larger than grouping
+  # decisions. Output capacity is separate from Pi's working-context compaction.
+  timeline_session_account:
+    # Multi-turn investigations use sampling; greedy decoding can repeat failed tools.
+    temperature: 1.0
+    reasoning_effort: none
+    max_tokens: 16384
   # Whole-day visual second pass. It proposes semantic merges for human review and
   # never mutates episode rows itself.
   timeline_consolidation:
@@ -1088,6 +1113,10 @@ cron_jobs:
     description: "Assemble uploaded device audio into speech-driven conversations"
     enabled: true
     schedule: "*/2 * * * *"
+  chat_note_review:
+    description: "Recover reviewed chat note generation and approved applications"
+    enabled: true
+    schedule: "* * * * *"
   episode_memory_review:
     description: "Generate potential memory from reviewed timeline episodes"
     enabled: true
@@ -1129,6 +1158,10 @@ cron_jobs:
     description: "Roll forward crash-interrupted Timeline publication journals"
     enabled: true
     schedule: "*/5 * * * *"
+  speaker_enrollment_recovery:
+    description: "Recover interrupted speaker enrollment operations"
+    enabled: true
+    schedule: "* * * * *"
   timeline_episode_dispatch_recovery:
     description: "Recover stable Timeline episode summary and completion dispatch"
     enabled: true
@@ -1143,6 +1176,18 @@ cron_jobs:
     schedule: "*/5 * * * *"
   timeline_consolidation_prefetch:
     description: "Keep grouping suggestions ready ahead of the Timeline review cursor"
+    enabled: false
+    schedule: "*/5 * * * *"
+  session_memory_prepare:
+    description: "Prepare recent meaningful sessions and recover their memory jobs"
+    enabled: true
+    schedule: "*/5 * * * *"
+  source_search_index:
+    description: "Resume bounded recording and session search indexing"
+    enabled: true
+    schedule: "* * * * *"
+  vault_context_assessment:
+    description: "Assess whether accepted context helps earlier sessions; never auto-regenerate"
     enabled: true
     schedule: "*/5 * * * *"
 
@@ -1164,7 +1209,7 @@ timeline:
   overlap_minutes: 3
   max_text_chars_per_window: 60000
   max_anchor_images_per_window: 4
-  executor: codex
+  executor: pi
   codex:
     model: gpt-5.6-luna
     service_tier: ""              # set to priority for Codex Fast mode (higher usage)
@@ -1181,6 +1226,9 @@ timeline:
     retry_hours: 6
   pi:
     operation: timeline_segmentation
+    # Execution limits bound autonomous investigation, not its search strategy.
+    max_tool_rounds: 96
+    max_tool_calls: 96
     # Final synthesis must emit the bounded JSON directly. An exact-input replay with
     # `low` spent all 32K output tokens in one hidden thinking block and returned no
     # answer; `none` emitted the schema result directly.
@@ -1266,3 +1314,13 @@ data_audit:
         Do NOT flag general technical discussion, abstract product/business
         strategy, publicly-known facts, or people's names used only for
         context (annotators need names for speaker labels).
+
+# Engaged browser voice. Engine selection is fixed for each engagement.
+voice:
+  enabled: true
+  vault_retrieval_enabled: false
+  default_engine: modular
+  idle_timeout_seconds: 60
+  max_duration_seconds: 1200
+  vault_timeout_seconds: 15
+  hermes_timeout_seconds: 600

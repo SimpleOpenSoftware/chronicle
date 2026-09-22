@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
+import backend.services.privacy as privacy
 from backend.client_manager import client_belongs_to_user, get_client_manager
 from backend.config_loader import get_service_config
 from backend.controllers.queue_controller import (
@@ -41,6 +42,10 @@ from backend.services.memory.audit import (
 )
 from backend.services.memory.visibility import conversation_scope_filter
 from backend.services.plugin_service import get_plugin_router
+from backend.services.recording_purpose import (
+    is_personal_recording,
+    personal_recording_filter,
+)
 from backend.users import User
 from backend.workers.memory_jobs import enqueue_memory_processing, process_memory_job
 from backend.workers.speaker_jobs import recognise_speakers_job
@@ -50,7 +55,9 @@ logger = logging.getLogger(__name__)
 audio_logger = logging.getLogger("audio_processing")
 
 
-async def _get_conversation_or_error(conversation_id: str, user: User):
+async def _get_conversation_or_error(
+    conversation_id: str, user: User, *, personal_only: bool = True
+):
     """Fetch a conversation and validate user access.
 
     Returns (conversation, None) on success, or (None, error_response) on failure.
@@ -58,7 +65,7 @@ async def _get_conversation_or_error(conversation_id: str, user: User):
     conversation = await Conversation.find_one(
         Conversation.conversation_id == conversation_id
     )
-    if not conversation:
+    if not conversation or (personal_only and not is_personal_recording(conversation)):
         return None, JSONResponse(
             status_code=404, content={"error": "Conversation not found"}
         )
@@ -69,6 +76,13 @@ async def _get_conversation_or_error(conversation_id: str, user: User):
     if not user.is_superuser and conversation.user_id != str(user.user_id):
         return None, JSONResponse(
             status_code=403, content={"error": "Access forbidden"}
+        )
+
+    try:
+        await privacy.require_record(conversation)
+    except privacy.PrivacyHeld:
+        return None, JSONResponse(
+            status_code=423, content={"error": "Private or unscreened recording"}
         )
     return conversation, None
 
@@ -135,10 +149,12 @@ async def close_current_conversation(client_id: str, user: User):
     )
 
 
-async def get_conversation(conversation_id: str, user: User):
+async def get_conversation(conversation_id: str, user: User, *, dataset: bool = False):
     """Get a single conversation with full transcript details."""
     try:
-        conversation, error = await _get_conversation_or_error(conversation_id, user)
+        conversation, error = await _get_conversation_or_error(
+            conversation_id, user, personal_only=not dataset
+        )
         if error:
             return error
         active_version = conversation.active_transcript
@@ -162,6 +178,7 @@ async def get_conversation(conversation_id: str, user: User):
             "processing_status": conversation.processing_status,
             "failure_stage": conversation.failure_stage,
             "origin": conversation.origin,
+            "data_purpose": conversation.data_purpose,
             "audio_ranges": [item.model_dump() for item in conversation.audio_ranges],
             "end_reason": (
                 conversation.end_reason.value if conversation.end_reason else None
@@ -437,6 +454,7 @@ async def get_conversations(
             "$and": [
                 user_filter,
                 conversation_scope_filter(memory_space_id),
+                personal_recording_filter(),
                 state_filter,
             ]
         }
@@ -453,6 +471,8 @@ async def get_conversations(
         cursor = collection.find(query, _LIST_PROJECTION)
         cursor = cursor.sort(sort_by, sort_direction).skip(offset).limit(limit)
         raw_docs = await cursor.to_list(length=limit)
+
+        raw_docs = await privacy.filter_conversation_documents(raw_docs, str(user.id))
 
         # Mark orphans in results (lightweight in-memory check on the page)
         orphan_ids: set = set()
@@ -563,7 +583,7 @@ async def _regex_search_conversations(
 
     match_filter: dict = {
         "deleted": False,
-        "$and": [conversation_scope_filter()],
+        "$and": [conversation_scope_filter(), personal_recording_filter()],
     }
     if not user.is_superuser:
         match_filter["user_id"] = str(user.user_id)
@@ -592,6 +612,8 @@ async def _regex_search_conversations(
     facet = facet_result[0] if facet_result else {"results": [], "count": []}
 
     raw_docs = facet.get("results", [])
+
+    raw_docs = await privacy.filter_conversation_documents(raw_docs, str(user.id))
     count_list = facet.get("count", [])
     total = count_list[0]["total"] if count_list else 0
 
@@ -745,7 +767,9 @@ async def archive_conversation_audio(
     bad-speaker recordings. Unlike soft delete, this is irreversible for the
     audio — the transcript/segment metadata is retained.
     """
-    conversation, error = await _get_conversation_or_error(conversation_id, user)
+    conversation, error = await _get_conversation_or_error(
+        conversation_id, user, personal_only=False
+    )
     if error:
         return error
 
@@ -1123,7 +1147,7 @@ async def reprocess_transcript(conversation_id: str, user: User):
     """Reprocess transcript for a conversation. Users can only reprocess their own conversations."""
     try:
         conversation_model, error = await _get_conversation_or_error(
-            conversation_id, user
+            conversation_id, user, personal_only=False
         )
         if error:
             return error
@@ -1252,7 +1276,7 @@ async def reprocess_speakers(
     try:
         # 1. Find conversation and validate ownership
         conversation_model, error = await _get_conversation_or_error(
-            conversation_id, user
+            conversation_id, user, personal_only=False
         )
         if error:
             return error
@@ -1417,7 +1441,7 @@ async def activate_transcript_version(
     """Activate a specific transcript version. Users can only modify their own conversations."""
     try:
         conversation_model, error = await _get_conversation_or_error(
-            conversation_id, user
+            conversation_id, user, personal_only=False
         )
         if error:
             return error
@@ -1461,7 +1485,7 @@ async def get_conversation_version_history(conversation_id: str, user: User):
     """
     try:
         conversation_model, error = await _get_conversation_or_error(
-            conversation_id, user
+            conversation_id, user, personal_only=False
         )
         if error:
             return error

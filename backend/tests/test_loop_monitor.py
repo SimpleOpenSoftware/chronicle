@@ -377,3 +377,59 @@ async def test_a_malformed_threshold_falls_back_to_the_default(
         )
     finally:
         task.cancel()
+
+
+async def test_registered_gc_callback_publishes_bounded_correlated_pause_metadata(
+    monkeypatch,
+):
+    """Run the real monitor registration and collect cycles through Python's GC."""
+    import gc
+
+    monitor = LoopMonitor("gc-entrypoint-test")
+    task = asyncio.create_task(monitor.run())
+    await asyncio.sleep(0.03)
+    assert monitor._on_gc in gc.callbacks
+    original_threshold = gc.get_threshold()
+
+    def paced_collection(phase, info):
+        if phase == "start" and info["generation"] == 2:
+            time.sleep(GC_PAUSE_MIN_SECONDS * 1.2)
+
+    def run_declared_collection():
+        cycle = []
+        cycle.append(cycle)
+        del cycle
+        gc.collect(2)
+
+    gc.callbacks.append(paced_collection)
+    try:
+        run_declared_collection()
+        result = monitor.stats()["gc"]
+        pause = result["recent_pauses"][-1]
+        assert pause["generation"] == 2 and pause["collected"] >= 1
+        assert pause["uncollectable"] >= 0
+        assert pause["started_perf_counter_ms"] <= pause["ended_perf_counter_ms"]
+        assert pause["started_monotonic_ms"] <= pause["ended_monotonic_ms"]
+        assert pause["duration_ms"] >= GC_PAUSE_MIN_SECONDS * 1000
+        assert any("run_declared_collection" in line for line in pause["trigger_stack"])
+        assert len(pause["trigger_stack"]) <= loop_monitor.STACK_DEPTH
+        assert pause["thresholds_at_start"] == list(original_threshold)
+        assert result["thresholds"] == list(original_threshold)
+        assert len(result["generation_stats"]) == 3
+        assert gc.get_threshold() == original_threshold
+        # A tiny synthetic clock drives retention without repeatedly collecting
+        # the entire test process's heap.
+        now = [100.0]
+        monkeypatch.setattr(loop_monitor.time, "monotonic", lambda: now[0])
+        for _ in range(loop_monitor.GC_PAUSE_SAMPLES + 4):
+            monitor._on_gc("start", {"generation": 2})
+            now[0] += 0.1
+            monitor._on_gc("stop", {"generation": 2, "collected": 2})
+        assert (
+            len(monitor.stats()["gc"]["recent_pauses"]) == loop_monitor.GC_PAUSE_SAMPLES
+        )
+    finally:
+        gc.callbacks.remove(paced_collection)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert monitor._on_gc not in gc.callbacks

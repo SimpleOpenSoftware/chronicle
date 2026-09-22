@@ -1,3 +1,4 @@
+import AskAboutSource from "../components/AskAboutSource"
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -23,6 +24,9 @@ import {
 } from '../services/api'
 import { useConversationDetail } from '../hooks/useConversations'
 import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
+import { useTimelineTimezone } from '../hooks/useTimelineTimezone'
+import { localDate } from '../components/timeline/timelineNavigation'
+import { sourceDate } from '../utils/sourceTime'
 import { Range } from '../lib/gaplessPlayer'
 import { TITLE_NOT_GENERATED } from '../lib/constants'
 import EpisodeKindField from '../components/timeline/EpisodeKindField'
@@ -49,9 +53,9 @@ function durationLabel(startedAt: string, endedAt: string) {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
-function clockRange(startedAt: string, endedAt: string) {
-  const options: Intl.DateTimeFormatOptions = { hour: 'numeric', minute: '2-digit' }
-  return `${new Date(startedAt).toLocaleTimeString([], options)} – ${new Date(endedAt).toLocaleTimeString([], options)}`
+function clockRange(startedAt: string, endedAt: string, timezone: string) {
+  const options: Intl.DateTimeFormatOptions = { timeZone: timezone, hour: 'numeric', minute: '2-digit' }
+  return `${sourceDate(startedAt).toLocaleTimeString('en-IN', options)} – ${sourceDate(endedAt).toLocaleTimeString('en-IN', options)}`
 }
 
 /**
@@ -288,6 +292,7 @@ export default function EpisodeDetail() {
   const { episodeId } = useParams<{ episodeId: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { timezone } = useTimelineTimezone()
 
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
@@ -347,12 +352,18 @@ export default function EpisodeDetail() {
           Back to Timeline
         </Button>
         <div className="rounded-lg border border-dashed border-gray-300 p-6 text-sm text-gray-500 dark:border-gray-600 dark:text-gray-400">
-          This episode no longer exists. Reanalyzing a day replaces its unconfirmed episodes.
+          {episodeQuery.isError && (episodeQuery.error as { response?: { status?: number } }).response?.status !== 404
+            ? 'Could not load this episode.'
+            : 'This episode is unavailable. It may have been removed or replaced.'}
         </div>
+        {episodeQuery.isError && (episodeQuery.error as { response?: { status?: number } }).response?.status !== 404 && (
+          <Button variant="secondary" onClick={() => episodeQuery.refetch()}>Retry</Button>
+        )}
       </div>
     )
   }
 
+  const episodeDay = localDate(sourceDate(episode.started_at), timezone)
   const observations = evidenceByKind.get('observation') ?? []
   const frames = evidenceByKind.get('frame') ?? []
   const photos = evidenceByKind.get('immich') ?? []
@@ -365,7 +376,7 @@ export default function EpisodeDetail() {
         <Button
           variant="secondary"
           size="sm"
-          onClick={() => navigate('/timeline')}
+          onClick={() => navigate(`/timeline?date=${episodeDay}`)}
           icon={<ArrowLeft className="h-4 w-4" />}
         >
           Back to Timeline
@@ -374,12 +385,10 @@ export default function EpisodeDetail() {
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
           <span className="inline-flex items-center gap-1.5">
             <Clock3 className="h-3.5 w-3.5" />
-            {clockRange(episode.started_at, episode.ended_at)}
+            {sourceDate(episode.started_at).toLocaleDateString('en-IN', { timeZone: timezone, day: 'numeric', month: 'short', year: 'numeric' })} · {clockRange(episode.started_at, episode.ended_at, timezone)} ({timezone})
           </span>
           <span>· {durationLabel(episode.started_at, episode.ended_at)}</span>
           <span>· {episode.kind.replace(/_/g, ' ')}</span>
-          <span>· {episode.activity_mode}</span>
-          <span>· {episode.salience}</span>
           {isHumanConfirmed(episode) && (
             <StateBadge tone="success" className="ml-1">
               <CheckCircle2 className="mr-1 h-3 w-3" /> Confirmed
@@ -417,7 +426,7 @@ export default function EpisodeDetail() {
               </Button>
               <Button variant="secondary" size="sm" onClick={() => setEditing(false)}>Cancel</Button>
               <span className="text-xs text-gray-500 dark:text-gray-400">
-                Saving confirms this episode, so reanalyzing the day keeps it.
+                Saving also confirms this episode for future analysis.
               </span>
             </div>
             {save.isError && (
@@ -452,6 +461,7 @@ export default function EpisodeDetail() {
           </div>
         )}
 
+    <AskAboutSource source={{ kind: "episode", key: episode.episode_id }} />
         {!!episode.entities.length && (
           <div className="flex flex-wrap items-center gap-2">
             <Users className="h-3.5 w-3.5 text-gray-400" />
@@ -476,7 +486,7 @@ export default function EpisodeDetail() {
               <li key={`${assertion.claim}-${index}`} className="text-sm text-gray-700 dark:text-gray-200">
                 {assertion.claim}
                 <span className="ml-2 text-xs text-gray-400">
-                  {assertion.role}
+                  {assertion.role.replace(/_/g, ' ')}
                 </span>
               </li>
             ))}
@@ -513,7 +523,6 @@ export default function EpisodeDetail() {
         <Section
           icon={<AudioLines className="h-4 w-4" />}
           title={citedRecordingIds.length === 1 ? 'Recording' : 'Recordings'}
-          hint="Play the event straight through, or correct one recording at a time."
         >
           <div className="space-y-4">
             <EpisodePlayback episode={episode} />
@@ -537,7 +546,7 @@ export default function EpisodeDetail() {
               return (
                 <li key={ref.evidence_id} className="flex gap-3 text-sm">
                   <time className="w-16 flex-shrink-0 text-xs text-gray-500 dark:text-gray-400">
-                    {new Date(ref.started_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                    {sourceDate(ref.started_at).toLocaleTimeString('en-IN', { timeZone: timezone, hour: 'numeric', minute: '2-digit' })}
                   </time>
                   <div className="min-w-0">
                     <div className="truncate text-gray-800 dark:text-gray-200">{label}</div>
@@ -562,7 +571,7 @@ export default function EpisodeDetail() {
             {[...frames, ...photos].map(ref => (
               <li key={ref.evidence_id} className="flex gap-3 text-sm">
                 <time className="w-16 flex-shrink-0 text-xs text-gray-500 dark:text-gray-400">
-                  {new Date(ref.started_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                  {sourceDate(ref.started_at).toLocaleTimeString('en-IN', { timeZone: timezone, hour: 'numeric', minute: '2-digit' })}
                 </time>
                 <span className="min-w-0 truncate text-gray-800 dark:text-gray-200">
                   {describeEvidence(ref).label}

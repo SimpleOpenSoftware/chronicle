@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { conversationsApi } from '../services/api'
+import { conversationsApi, api } from '../services/api'
 
 interface ConversationListOpts {
   includeDeleted?: boolean
@@ -22,10 +22,12 @@ export function useConversations(opts: ConversationListOpts = {}) {
   })
 }
 
-export function useConversationDetail(conversationId: string | null) {
+export function useConversationDetail(conversationId: string | null, dataset = false) {
   return useQuery({
-    queryKey: ['conversation', conversationId],
-    queryFn: () => conversationsApi.getById(conversationId!).then(r => r.data.conversation),
+    queryKey: ['conversation', conversationId, dataset ? 'dataset' : 'personal'],
+    queryFn: () => (dataset
+      ? api.get(`/api/data-audit/recordings/${conversationId}`)
+      : conversationsApi.getById(conversationId!)).then(r => r.data.conversation),
     enabled: !!conversationId,
   })
 }
