@@ -117,7 +117,7 @@ See [quickstart.md](../quickstart.md) for setup instructions.
 ./wizard.sh
 
 # Start
-./start.sh
+./services start --all
 
 # Access
 open http://localhost:5173

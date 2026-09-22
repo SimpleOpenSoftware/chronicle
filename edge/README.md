@@ -65,9 +65,9 @@ companion binaries (`screenpipe`, `syncthing`). Manage components with:
 
 ```bash
 cd ~/chronicle
-uv run --with-requirements setup-requirements.txt python services.py client status
-uv run --with-requirements setup-requirements.txt python services.py client install screenpipe-collector
-uv run --with-requirements setup-requirements.txt python services.py client uninstall tray
+./services client status
+./services client install screenpipe-collector
+./services client uninstall tray
 ```
 
 The component units are defined in the repo-root `clients.py` and `uv run`
@@ -94,8 +94,8 @@ host process. (`havpe-relay` always uses the sidecar; it isn't node-agent-manage
 **Default (node agent):**
 ```bash
 cd ~/chronicle
-./status.sh                                   # node + service health
-uv run --with-requirements setup-requirements.txt python services.py stop <service>
+./services status                                   # node + service health
+./services stop <service>
 ```
 
 **Advertise-only sidecar (`--advertise-only`):**
@@ -110,8 +110,8 @@ docker compose --profile edge down    # stop
 
 ```bash
 cd ~/chronicle
-uv run --with-requirements setup-requirements.txt python services.py update --check
-uv run --with-requirements setup-requirements.txt python services.py update
+./services update --check
+./services update
 ```
 
 Branch installs pull their branch; release-tag installs move to the latest `v*`

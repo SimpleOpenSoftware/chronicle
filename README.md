@@ -67,7 +67,8 @@ chronicle/
 ├── config/                 # Central configuration files
 ├── tests/                  # Integration & unit tests
 ├── wizard.py              # Root setup orchestrator
-├── services.py            # Service lifecycle manager
+├── services               # Operator CLI
+├── services.py            # Shared lifecycle implementation
 └── *.sh                   # Convenience scripts (wrappers)
 ```
 
@@ -113,34 +114,21 @@ chronicle/
 uv run --with-requirements setup-requirements.txt python wizard.py
 ```
 
-**Note**: Convenience scripts (*.sh) are wrappers around `wizard.py` and `services.py` that simplify the longer `uv run` commands.
+Use `./wizard.sh` for configuration and `./services` for operations.
 
 ### Service Management
-```bash
-# Start all configured services
-./start.sh
-
-# Restart all services (preserves containers)
-./restart.sh
-
-# Check service status
-./status.sh
-
-# Stop all services
-./stop.sh
-```
-
-<details>
-<summary>Full commands (click to expand)</summary>
 
 ```bash
-# What the convenience scripts wrap
-uv run --with-requirements setup-requirements.txt python services.py start --all --build
-uv run --with-requirements setup-requirements.txt python services.py restart --all
-uv run --with-requirements setup-requirements.txt python services.py status
-uv run --with-requirements setup-requirements.txt python services.py stop --all
+./services status --detailed
+./services start llm-services wakeword-service
+./services start --all
+./services restart backend
+./services stop --all
+./services logs wakeword-service --tail 100
 ```
-</details>
+
+Start/restart waits for readiness. See the [operator workflow](docs/init-system.md#service-management)
+for remote nodes, image builds, operation history, and explicit local recovery.
 
 ### Development
 ```bash

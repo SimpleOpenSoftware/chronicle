@@ -36,8 +36,8 @@ Syncthing). Vault sync reads `BACKEND_URL` and `CHRONICLE_API_KEY` from the
 repository-root `.env`.
 
 The service unit is defined in the repo-root `clients.py` (shared with
-`services.py client` and the node agent), and runs `uv run` from this checkout,
-so a node update (`services.py update` or the WebUI update button) restarts the
+`./services client` and the node agent), and runs `uv run` from this checkout,
+so a node update (`./services update` or the WebUI update button) restarts the
 tray on the new code automatically.
 
 ## Section internals

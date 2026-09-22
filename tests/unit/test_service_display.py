@@ -149,7 +149,7 @@ def test_llm_health_uses_each_endpoints_configured_bind_host(monkeypatch, tmp_pa
 
     def get(url, timeout):
         requested.append((url, timeout))
-        return SimpleNamespace(status_code=200)
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "ok"})
 
     monkeypatch.setattr(services.requests, "get", get)
 
@@ -169,7 +169,7 @@ def test_llm_health_dials_loopback_for_wildcard_binds(monkeypatch, tmp_path):
 
     def get(url, timeout):
         requested.append(url)
-        return SimpleNamespace(status_code=200)
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "ok"})
 
     monkeypatch.setattr(services.requests, "get", get)
 
@@ -197,7 +197,8 @@ def test_remote_chat_only_requires_local_embedding_health(monkeypatch, tmp_path)
     monkeypatch.setattr(
         services.requests,
         "get",
-        lambda url, timeout: requested.append(url) or SimpleNamespace(status_code=200),
+        lambda url, timeout: requested.append(url)
+        or SimpleNamespace(status_code=200, json=lambda: {"status": "ok"}),
     )
 
     assert services.service_display_label("llm-services") == (

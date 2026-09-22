@@ -16,7 +16,6 @@ import sys
 import time
 from pathlib import Path
 
-import clients
 import requests
 import yaml
 from chronicle_setup import (
@@ -36,6 +35,8 @@ from dotenv import dotenv_values, set_key
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+
+import clients
 
 console = Console()
 
@@ -841,7 +842,7 @@ def check_service_health(service_name):
     """Check runtime health of a service by hitting its health endpoints.
 
     Returns (status, detail) where status is one of:
-        "healthy"  — all endpoints responding with < 400
+        "healthy"  — every active endpoint reports readiness
         "partial"  — some endpoints down (detail says which)
         "unhealthy" — responding but returning errors
         "stopped"  — not reachable at all
@@ -859,11 +860,18 @@ def check_service_health(service_name):
     for label, url in service_health_endpoint_urls(service_name):
         try:
             resp = requests.get(url, timeout=2)
-            if resp.status_code < 400:
-                results.append((label, True))
-            else:
-                results.append((label, False))
-                any_unhealthy = True
+            ready = resp.status_code == 200
+            if ready:
+                try:
+                    data = resp.json()
+                    # Local import keeps legacy health helpers cheap to import.
+                    from service_health import body_ready
+
+                    ready = body_ready(data)
+                except ValueError:
+                    pass
+            results.append((label, ready))
+            any_unhealthy = any_unhealthy or not ready
         except (requests.ConnectionError, requests.Timeout):
             results.append((label, False))
 
@@ -962,6 +970,24 @@ def _backend_profile_flags(service_path, command):
 
 
 def run_compose_command(service_name, command, build=False, force_recreate=False):
+    """All Chronicle-managed activations pass through the deployment authority."""
+    # Local imports avoid a cycle while preserving this existing public helper.
+    from deployment_guard import activation
+    from service_deployments import PlacementError
+
+    try:
+        if command in ("up", "start", "restart"):
+            with activation(Path(__file__).resolve().parent, service_name):
+                return _run_compose_command(
+                    service_name, command, build, force_recreate
+                )
+        return _run_compose_command(service_name, command, build, force_recreate)
+    except PlacementError as exc:
+        console.print(f"[red]Deployment admission refused: {escape(str(exc))}[/red]")
+        return False
+
+
+def _run_compose_command(service_name, command, build=False, force_recreate=False):
     """Run docker compose command for a service"""
     service = SERVICES[service_name]
     service_path = Path(service["path"])
@@ -1332,7 +1358,7 @@ def ensure_docker_network():
 
 _SERVICE_MANAGER_PID = Path(__file__).parent / "edge" / ".service-manager.pid"
 _SERVICE_MANAGER_LOG = Path(__file__).parent / "edge" / "service-manager.log"
-_SERVICE_MANAGER_PORT = "8775"
+_SERVICE_MANAGER_PORT = os.environ.get("SERVICE_MANAGER_PORT", "8775")
 
 
 def _service_manager_running() -> bool:
@@ -1371,7 +1397,7 @@ def _ensure_service_manager_token() -> str:
 
 
 def handle_client_command(args) -> None:
-    """``services.py client install|uninstall|status`` — client-node components.
+    """``./services client install|uninstall|status`` — client-node components.
 
     Client nodes stream data (tray, ScreenPipe collector) with no compose
     services; the components are native user units defined in clients.py.
@@ -1440,7 +1466,7 @@ def handle_client_command(args) -> None:
     if sys.platform == "darwin":
         console.print(
             "[dim]Node agent auto-install is Linux/systemd-only for now — run "
-            "'./start.sh' or 'services.py manager start' to control this "
+            "'./services start --all' or './services manager start' to control this "
             "machine from the hub.[/dim]"
         )
     else:
@@ -1452,7 +1478,9 @@ def _start_service_manager():
     # Heal legacy installs: the old standalone discovery agent is now folded in.
     _cleanup_legacy_discovery()
     if _service_manager_managed():
-        _systemctl_user("start", "chronicle-service-manager", capture=False)
+        result = _systemctl_user("start", "chronicle-service-manager", capture=False)
+        if result.returncode:
+            return False
         console.print(
             "[dim]🛠  Service manager managed by systemd (ensured started)[/dim]"
         )
@@ -1539,7 +1567,7 @@ def _stop_service_manager():
 # --- systemd user-service integration (auto-start agents on boot) ---
 #
 # The service manager and discovery agents are native host processes, not
-# containers, so a plain ``./start.sh`` launch does not survive a reboot the way
+# containers, so a plain ``./services start --all`` launch does not survive a reboot the way
 # Docker's restart policy revives the containers. Optionally install them as
 # systemd *user* services (with linger enabled) so they come back on boot. The
 # unit's ExecStart re-invokes ``services.py <agent> run`` — a foreground runner
@@ -1569,15 +1597,17 @@ _SYSTEMD_UNITS = {
     },
     # Boot persistence for the container stack. Rootless Podman is daemonless, so
     # unlike Docker nothing re-applies `restart:` policies after a reboot — this
-    # oneshot runs the same `services.py start --all` that ./start.sh uses to bring
+    # oneshot runs the same `./services start --all` that ./services start --all uses to bring
     # the enabled stacks (per config.yml) back up. Ordered after the node agent;
     # enabled for boot only (install does not kick off a full stack `up`).
     "chronicle-stack": {
         "subcmd": "start --all",
+        "stop_subcmd": "stop --all",
         "description": "Chronicle container stack (start enabled services on boot)",
         "type": "oneshot",
         "remain_after_exit": True,
         "timeout_start_sec": 900,
+        "timeout_stop_sec": 900,
         "after": ["chronicle-service-manager.service"],
         "enable_now": False,
     },
@@ -1668,8 +1698,13 @@ def _write_systemd_unit(unit: str) -> Path:
         f"WorkingDirectory={_REPO_ROOT}",
         f"Environment=PATH={unit_path_env}",
         f"ExecStart={uv_path} run --with-requirements setup-requirements.txt "
-        f"python {_REPO_ROOT / 'services.py'} {cfg['subcmd']}",
+        f"python {_REPO_ROOT / 'service_cli.py'} {cfg['subcmd']}",
     ]
+    if cfg.get("stop_subcmd"):
+        service_lines.append(
+            f"ExecStop={uv_path} run --with-requirements setup-requirements.txt "
+            f"python {_REPO_ROOT / 'service_cli.py'} {cfg['stop_subcmd']}"
+        )
     if cfg.get("remain_after_exit"):
         service_lines.append("RemainAfterExit=yes")
     if cfg.get("restart"):
@@ -1677,6 +1712,8 @@ def _write_systemd_unit(unit: str) -> Path:
         service_lines.append(f"RestartSec={cfg.get('restart_sec', 5)}")
     if cfg.get("timeout_start_sec") is not None:
         service_lines.append(f"TimeoutStartSec={cfg['timeout_start_sec']}")
+    if cfg.get("timeout_stop_sec") is not None:
+        service_lines.append(f"TimeoutStopSec={cfg['timeout_stop_sec']}")
 
     content = (
         "[Unit]\n"
@@ -1702,7 +1739,7 @@ def _install_systemd_unit(unit: str) -> bool:
     subprocess.run(["loginctl", "enable-linger"], capture_output=True, text=True)
     _systemctl_user("daemon-reload")
     # The stack oneshot is boot-only: enabling it should register it for boot, not
-    # trigger a full `start --all` as a side effect of install (./start.sh owns the
+    # trigger a full `start --all` as a side effect of install (./services start --all owns the
     # running stack). The agent enables --now so it comes up immediately.
     enable_now = _SYSTEMD_UNITS[unit].get("enable_now", True)
     enable_args = ["enable", "--now", unit] if enable_now else ["enable", unit]
@@ -1985,14 +2022,18 @@ def _write_remote_control_supervisor() -> Path:
     The wrapper starts the detached tmux session (which gives the TUI its pty)
     and then *blocks* polling ``has-session``, so it stays alive exactly as long
     as the ``claude remote-control`` process does. When that process dies the
-    session ends, the wrapper exits, and ``Restart=always`` brings it back. A
+    session ends, the wrapper exits nonzero, and ``Restart=on-failure`` brings it
+    back. Authentication failures exit successfully so an expired login does not
+    create a restart loop. A
     plain ``tmux new-session -d`` could not be supervised this way: it returns 0
     immediately, so systemd lost track of the real process and never restarted
     it when it died.
     """
     tmux = shutil.which("tmux") or "/usr/bin/tmux"
     rc_dir = _claude_rc_dir()
-    cmd_line = shlex.join(_claude_rc_command())
+    rc_command = _claude_rc_command()
+    claude = shlex.quote(rc_command[0])
+    cmd_line = shlex.join(rc_command)
     _SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
     script_path = _SYSTEMD_USER_DIR / f"{_CLAUDE_RC_UNIT}.sh"
     # `tmux -L <socket>`: a PRIVATE server, so killing this unit's cgroup never
@@ -2003,6 +2044,12 @@ set -u
 SESSION={shlex.quote(_CLAUDE_RC_SESSION)}
 # tmux pinned to a dedicated socket (-L) so this never disturbs other tmux servers.
 TMUX="{shlex.quote(tmux)} -L {shlex.quote(_CLAUDE_RC_SOCKET)}"
+# A missing or expired claude.ai login is durable until a human runs /login.
+# Exit successfully so Restart=on-failure does not spin forever.
+if ! {claude} auth status >/dev/null 2>&1; then
+    echo "Claude authentication unavailable; run /login before starting remote-control." >&2
+    exit 0
+fi
 # Clear any stale session of this name, then start fresh.
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
 $TMUX new-session -d -s "$SESSION" -c {shlex.quote(str(rc_dir))} {cmd_line} || exit 1
@@ -2010,6 +2057,8 @@ $TMUX new-session -d -s "$SESSION" -c {shlex.quote(str(rc_dir))} {cmd_line} || e
 while $TMUX has-session -t "$SESSION" 2>/dev/null; do
     sleep 5
 done
+# An authenticated session disappearing is unexpected and should be restarted.
+exit 1
 """)
     script_path.chmod(0o755)
     return script_path
@@ -2036,20 +2085,20 @@ def _write_remote_control_unit() -> Path:
     _SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
     unit_path = _SYSTEMD_USER_DIR / f"{_CLAUDE_RC_UNIT}.service"
     # Type=simple: the supervisor wrapper is the tracked main process and lives as
-    # long as the tmux session does, so Restart=always genuinely restarts the
-    # remote-control server whenever it dies (crash, network drop, claude update).
-    # StartLimitIntervalSec=0 disables the start-rate cap so it never gives up.
+    # long as the tmux session does. Auth failures exit successfully and remain
+    # stopped; unexpected session exits fail and are restarted with rate limiting.
     unit_path.write_text(f"""[Unit]
 Description=Chronicle Claude remote-control session (control Claude Code from your phone)
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory={rc_dir}
 Environment=PATH={unit_path_env}
 ExecStart=/bin/sh {script_path}
-ExecStop={tmux} -L {_CLAUDE_RC_SOCKET} kill-session -t {_CLAUDE_RC_SESSION}
-Restart=always
+ExecStop=-{tmux} -L {_CLAUDE_RC_SOCKET} kill-session -t {_CLAUDE_RC_SESSION}
+Restart=on-failure
 RestartSec=10
 
 [Install]
@@ -2376,255 +2425,6 @@ def firewall_clear() -> bool:
     return ok
 
 
-def start_services(services, build=False, force_recreate=False):
-    """Start specified services"""
-    console.print(f"🚀 [bold]Starting {len(services)} services...[/bold]")
-
-    # Ensure Docker network exists before starting services
-    if not ensure_docker_network():
-        console.print("[red]❌ Cannot start services without Docker network[/red]")
-        return
-
-    success_count = 0
-    for service_name in services:
-        if service_name not in SERVICES:
-            console.print(f"[red]❌ Unknown service: {service_name}[/red]")
-            continue
-
-        if service_name == "langfuse" and not _ensure_langfuse_env():
-            console.print("[yellow]⚠️  LangFuse not configured, skipping[/yellow]")
-            continue
-
-        if not check_service_enabled(service_name):
-            console.print(
-                f"[yellow]⚠️  {service_name} not configured, skipping[/yellow]"
-            )
-            continue
-
-        console.print(f"\n🔧 Starting {service_name}...")
-        if run_compose_command(service_name, "up", build, force_recreate):
-            console.print(f"[green]✅ {service_name} started[/green]")
-            success_count += 1
-        else:
-            console.print(f"[red]❌ Failed to start {service_name}[/red]")
-
-    console.print(
-        f"\n[green]🎉 {success_count}/{len(services)} services started successfully[/green]"
-    )
-
-    # Start the node agent (WebUI control + Tailnet advertising) on any start.
-    # It advertises this node's enabled services regardless of whether the
-    # backend runs here, so service-only nodes (e.g. a GPU/RPi box) advertise too.
-    _start_service_manager()
-
-    # WSL2 hosts: converge Windows Firewall rules so LAN clients (phones,
-    # companion Macs) can actually reach what just started. No-op elsewhere.
-    firewall_sync(quiet=True)
-
-    # Host-level faults (dead container DNS, logged-out Tailscale, a stale socket
-    # mount) leave every container reporting healthy, so surface them here rather
-    # than letting the stack look fine while it is unusable. Advisory only.
-    preflight()
-
-    # Show access URLs if backend was started
-    if "backend" in services and check_service_enabled("backend"):
-        backend_env = _get_backend_env_path()
-        https_enabled = (
-            read_env_value(backend_env, "HTTPS_ENABLED") or ""
-        ).lower() == "true"
-        server_ip = read_env_value(backend_env, "SERVER_IP") or ""
-
-        if https_enabled and server_ip:
-            webui_url = f"https://{server_ip}"
-            api_url = f"https://{server_ip}/api"
-        else:
-            host = server_ip or "localhost"
-            webui_port = read_env_value(backend_env, "WEBUI_PORT") or "5173"
-            backend_port = read_env_value(backend_env, "BACKEND_PUBLIC_PORT") or "8000"
-            webui_url = f"http://{host}:{webui_port}"
-            api_url = f"http://{host}:{backend_port}/api"
-
-        console.print("")
-        console.print("[bold cyan]Access URLs:[/bold cyan]")
-        console.print(f"   Web Dashboard:  {webui_url}")
-        console.print(f"   API:            {api_url}")
-
-    # Show LangFuse prompt management tip if langfuse was started
-    if "langfuse" in services and check_service_enabled("langfuse"):
-        backend_env = _get_backend_env_path()
-        langfuse_host = read_env_value(backend_env, "SERVER_IP") or "localhost"
-        langfuse_base_url = service_ui_url("langfuse", langfuse_host)
-        langfuse_url = f"{langfuse_base_url}/project/chronicle/prompts"
-        console.print(f"   Prompt Mgmt:    {langfuse_url}")
-
-
-def stop_services(services, stop_manager=False):
-    """Stop specified services.
-
-    The service manager agent is only stopped on a full ``stop --all`` —
-    otherwise it stays up so individual services can be restarted from the UI.
-    """
-    console.print(f"🛑 [bold]Stopping {len(services)} services...[/bold]")
-
-    # The node agent (advertiser + control) is decoupled from the backend — it
-    # only stops on a full ``stop --all`` so individual services can still be
-    # restarted from the UI and advertising survives a backend-only stop.
-    if stop_manager:
-        _stop_service_manager()
-
-    success_count = 0
-    for service_name in services:
-        if service_name not in SERVICES:
-            console.print(f"[red]❌ Unknown service: {service_name}[/red]")
-            continue
-
-        console.print(f"\n🔧 Stopping {service_name}...")
-        if run_compose_command(service_name, "down"):
-            console.print(f"[green]✅ {service_name} stopped[/green]")
-            success_count += 1
-        else:
-            console.print(f"[red]❌ Failed to stop {service_name}[/red]")
-
-    console.print(
-        f"\n[green]🎉 {success_count}/{len(services)} services stopped successfully[/green]"
-    )
-
-
-def restart_services(services, recreate=False):
-    """Restart specified services"""
-    console.print(f"🔄 [bold]Restarting {len(services)} services...[/bold]")
-
-    if recreate:
-        console.print(
-            "[dim]Using down + up to recreate containers (fixes WSL2 bind mount issues)[/dim]\n"
-        )
-    else:
-        console.print(
-            "[dim]Recreating containers in place (picks up .env/config + mounted code; "
-            "use --recreate for a full down+up)[/dim]\n"
-        )
-
-    success_count = 0
-    for service_name in services:
-        if service_name not in SERVICES:
-            console.print(f"[red]❌ Unknown service: {service_name}[/red]")
-            continue
-
-        if not check_service_enabled(service_name):
-            console.print(
-                f"[yellow]⚠️  {service_name} not configured, skipping[/yellow]"
-            )
-            continue
-
-        console.print(f"\n🔧 Restarting {service_name}...")
-
-        if recreate:
-            # Full recreation: down + up (fixes bind mount issues)
-            if not run_compose_command(service_name, "down"):
-                console.print(f"[red]❌ Failed to stop {service_name}[/red]")
-                continue
-
-            if run_compose_command(service_name, "up"):
-                console.print(f"[green]✅ {service_name} restarted[/green]")
-                success_count += 1
-            else:
-                console.print(f"[red]❌ Failed to start {service_name}[/red]")
-        else:
-            # Recreate containers in place. NOT `compose restart`: that doesn't re-read
-            # .env/config, and podman-compose's `restart` is flaky — it silently leaves
-            # some containers (e.g. a slow-to-SIGTERM backend) untouched. `up
-            # --force-recreate` reliably recreates every container in the project and
-            # picks up env/config + volume-mounted code changes. The service-manager
-            # agent already restarts via down+up for the same reason.
-            if run_compose_command(service_name, "up", force_recreate=True):
-                console.print(f"[green]✅ {service_name} restarted[/green]")
-                success_count += 1
-            else:
-                console.print(f"[red]❌ Failed to restart {service_name}[/red]")
-
-    console.print(
-        f"\n[green]🎉 {success_count}/{len(services)} services restarted successfully[/green]"
-    )
-
-    # Ensure the node agent (control + advertising) is running
-    _start_service_manager()
-
-
-def show_status():
-    """Show status of all services"""
-    console.print("📊 [bold]Service Status:[/bold]\n")
-
-    table = Table()
-    table.add_column("Service", style="cyan")
-    table.add_column("Configured", justify="center")
-    table.add_column("Running", justify="center")
-    table.add_column("Description", style="dim")
-    table.add_column("Ports", style="green")
-
-    for service_name in SERVICES:
-        configured = "✅" if check_service_enabled(service_name) else "❌"
-        ports = ", ".join(service_display_ports(service_name))
-
-        # Check runtime health
-        status, detail = check_service_health(service_name)
-        if status == "healthy":
-            running = "[green]✅ healthy[/green]"
-        elif status == "partial":
-            running = f"[yellow]⚠ partial[/yellow] [dim]({detail})[/dim]"
-        elif status == "unhealthy":
-            running = "[red]⚠ unhealthy[/red]"
-        else:
-            running = "[dim]— stopped[/dim]"
-
-        table.add_row(
-            service_name,
-            configured,
-            running,
-            service_display_label(service_name),
-            ports,
-        )
-
-    console.print(table)
-
-    # Node agent status (control + Tailnet advertising)
-    if _service_manager_managed():
-        state = "running" if _unit_active("chronicle-service-manager") else "stopped"
-        console.print(
-            f"[green]🛠  Service manager {state} (systemd user service, port {_SERVICE_MANAGER_PORT})[/green]"
-        )
-    elif _service_manager_running():
-        pid = int(_SERVICE_MANAGER_PID.read_text().strip())
-        console.print(
-            f"[green]🛠  Service manager running (PID {pid}, port {_SERVICE_MANAGER_PORT})[/green]"
-        )
-    else:
-        console.print("[dim]🛠  Service manager not running[/dim]")
-
-    # Stack-on-boot oneshot (Podman has no daemon to revive containers on reboot)
-    if _unit_enabled("chronicle-stack"):
-        console.print(
-            "[green]🔁 Stack auto-start on boot enabled (systemd user service)[/green]"
-        )
-
-    console.print("\n💡 [dim]Use './start.sh' to start all configured services[/dim]")
-
-
-_TAILSCALED_DROPIN = Path(
-    "/etc/systemd/system/tailscaled.service.d/10-chronicle-preserve-runtime.conf"
-)
-_TAILSCALED_DROPIN_BODY = """# Installed by Chronicle (services.py).
-#
-# tailscaled declares RuntimeDirectory=tailscale, so systemd deletes and recreates
-# /run/tailscale on every restart. Containers bind-mount that directory to reach
-# the socket; when it is replaced they keep the old, deleted inode and every
-# connection is refused -- which silently stops Caddy serving the *.ts.net
-# certificate and stops the backend advertising over minidisc. Preserving the
-# directory keeps those mounts valid across tailscaled restarts.
-[Service]
-RuntimeDirectoryPreserve=yes
-"""
-
-
 def _compose_container_names(service_name):
     """Container names for a compose service, or [] if it isn't running.
 
@@ -2780,7 +2580,7 @@ def preflight():
 
     Deliberately advisory: a failing check never blocks a start, because a broken
     probe must not be able to keep Chronicle down. Repairs are not run here —
-    ``services.py doctor --repair`` and the node agent's watchdog own that.
+    ``./services doctor --repair`` and the node agent's watchdog own that.
     """
     try:
         results = run_all_checks(build_check_context())
@@ -2792,64 +2592,22 @@ def preflight():
     console.print("\n[yellow]⚠️  Host checks found problems:[/yellow]")
     for result in problems:
         console.print(f"   • {escape(result.title)}: {escape(result.detail)}")
-    console.print("   Run [bold]./services.py doctor[/bold] for details.\n")
+    console.print("   Run [bold]./services doctor[/bold] for details.\n")
 
 
-def main():
+def admin_main(argv=None):
     parser = argparse.ArgumentParser(description="Chronicle Service Management")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # Start command
-    start_parser = subparsers.add_parser("start", help="Start services")
-    start_parser.add_argument(
-        "services",
-        nargs="*",
-        help="Services to start: backend, speaker-recognition, asr-services (or use --all)",
+    deployment_parser = subparsers.add_parser(
+        "deployments", help="Read or update the authoritative placement plan"
     )
-    start_parser.add_argument(
-        "--all", action="store_true", help="Start all configured services"
+    deployment_parser.add_argument(
+        "--apply", type=Path, help="Apply a JSON plan with its expected revision"
     )
-    start_parser.add_argument(
-        "--build", action="store_true", help="Build images before starting"
+    deployment_parser.add_argument(
+        "--status", action="store_true", help="Check routing and exclusion compliance"
     )
-    start_parser.add_argument(
-        "--force-recreate",
-        action="store_true",
-        help="Force recreate containers even if unchanged",
-    )
-    start_parser.add_argument(
-        "--use-prebuilt",
-        metavar="TAG",
-        help="Use prebuilt images from GHCR (or custom registry via CHRONICLE_REGISTRY env var)",
-    )
-
-    # Stop command
-    stop_parser = subparsers.add_parser("stop", help="Stop services")
-    stop_parser.add_argument(
-        "services",
-        nargs="*",
-        help="Services to stop: backend, speaker-recognition, asr-services (or use --all)",
-    )
-    stop_parser.add_argument("--all", action="store_true", help="Stop all services")
-
-    # Restart command
-    restart_parser = subparsers.add_parser("restart", help="Restart services")
-    restart_parser.add_argument(
-        "services",
-        nargs="*",
-        help="Services to restart: backend, speaker-recognition, asr-services (or use --all)",
-    )
-    restart_parser.add_argument(
-        "--all", action="store_true", help="Restart all services"
-    )
-    restart_parser.add_argument(
-        "--recreate",
-        action="store_true",
-        help="Recreate containers (down + up) instead of quick restart - fixes WSL2 bind mount issues",
-    )
-
-    # Status command
-    subparsers.add_parser("status", help="Show service status")
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -2954,104 +2712,48 @@ def main():
         help="Action ('install'/'uninstall' = systemd user service for boot persistence)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.command:
-        show_status()
-        return
+        parser.print_help()
+        return 0
 
-    if args.command == "status":
-        show_status()
+    if args.command == "deployments":
+        # Placement dependencies load only for explicit deployment administration.
+        from deployment_guard import control_headers, placement_config
+
+        cfg = placement_config(Path(__file__).resolve().parent)
+        url = cfg.get("coordinator_url", "").rstrip("/")
+        if not url:
+            parser.error(
+                "Configure service_placement.coordinator_url and node_id first"
+            )
+        try:
+            if args.apply:
+                response = requests.put(
+                    url + "/deployments",
+                    json=json.loads(args.apply.read_text()),
+                    headers=control_headers(Path(__file__).resolve().parent),
+                    timeout=120,
+                )
+            else:
+                response = requests.get(
+                    url + ("/deployments/status" if args.status else "/deployments"),
+                    headers=control_headers(Path(__file__).resolve().parent),
+                    timeout=120,
+                )
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
+        except (requests.RequestException, ValueError, OSError) as exc:
+            console.print(f"[red]Deployment request failed: {escape(str(exc))}[/red]")
+            if isinstance(exc, requests.HTTPError):
+                console.print(escape(exc.response.text))
+            sys.exit(1)
 
     elif args.command == "doctor":
         if args.install_tailscaled_dropin:
             install_tailscaled_dropin()
         sys.exit(run_doctor(as_json=args.json, repair=args.repair))
-
-    elif args.command == "start":
-        if args.all:
-            services = [
-                s
-                for s in SERVICES.keys()
-                if check_service_enabled(s)
-                or (s == "langfuse" and _langfuse_enabled_in_backend())
-            ]
-        elif args.services:
-            # Validate service names
-            invalid_services = [s for s in args.services if s not in SERVICES]
-            if invalid_services:
-                console.print(
-                    f"[red]❌ Invalid service names: {', '.join(invalid_services)}[/red]"
-                )
-                console.print(f"Available services: {', '.join(SERVICES.keys())}")
-                return
-            services = args.services
-        else:
-            console.print(
-                "[red]❌ No services specified. Use --all or specify service names.[/red]"
-            )
-            return
-
-        if args.use_prebuilt:
-            if os.environ.get("CHRONICLE_REGISTRY"):
-                registry = os.environ["CHRONICLE_REGISTRY"]
-            elif os.environ.get("DOCKERHUB_USERNAME"):
-                registry = f"{os.environ['DOCKERHUB_USERNAME']}/"
-            else:
-                registry = "ghcr.io/simpleopensoftware/"
-            os.environ["CHRONICLE_REGISTRY"] = registry
-            os.environ["CHRONICLE_TAG"] = args.use_prebuilt
-            console.print(
-                f"[cyan]ℹ️  Using prebuilt images: {registry}*:{args.use_prebuilt}[/cyan]"
-            )
-            build_flag = False
-        else:
-            build_flag = args.build
-
-        start_services(services, build_flag, args.force_recreate)
-
-    elif args.command == "stop":
-        if args.all:
-            # Only stop configured services (like start --all does)
-            services = [s for s in SERVICES.keys() if check_service_enabled(s)]
-        elif args.services:
-            # Validate service names
-            invalid_services = [s for s in args.services if s not in SERVICES]
-            if invalid_services:
-                console.print(
-                    f"[red]❌ Invalid service names: {', '.join(invalid_services)}[/red]"
-                )
-                console.print(f"Available services: {', '.join(SERVICES.keys())}")
-                return
-            services = args.services
-        else:
-            console.print(
-                "[red]❌ No services specified. Use --all or specify service names.[/red]"
-            )
-            return
-
-        stop_services(services, stop_manager=args.all)
-
-    elif args.command == "restart":
-        if args.all:
-            services = [s for s in SERVICES.keys() if check_service_enabled(s)]
-        elif args.services:
-            # Validate service names
-            invalid_services = [s for s in args.services if s not in SERVICES]
-            if invalid_services:
-                console.print(
-                    f"[red]❌ Invalid service names: {', '.join(invalid_services)}[/red]"
-                )
-                console.print(f"Available services: {', '.join(SERVICES.keys())}")
-                return
-            services = args.services
-        else:
-            console.print(
-                "[red]❌ No services specified. Use --all or specify service names.[/red]"
-            )
-            return
-
-        restart_services(services, recreate=args.recreate)
 
     elif args.command == "update":
         import updates  # lazy: updates.py imports this module
@@ -3079,8 +2781,12 @@ def main():
             sys.exit(0 if ok else 1)
 
     elif args.command == "manager":
+        if args.manager_action in ("stop", "restart") and _service_manager_managed():
+            return _systemctl_user(
+                args.manager_action, "chronicle-service-manager", capture=False
+            ).returncode
         if args.manager_action == "start":
-            _start_service_manager()
+            return 0 if _start_service_manager() else 1
         elif args.manager_action == "stop":
             _stop_service_manager()
         elif args.manager_action == "restart":
@@ -3099,11 +2805,11 @@ def main():
 
     elif args.command == "firewall":
         if args.firewall_action == "sync":
-            firewall_sync()
+            return 0 if firewall_sync() else 1
         elif args.firewall_action == "list":
             firewall_list()
         elif args.firewall_action == "clear":
-            firewall_clear()
+            return 0 if firewall_clear() else 1
 
     elif args.command == "remote-control":
         if args.remote_control_action == "start":
@@ -3119,7 +2825,3 @@ def main():
             install_remote_control()
         elif args.remote_control_action == "uninstall":
             uninstall_remote_control()
-
-
-if __name__ == "__main__":
-    main()

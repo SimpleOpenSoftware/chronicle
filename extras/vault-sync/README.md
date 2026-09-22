@@ -131,7 +131,7 @@ On the machine running the Chronicle backend:
    ```
    Make sure port **22000** is reachable from your Mac (it is over Tailscale; on a
    Windows/WSL2 host run `uv run --with-requirements setup-requirements.txt python
-   services.py firewall sync` from the repo root — it manages the Windows Firewall
+   ./services firewall sync` from the repo root — it manages the Windows Firewall
    rules for all enabled services, vault sync included).
 3. Verify the broker chain (should return a `server_device_id` + your `sync_address`):
    ```bash

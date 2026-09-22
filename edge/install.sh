@@ -174,16 +174,16 @@ if [[ "$CLIENT_MODE" == "1" ]]; then
     CLIENT_ARGS=""
     [[ "$PENDANT" == "1" ]] && CLIENT_ARGS="--pendant"
     info "Installing client components + node agent (no containers, no GPU)..."
-    uv run --with-requirements setup-requirements.txt python3 services.py client install $CLIENT_ARGS
+    ./services client install $CLIENT_ARGS
 
     ok "────────────────────────────────────────"
     ok "  Client node ready!"
     ok ""
     ok "  Tray:     look for the Chronicle icon in your system tray / menu bar"
-    ok "  Status:   uv run --with-requirements setup-requirements.txt python3 services.py client status"
+    ok "  Status:   ./services client status"
     ok "  Collector: pair ScreenPipe via the WebUI Timeline → Sources panel, then"
     ok "             uv run --project extras/screenpipe-collector chronicle-screenpipe pair ..."
-    ok "             uv run --with-requirements setup-requirements.txt python3 services.py client install screenpipe-collector"
+    ok "             ./services client install screenpipe-collector"
     ok ""
     ok "  Updates from the hub restart these components automatically."
     ok "────────────────────────────────────────"
@@ -303,13 +303,13 @@ m.set_enabled_services(services)
 print(f"enabled {svc}")
 PY
     info "Starting $SERVICE_NAME + node agent (advertises on the Tailnet)..."
-    uv run --with-requirements setup-requirements.txt python3 services.py start "$SERVICE_NAME" --build
+    ./services start "$SERVICE_NAME" --build
     info "Installing node agent for boot persistence (skipped if systemd unavailable)..."
-    uv run --with-requirements setup-requirements.txt python3 services.py manager install || true
+    ./services manager install || true
     MODE_DESC="node agent (advertise + control, reboot-survivable)"
-    STATUS_CMD="cd $CHRONICLE_HOME && ./status.sh"
+    STATUS_CMD="cd $CHRONICLE_HOME && ./services status"
     LOGS_CMD="$ENGINE ps   # then: $ENGINE logs -f <container>"
-    STOP_CMD="cd $CHRONICLE_HOME && uv run --with-requirements setup-requirements.txt python3 services.py stop $SERVICE_NAME"
+    STOP_CMD="cd $CHRONICLE_HOME && ./services stop $SERVICE_NAME"
 fi
 
 ok "────────────────────────────────────────"

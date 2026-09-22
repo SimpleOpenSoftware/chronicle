@@ -107,8 +107,8 @@ def configure(non_interactive: bool = False, hf_token: str | None = None) -> Non
     else:
         console.print(f"[green]Wake-word model present: {MODEL_PATH}[/green]")
 
-    console.print("\n[bold]Next:[/bold] start with ./start.sh or:")
-    console.print("  cd extras/wakeword-service && docker compose up --build -d")
+    console.print("\n[bold]Next:[/bold] start from the repository root:")
+    console.print("  ./services start wakeword-service --build")
 
 
 def main() -> None:

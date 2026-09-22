@@ -136,7 +136,7 @@ export default function RemoteControl({ isAdmin }: { isAdmin: boolean }) {
       <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
         Backed by a tmux session (<code className="text-xs">tmux attach -t {data.session ?? 'chronicle-rc'}</code> at
         the desktop). Make it survive reboots from the wizard's "auto-start on boot" step, or{' '}
-        <code className="text-xs">services.py remote-control install</code>.
+        <code className="text-xs">./services remote-control install</code>.
       </p>
     </Card>
   )

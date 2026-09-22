@@ -1,5 +1,9 @@
 # Running Chronicle with Podman
 
+For everyday status, start/stop/restart, recovery checks, and the boundary for raw
+engine diagnostics, use the [service-management workflow](init-system.md#service-management).
+This page covers Podman setup and engine-specific troubleshooting.
+
 Chronicle's service lifecycle (`services.py`, `status.py`, the service-manager
 agent) works with either **Docker** (default) or **Podman**. This is useful where
 Docker Desktop is unavailable (e.g. locked-down work machines) or when you prefer a
@@ -68,7 +72,7 @@ internally by querying `podman ps` scoped to the compose project label.
 
 4. **Select podman** in `config/config.yml` (`container_engine: podman`).
 
-5. **Start services as usual:** `./start.sh`, `./status.sh`, `./stop.sh` — they all
+5. **Start services as usual:** `./services start --all`, `./services status`, `./services stop --all` — they all
    route through the selected engine.
 
 ## Migrating an existing Docker install
@@ -123,10 +127,13 @@ internally by querying `podman ps` scoped to the compose project label.
   policies after a reboot (the policy still covers crash-restart while the box is
   up, just not the reboot gap). Instead of Podman's own `podman-restart.service`
   (which only matches `restart-policy=always`, *not* `unless-stopped`), Chronicle
-  ships a **`chronicle-stack`** systemd *user* oneshot that runs `services.py start
-  --all` on boot — the same path as `./start.sh`, respecting the `config.yml`
-  enabled set. It installs (with linger) alongside the node agent via the wizard's
-  "Auto-start on boot" prompt or `services.py manager install`, and is ordered
+  ships a **`chronicle-stack`** systemd *user* oneshot that runs `./services start
+  --all` on boot — the same path as `./services start --all`, respecting the `config.yml`
+  enabled set and authoritative node placement. Its `ExecStop` runs `services.py
+  stop --all`, so `systemctl --user stop chronicle-stack` shuts down the containers
+  while leaving the managed node agent available. It installs (with linger)
+  alongside the node agent via the wizard's
+  "Auto-start on boot" prompt or `./services manager install`, and is ordered
   `After=chronicle-service-manager.service`. So no compose-file edits or
   `podman-restart.service` are needed. Manage/inspect it with `systemctl --user
   status chronicle-stack` and `journalctl --user -u chronicle-stack`.
@@ -143,7 +150,7 @@ internally by querying `podman ps` scoped to the compose project label.
   problem is the mount). Git cannot store an empty directory, so any runtime dir
   a compose file mounts is missing on a fresh checkout. The failure is quiet:
   the container is left in `created`, not `exited`, so nothing is listening and
-  `./start.sh` reports success for the rest of the stack. Seen on kraken, where
+  `./services start --all` reports success for the rest of the stack. Seen on kraken, where
   `extras/asr-services`' `./debug` and `./lora_adapters` left the ASR service
   unstarted for days and dictation 503'd with "Cannot reach transcription
   service". Fix: commit a `.gitkeep` in each mounted runtime dir (done for those
@@ -169,7 +176,7 @@ internally by querying `podman ps` scoped to the compose project label.
   (`x-public-dns` in `backend/docker-compose.yml`). On a DNS-enabled
   network these become aardvark's *per-container* upstreams — the container's
   `resolv.conf` still points at aardvark, so container-name resolution is
-  unaffected, but the broken global fallback is bypassed. `./services.py doctor`
+  unaffected, but the broken global fallback is bypassed. `./services doctor`
   checks for it; the node agent's watchdog repairs it by churning a throwaway
   container to force a reload.
 
@@ -193,8 +200,8 @@ internally by querying `podman ps` scoped to the compose project label.
 - **Windows Firewall (WSL2).** Windows Defender Firewall blocks inbound LAN traffic
   to WSL2-hosted ports by default, so phones / companion Macs silently can't reach
   the backend (Docker Desktop's proxy used to get allowed implicitly; rootless
-  podman gets nothing). Chronicle manages the rules itself: `services.py start`
-  converges them automatically on WSL2 hosts, and `services.py firewall sync|list|clear`
+  podman gets nothing). Chronicle manages the rules itself: `./services start`
+  converges them automatically on WSL2 hosts, and `./services firewall sync|list|clear`
   drives them manually. Every managed rule is named `Chronicle: <service> <label>
   <port>/<proto>` and scoped to `localsubnet` + the Tailscale CGNAT range
   (`100.64.0.0/10`) — nothing is exposed to the public internet, and `clear` removes

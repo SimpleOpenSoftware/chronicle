@@ -32,7 +32,7 @@ A node is a git checkout, so its version is `git describe` on that checkout
 After the checkout moves, every enabled service (per `config/config.yml
 services:`) is restarted with `up --build` — or with prebuilt registry images
 when a prebuilt tag is given (same `CHRONICLE_REGISTRY`/`CHRONICLE_TAG` env
-contract as `services.py start --use-prebuilt`).
+contract as `./services start --use-prebuilt`).
 
 **Rollback:** if any service fails to come up on the new code, the checkout is
 restored to the previous commit (detached — local branches are never rewritten)
@@ -41,11 +41,11 @@ and the services are restarted from the old code.
 ## CLI (any node)
 
 ```bash
-uv run --with-requirements setup-requirements.txt python services.py update --check   # is an update available?
-uv run --with-requirements setup-requirements.txt python services.py update           # update + rebuild/restart services
-uv run ... python services.py update --tag v0.3.0                                     # pin a specific tag/ref
-uv run ... python services.py update --prebuilt v0.3.0                                # pull GHCR images instead of building
-uv run ... python services.py update --no-restart                                     # move the checkout only
+./services update --check   # is an update available?
+./services update           # update + rebuild/restart services
+uv run ... python ./services update --tag v0.3.0                                     # pin a specific tag/ref
+uv run ... python ./services update --prebuilt v0.3.0                                # pull GHCR images instead of building
+uv run ... python ./services update --no-restart                                     # move the checkout only
 ```
 
 ## Node agent API (`:8775`)
@@ -74,7 +74,7 @@ Updating the **hub** restarts the backend — the WebUI briefly disconnects.
 ## Known limits
 
 - The agent re-exec path doesn't re-resolve Python deps; if
-  `setup-requirements.txt` changed, re-run `./start.sh` (systemd-managed agents
+  `setup-requirements.txt` changed, re-run `./services start --all` (systemd-managed agents
   are fine — the unit restart goes through `uv run`).
 - No automatic/scheduled updates — checks and applies are operator-triggered
   (by design for a system doing live audio capture).

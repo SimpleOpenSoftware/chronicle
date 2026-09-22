@@ -114,12 +114,25 @@ journalctl --user -u chronicle-service-manager
 journalctl --user -u chronicle-stack
 ```
 
-For an unmanaged node agent, inspect `edge/service-manager.log`. Container logs remain
-the next source for why a service exited. Direct commands such as
-`services.py restart`, `./restart.sh`, or raw Compose/Podman commands do **not** create
-service-operation ledger entries, so absence from the ledger does not prove a restart
-was automatic. Also check the relevant shell history or host journal when direct
-execution is plausible.
+For an unmanaged node agent, inspect `edge/service-manager.log`. Normal CLI and WebUI
+lifecycle commands report to the same ledger. Explicit `--direct` recovery, failed
+ledger reporting, and raw engine operations can leave no entry; absence does not
+prove an automatic restart.
+
+## Service operations
+
+For status, lifecycle, rebuilds, or unavailable-service reports, read
+[the service-management workflow](docs/init-system.md#service-management) first.
+Use `./services status --detailed`, then the CLI's `logs`, `inspect`, `doctor`, and
+`deployments --status` commands as appropriate. Start/stop/restart requires named
+groups or explicit `--all`; remote execution requires `--node` with a registered ID.
+LLM, wakeword, and TTS are managed groups. Normal actions wait for readiness and
+share WebUI operation tracking. Use explicit `--direct` only for local recovery
+without the manager; admission still applies.
+
+Use raw engine commands for evidence the CLI does not expose, isolated development,
+unmanaged services, or a broken CLI. State the gap before going lower-level and
+redact secrets. After repairs, exercise the affected capability as well as readiness.
 
 ## Initial Setup & Configuration
 
@@ -144,7 +157,7 @@ uv run --with-requirements setup-requirements.txt python wizard.py
 # For step-by-step instructions, see quickstart.md
 ```
 
-**Note on Convenience Scripts**: Chronicle provides wrapper scripts (`./wizard.sh`, `./start.sh`, `./restart.sh`, `./stop.sh`, `./status.sh`) that simplify the longer `uv run --with-requirements setup-requirements.txt python` commands. Use these for everyday operations.
+**Operator entry points**: Use `./wizard.sh` for configuration and `./services` for service management. See [service operations](#service-operations).
 
 **Temporary Tooling Rule**: When a Python tool or dependency is needed only for a one-off task, run it ephemerally with `uv run --with <package> ...`; do not install it into a project environment or add it to project dependencies. For a package-owned CLI, use `uvx --from <package> <entrypoint>`. This applies to browser automation, screenshots, data inspection, and other temporary utilities.
 
@@ -172,11 +185,12 @@ Key features:
 
 ### Backend Development (Chronicle Backend - Primary)
 ```bash
+# From the repository root, start the managed backend
+./services start backend
+
 cd backend
 
-# Start full stack with Docker
-docker compose up --build -d
-
+# Standalone development alternative (use an isolated configuration)
 uv run python src/main.py
 
 # Code formatting and linting
@@ -264,27 +278,20 @@ npm run web
 ```
 
 ### Additional Services
+
+Start configured service groups from the repository root:
+
 ```bash
-# ASR Services
-cd extras/asr-services
-docker compose up parakeet-asr   # Offline ASR with Parakeet
-
-# Speaker Recognition (with tests)
-cd extras/speaker-recognition
-docker compose up --build
-./run-test.sh  # Run speaker recognition integration tests
-
-# HAVPE Relay (ESP32 bridge)
-cd extras/havpe-relay
-docker compose up --build
-
-# TTS Services (text-to-speech, run ONE provider at a time on port 8770)
-cd extras/tts
-docker compose up tada-tts -d --build        # HumeAI TADA (GPU, voice cloning)
-docker compose up fish-tts -d --build        # Fish Speech (GPU, 50+ langs, emotion tags)
-docker compose up kittentts-tts -d --build   # KittenTTS (~25MB CPU ONNX, no GPU)
-docker compose up kokoro-tts -d --build       # Kokoro-82M (<~1GB VRAM GPU/CPU, preset voices)
+./services start asr-services
+./services start speaker-recognition
+./services start tts
 ```
+
+Choose the ASR/TTS provider through setup or the WebUI System controls. For builds,
+provider changes, and diagnostics, follow the
+[service-management workflow](docs/init-system.md#service-management).
+Speaker recognition integration tests remain in `extras/speaker-recognition/run-test.sh`.
+The HAVPE relay has its own lifecycle; see `extras/havpe-relay/` for its setup.
 
 ## Architecture Overview
 
@@ -605,9 +612,8 @@ Provider-based text-to-speech (`extras/tts/`), built on the same provider patter
 # Configure (selects provider, model, CUDA version) — from the repository root
 uv run --with-requirements setup-requirements.txt python extras/tts/init.py
 
-# Start ONE provider
-cd extras/tts
-docker compose up tada-tts -d --build       # or fish-tts / kittentts-tts
+# Start the configured provider through the managed TTS group
+./services start tts
 
 # Test
 curl http://localhost:8770/health
@@ -625,7 +631,7 @@ curl -X POST http://localhost:8770/synthesize -F "text=Hello world." -o output.w
 **POST /synthesize** — `text` (required); optional `reference_audio` (WAV) + `reference_text` for voice cloning; optional generation params (`temperature`, `top_p`, `repetition_penalty`, `seed`, `max_new_tokens`). Returns WAV bytes with `X-Sample-Rate`, `X-Provider`, `X-Model` headers.
 
 **Notes:**
-- Not registered in `services.py` — manage with `docker compose` directly (like the HAVPE relay).
+- Registered as `tts` in `services.py`; select the provider via setup or the WebUI System controls. See [service management](docs/init-system.md#service-management).
 - GPU providers require CUDA 12.6+ (`PYTORCH_CUDA_VERSION=cu126`/`cu128`); `cu121` is unsupported (torch>=2.7).
 - Add a provider by creating `extras/tts/providers/{name}/` with `service.py`, `synthesizer.py`, and `Dockerfile` (subclass `BaseTTSService`).
 - An optional `edge-agent` sidecar (`--profile edge`) advertises the service on the Tailnet.
@@ -636,22 +642,18 @@ curl -X POST http://localhost:8770/synthesize -F "text=Hello world." -o output.w
 
 **Single Machine (Default):**
 ```bash
-# Everything on one machine
-docker compose up --build -d
+# Start configured services assigned to this node
+./services start --all
 ```
 
 **Distributed Setup (GPU + Backend separation):**
 
 #### GPU Machine Setup
 ```bash
-# Start GPU-accelerated services
-cd extras/asr-services
-docker compose up moonshine -d
+# From the repository root on the GPU node, start configured service groups
+./services start asr-services speaker-recognition
 
-cd extras/speaker-recognition
-docker compose up --build -d
-
-# Ollama with GPU support
+# Optional external Ollama, outside Chronicle's managed service registry
 docker run -d --gpus=all -p 11434:11434 \
   -v ollama:/root/.ollama \
   ollama/ollama:latest
@@ -664,8 +666,8 @@ OLLAMA_BASE_URL=http://[gpu-machine-tailscale-ip]:11434
 SPEAKER_SERVICE_URL=http://[gpu-machine-tailscale-ip]:8085
 PARAKEET_ASR_URL=http://[gpu-machine-tailscale-ip]:8080
 
-# Start lightweight backend services
-docker compose up --build -d
+# From the repository root, start the managed backend
+./services start backend
 ```
 
 #### Tailscale Networking
@@ -817,7 +819,7 @@ For temporary Python-backed tooling that is not part of the repo dependencies, p
 - Prefer GPU acceleration whenever the workload and deployed service support it.
 
 **Container Engine (Docker or Podman):**
-- The project supports **both Docker and Podman**. The active engine is set by `container_engine` in `config/config.yml` (default `docker`); prefer the lifecycle scripts (`./start.sh`/`./stop.sh`/`./restart.sh`) which route through the selected engine. For one-off manual commands under Podman use `podman-compose` (not `docker compose`). See **[@docs/podman.md](docs/podman.md)**.
+- The project supports **both Docker and Podman**. The active engine is set by `container_engine` in `config/config.yml` (default `docker`); prefer the lifecycle scripts (`./services start --all`/`./services stop --all`/`./services restart --all`) which route through the selected engine. For the lower-level cases described in [service operations](#service-operations), use `podman-compose` under Podman. See **[@docs/podman.md](docs/podman.md)**.
 
 **Docker Build Guidelines:**
 - Use `docker compose build` (or `podman-compose build`) without `--no-cache` by default for faster builds

@@ -158,10 +158,10 @@ two jobs for one machine:
 It must run natively on the host: docker compose needs host bind-mount paths, and (on
 Docker Desktop/WSL2) a container can't bind the Tailscale interface to advertise.
 
-- **Started automatically** by `./start.sh` / `./restart.sh` on **any** start (so a
-  service-only node with no backend still advertises); stopped by `./stop.sh` (full
-  `stop --all` only — a backend-only stop leaves it up and advertising)
-- **Manual control**: `uv run --with-requirements setup-requirements.txt python services.py manager start|stop|restart`
+- **Started automatically** by `./services start --all` / `./services restart --all` on **any** start (so a
+  service-only node with no backend still advertises). `stop --all` leaves the
+  agent running; `./services manager stop` stops it explicitly
+- **Manual control**: `./services manager start|stop|restart`
 - **Identity / cluster**: `GET /node` (host, Tailscale name/IP, arch, GPU) and `GET /cluster` (live tailnet view); both token-gated. `GET /health` is unauthed.
 - **Port**: 8775 (override with `SERVICE_MANAGER_PORT`)
 - **Auth**: bearer token, auto-generated into `backend/.env` as `SERVICE_MANAGER_TOKEN` on first start; the backend reads the same value and proxies admin-only requests (`/api/admin/services/*`) to the agent
@@ -177,15 +177,18 @@ start without an interactive login):
 1. **`chronicle-service-manager`** — the node agent itself. It runs **natively on the
    host**, not in Docker, so it does **not** come back after a reboot on its own; a
    fresh boot otherwise leaves the WebUI System page showing "Service manager not up,
-   use ./start.sh". `Type=exec`, started immediately on install.
-2. **`chronicle-stack`** — a `Type=oneshot` that runs `services.py start --all` on
-   boot to bring the **container stack** back (the enabled set from `config.yml`,
-   exactly what `./start.sh` does). Under **Docker** the containers' `restart:`
+   use ./services start --all". `Type=exec`, started immediately on install.
+2. **`chronicle-stack`** — a `Type=oneshot` that runs `./services start --all` on
+   boot to bring the **container stack** back (enabled services from `config.yml`
+   that placement permits on this node, exactly what `./services start --all` does).
+   `ExecStop` runs `./services stop --all`, so stopping or restarting this unit
+   also stops the containers. Start and stop each have a 15-minute budget.
+   Under **Docker** the containers' `restart:`
    policy revives them on boot, so this is belt-and-suspenders; under **rootless
    Podman** it's essential — Podman is daemonless and nothing re-applies `restart:`
    policies after a reboot (see [podman.md](podman.md)). Ordered
    `After=chronicle-service-manager.service`; enabled for boot only (installing it
-   does **not** kick off a full `start --all` — `./start.sh` owns the running stack).
+   does **not** kick off a full `start --all` — `./services start --all` owns the running stack).
 
 The wizard offers both near the end of setup ("Auto-start on boot"); you can also do
 it manually:
@@ -193,22 +196,37 @@ it manually:
 ```bash
 # Install both units (~/.config/systemd/user/chronicle-{service-manager,stack}.service),
 # enable linger, start the agent now and register the stack for boot
-uv run --with-requirements setup-requirements.txt python services.py manager install
+./services manager install
 
 # Remove both
-uv run --with-requirements setup-requirements.txt python services.py manager uninstall
+./services manager uninstall
 ```
 
-Once installed, `./start.sh` defers to systemd (`systemctl --user start`) instead of
-spawning a background process, `./stop.sh --all` leaves the managed agent running,
-and `./status.sh` reports the agent as `(systemd user service)` and shows whether
-stack-on-boot is enabled. Manage them directly with `systemctl --user
-status|stop|restart chronicle-service-manager` (or `chronicle-stack`); view logs with
-`journalctl --user -u chronicle-service-manager` (or `-u chronicle-stack`).
+Once installed, `./services start --all` uses systemd to ensure the **node agent** is running;
+the CLI submits container operations to that agent. `./services stop --all` leaves the managed agent
+running so it remains available for service controls. Inspect boot registration with
+`systemctl --user status chronicle-service-manager chronicle-stack`.
+
+Use `systemctl --user start|stop|restart chronicle-stack` to manage the stack through
+systemd, or use `./services` for operator commands. CLI operations do not
+update the oneshot unit's active state; after a direct stop, use `./services start --all` or
+`systemctl --user restart chronicle-stack` to bring containers back. Inspect logs
+with `journalctl --user -u chronicle-stack` or `-u chronicle-service-manager`.
+
+Start, stop and restart return a nonzero exit status if any selected service fails.
+Bulk start/restart skips groups assigned only to other nodes, allows declared HA
+instances, and fails closed if the placement plan cannot be read. Each activation
+still acquires its normal reservation. Explicit service requests remain subject to
+admission; stop does not require the authority, including for excluded instances.
+Start/restart waits for selected services to become ready; see the completion rules below.
+
+To refresh an older installed unit, rerun `./services manager install`. Installing
+the unit does not restart containers. If startup fails after partially starting
+services, inspect the command output and use `./services stop --all` to stop that partial stack.
 
 > **Upgrading from the old two-agent layout:** the standalone `chronicle-discovery`
-> systemd unit is obsolete (the node agent advertises now). `./start.sh` and
-> `services.py manager install` auto-disable and remove a leftover `chronicle-discovery`
+> systemd unit is obsolete (the node agent advertises now). `./services start --all` and
+> `./services manager install` auto-disable and remove a leftover `chronicle-discovery`
 > unit, so no manual cleanup is needed.
 
 > **Requires a systemd user instance.** On a normal Linux host this is available out
@@ -224,75 +242,120 @@ image hasn't been built yet.
 
 ## Service Management
 
-Chronicle now separates **configuration** from **service lifecycle management**:
+`./services` is the single operator entry point. It selects Docker or Podman from
+configuration and uses the same lifecycle implementation as the WebUI. Run it from
+the checkout; it resolves its own working directory. The old root start/stop/restart/
+status scripts and Python CLI entry points have been removed.
 
-### Unified Service Management
-
-**Convenience Scripts (Recommended):**
-```bash
-# Start all configured services
-./start.sh
-
-# Check service status
-./status.sh
-
-# Restart all services
-./restart.sh
-
-# Stop all services
-./stop.sh
-```
-
-**Note**: Convenience scripts wrap the longer `uv run --with-requirements setup-requirements.txt python` commands for ease of use.
-
-<details>
-<summary>Full commands (click to expand)</summary>
-
-Use the `services.py` script directly for more control:
+### Everyday operations
 
 ```bash
-# Start all configured services
-uv run --with-requirements setup-requirements.txt python services.py start --all --build
-
-# Start specific services
-uv run --with-requirements setup-requirements.txt python services.py start backend speaker-recognition
-
-# Check service status
-uv run --with-requirements setup-requirements.txt python services.py status
-
-# Restart all services
-uv run --with-requirements setup-requirements.txt python services.py restart --all
-
-# Restart specific services
-uv run --with-requirements setup-requirements.txt python services.py restart backend
-
-# Stop all services
-uv run --with-requirements setup-requirements.txt python services.py stop --all
-
-# Stop specific services
-uv run --with-requirements setup-requirements.txt python services.py stop asr-services speaker-recognition
+./services status
+./services status llm-services wakeword-service --detailed
+./services status --json
+./services start llm-services wakeword-service
+./services restart backend
+./services stop tts
+./services start --all
+./services stop --all
+./services start backend --build --force-recreate
+./services logs wakeword-service --tail 100
+./services inspect llm-services
+./services doctor
+./services deployments --status
 ```
 
-</details>
+Lifecycle commands require service names or explicit `--all`, never both. Names
+refer to service groups from the registry, not container names; help lists the
+available groups. ASR/TTS provider selection remains in setup and WebUI controls.
+A normal restart recreates containers in place without rebuilding images;
+`restart --recreate` performs down/up. Use `--build` for image changes. Mounted code
+must be present in the actual runtime mount; a deployment using a reviewed source
+snapshot needs that snapshot refreshed before restart.
 
-**Important Notes:**
-- **Restart** recreates containers in place (`up --force-recreate`) without rebuilding the image — it re-reads `.env`/config and picks up **volume-mounted code** (e.g. the backend's `./src`), so it's enough for most config and code changes
-- **For dependency/Dockerfile changes** (anything baked into the image), use `./stop.sh` then `./start.sh` to rebuild images
-- Convenience scripts handle common operations; use direct commands for specific service selection
-
-### Manual Service Management
-You can also manage services individually:
+The current node is the default. Remote operations require an explicit registered
+node ID; selection never silently moves to another owner:
 
 ```bash
-# Chronicle Backend
-cd backend && docker compose up --build -d
-
-# Speaker Recognition
-cd extras/speaker-recognition && docker compose up --build -d
-
-# ASR Services (only if using offline transcription)
-cd extras/asr-services && docker compose up --build -d
+./services status --node rainbow
+./services restart tts --node rainbow
+./services logs tts --node rainbow --tail 100
 ```
+
+`--all` start/restart selects enabled services allowed on that node by the placement
+plan. Stop can clean up excluded instances even if the authority is unavailable.
+Local inventory, endpoint readiness, and backend dependency health are separate
+status fields: a stopped local service may be supplied by another node.
+
+### Completion and recovery
+
+Normal lifecycle commands submit to the node manager, display an operation ID and
+progress, and wait for completion. The local manager is started once if needed,
+with a 30-second startup deadline. Read-only commands never start it. `stop --all`
+leaves the manager running; use `./services manager stop` to stop it explicitly.
+
+Start/restart launches every selected group before checking readiness. It waits up
+to 300 seconds after the container actions finish; change this with `--timeout`.
+Success requires running containers and provider-aware endpoint readiness, including
+configured identity checks. Stop verifies that containers stopped. A timeout reports
+failure without rolling back or resubmitting. Exit codes are 0 for success/accepted,
+1 for operational failure, and 2 for invalid usage.
+
+```bash
+./services start llm-services --timeout 600
+./services start llm-services --no-wait
+./services operation OPERATION_ID
+./services operation OPERATION_ID --node rainbow --json
+```
+
+`--no-wait` returns after acceptance; the manager continues readiness checks. Ctrl-C
+stops waiting without cancelling the accepted action. Poll its ID instead of issuing
+the action again. Operation polling is node-local and retained in manager memory;
+a manager restart can lose that polling record. Consult logs/System Events rather
+than assuming a lost record means the action did not happen.
+
+If the manager cannot start, use explicit local recovery:
+
+```bash
+./services stop llm-services --direct
+```
+
+`--direct` uses the same executor and host lock without the manager. It cannot be
+combined with `--node` or `--no-wait`. Admission still applies to start/restart, so an
+unavailable placement authority blocks activation. There is no automatic fallback.
+
+Readiness is not a complete end-to-end test: verify generation for an LLM, fresh
+job activity for background work, and a spoken-device test for wakeword when those
+capabilities are the subject of a repair.
+
+### Operation history and diagnostics
+
+CLI and WebUI lifecycle actions share node-manager operation tracking and **System
+Events → service** reporting. Event reporting is best effort: if the backend is down,
+the operation reports that history could not be written and node-manager logs remain
+available. Direct recovery is explicitly marked as outside that ledger.
+
+`logs` defaults to 100 lines per group container, with a maximum of 10,000; use
+`--container NAME` to select a container within the group. Live following is not
+implemented. `inspect` returns selected state, image, ports, mounts, and health timing
+fields, excluding environment variables and health command credentials. Both support
+`--json` and `--node`. Human operation timestamps are IST; JSON timestamps are Unix
+seconds. JSON output contains no decorative text.
+
+Use these commands before raw container-engine diagnostics. If a specific question
+requires evidence they do not expose, state that gap and use a scoped read-only
+engine command on the hosting node. Never dump full environments. Raw engine
+lifecycle commands are reserved for isolated development, unmanaged services, or a
+broken Chronicle CLI; explicit `--direct` is the first local recovery path.
+
+```bash
+journalctl --user -u chronicle-service-manager
+journalctl --user -u chronicle-stack
+```
+
+An unmanaged manager writes `edge/service-manager.log`. For an unexpected restart,
+check operation history first. Missing history does not prove a crash: direct
+recovery, failed event reporting, and raw engine actions can leave no ledger entry.
 
 ## Configuration Files
 
@@ -313,7 +376,7 @@ The `-e` matters: `uv run --with-requirements` caches the environment it
 builds and reuses it while this file's text is unchanged, so a non-editable path
 dependency stays frozen at the sources it was first built from. Edits to
 `chronicle_setup/` are then silently ignored by the wizard, every `init.py`, and
-`services.py doctor`, which keep running a stale wheel from `~/.cache/uv`.
+`./services doctor`, which keep running a stale wheel from `~/.cache/uv`.
 
 Measured on uv 0.6.16: neither `uv cache clean chronicle-setup` nor a
 `[tool.uv] cache-keys` entry invalidates it — only `--reinstall-package`, which
@@ -329,32 +392,9 @@ uv run --with-requirements setup-requirements.txt \
 
 ## Troubleshooting
 
-### Common Issues
-- **Port conflicts**: Check if services are already running on default ports
-- **Permission errors**: Ensure scripts are executable (`chmod +x setup.sh`)
-- **Missing dependencies**: Install uv and ensure setup-requirements.txt dependencies available
-- **Service startup failures**: Check Docker is running and has sufficient resources
-
-### Service Health Checks
-```bash
-# Backend health
-curl http://localhost:8000/health
-
-# Speaker Recognition health
-curl http://localhost:8085/health
-
-# ASR service health
-curl http://localhost:8767/health
-```
-
-### Logs and Debugging
-```bash
-# View service logs
-docker compose logs [service-name]
-
-# Backend logs
-cd backend && docker compose logs chronicle-backend
-
-# Speaker Recognition logs
-cd extras/speaker-recognition && docker compose logs speaker-service
-```
+Start with the [service-management workflow](#service-management): detailed status,
+host diagnostics, placement checks, and then scoped logs. Check that the configured
+container engine is available (Docker needs its daemon; rootless Podman does not).
+For Podman host prerequisites and engine-specific faults, see [podman.md](podman.md).
+Use the actual deployment address for endpoint checks; localhost applies only on the
+hosting node. Prefer HTTPS and use `curl -k` for an internal/self-signed certificate.

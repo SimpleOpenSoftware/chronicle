@@ -6,7 +6,7 @@
 #   DOCKERHUB_USERNAME=myuser ./scripts/push-images.sh v1.0.0 "description"   # backward compat
 #
 # Requirements:
-#   - Images must already be built locally (run ./start.sh --build first)
+#   - Images must already be built locally (run ./services start --all --build first)
 #   - CHRONICLE_PUSH_REGISTRY or DOCKERHUB_USERNAME env var must be set
 #   - Must be logged in to the target registry (docker login)
 
@@ -95,7 +95,7 @@ for entry in "${IMAGES[@]}"; do
 
     # Check if image exists locally
     if ! docker image inspect "${LOCAL_NAME}" > /dev/null 2>&1; then
-        warn "  Not found locally — skipping (run ./start.sh --build to build it first)"
+        warn "  Not found locally — skipping (run ./services start --all --build to build it first)"
         SKIPPED+=("${LOCAL_NAME}")
         continue
     fi
@@ -186,7 +186,7 @@ if [[ ${#PUSHED[@]} -gt 0 ]]; then
     echo ""
     echo "To restore this snapshot:"
     echo "  CHRONICLE_REGISTRY=${REGISTRY} ./scripts/pull-images.sh ${TAG}"
-    echo "  CHRONICLE_REGISTRY=${REGISTRY} ./start.sh --use-prebuilt ${TAG}"
+    echo "  CHRONICLE_REGISTRY=${REGISTRY} ./services start --all --use-prebuilt ${TAG}"
 fi
 if [[ ${#SKIPPED[@]} -gt 0 ]]; then
     warn "${#SKIPPED[@]} image(s) were skipped (not found locally)"

@@ -54,7 +54,7 @@ On Docker Desktop (macOS/Windows) the `tailscaled` socket isn't reachable from t
 Docker VM, so Caddy can't fetch a `*.ts.net` cert. There the wizard issues the cert on
 the host (`tailscale cert` → `certs/server.crt`/`server.key`, mounted into Caddy) and the
 Caddyfile includes a `tls /certs/...` directive. `services.py` renews it on every
-`./start.sh` / `./restart.sh` if it's within 21 days of expiry — no cron needed, since
+`./services start --all` / `./services restart --all` if it's within 21 days of expiry — no cron needed, since
 those boxes restart frequently.
 
 ## Setup via Wizard
@@ -89,7 +89,7 @@ Two distinct faults, and the Caddy log tells you which:
   `RuntimeDirectory=tailscale` deletes and recreates `/run/tailscale` on every
   `tailscaled` restart, so the container keeps a deleted socket. Chronicle now
   mounts the *directory* and installs a `RuntimeDirectoryPreserve=yes` drop-in
-  (`./services.py doctor --install-tailscaled-dropin`, needs root) so the directory
+  (`./services doctor --install-tailscaled-dropin`, needs root) so the directory
   survives too. To recover an already-affected container, restart it — the engine
   re-applies mounts on start, so no rebuild is needed.
 - `Access denied: cert access denied` — the **Tailscale operator is unset**. Caddy
@@ -106,7 +106,7 @@ echo | openssl s_client -connect localhost:443 -servername <your-name>.ts.net \
   2>/dev/null | openssl x509 -noout -issuer -enddate     # want issuer=Let's Encrypt
 ```
 
-`./services.py doctor` checks all of the above, and the node agent's watchdog
+`./services doctor` checks all of the above, and the node agent's watchdog
 repairs the socket and operator faults automatically.
 
 **HTTPS not working**:

@@ -4,8 +4,8 @@ Reference for `backend/docker-compose.yml` — what each service is for and
 why the non-obvious settings are the way they are. The compose file itself carries
 only short pointers back here.
 
-Do not drive this file by hand for day-to-day operation: `./start.sh` / `./stop.sh` /
-`./restart.sh` route through `services.py`, which selects the container engine
+Do not drive this file by hand for day-to-day operation: `./services start --all` / `./services stop --all` /
+`./services restart --all` route through `services.py`, which selects the container engine
 (`container_engine: docker|podman` in `config/config.yml`), exports build args, and
 activates the right profiles. See [init-system.md](../init-system.md) and
 [podman.md](../podman.md).

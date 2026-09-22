@@ -9,7 +9,7 @@
 #   DOCKERHUB_USERNAME=myuser ./scripts/pull-images.sh v1.0.0   # backward compat
 #
 # After pulling, start with the prebuilt images:
-#   ./start.sh --use-prebuilt v1.0.0
+#   ./services start --all --use-prebuilt v1.0.0
 
 set -euo pipefail
 
@@ -120,7 +120,7 @@ if [[ ${#PULLED[@]} -gt 0 ]]; then
     success "Pulled ${#PULLED[@]} image(s) tagged as ${TAG}"
     echo ""
     echo "Start services with prebuilt images:"
-    echo -e "  ${BOLD}./start.sh --use-prebuilt ${TAG}${RESET}"
+    echo -e "  ${BOLD}./services start --all --use-prebuilt ${TAG}${RESET}"
 fi
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     warn "${#FAILED[@]} image(s) not found in registry (these services will fall back to local builds)"

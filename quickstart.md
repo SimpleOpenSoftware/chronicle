@@ -124,7 +124,7 @@ cd chronicle
 uv run --with-requirements setup-requirements.txt python wizard.py
 ```
 
-**Note**: Convenience scripts (`./wizard.sh`, `./start.sh`, `./restart.sh`, `./stop.sh`, `./status.sh`) are wrappers around `wizard.py` and `services.py` that simplify the longer `uv run` commands.
+**Operator entry points**: `./wizard.sh` configures Chronicle; `./services` manages it.
 
 ### What the Setup Wizard Will Ask You
 
@@ -170,11 +170,8 @@ The wizard will ask questions - here's what to answer:
 
 **Start the services:**
 ```bash
-# Option 1: Using convenience script (recommended)
-./start.sh
-
-# Option 2: Direct command
-uv run --with-requirements setup-requirements.txt python services.py start --all --build
+# Start configured services and wait for readiness
+./services start --all
 ```
 
 *This downloads and starts all the AI services - takes 5-10 minutes first time*
@@ -264,15 +261,10 @@ Before connecting your phone, make sure everything works:
 
 ### Service Issues
 
-**General Service Management:**
-- **Services not responding**: Try restarting with `./restart.sh`
-- **Check service status**: Use `./status.sh`
-- **Stop all services**: Use `./stop.sh`
-
-*Full commands (what the convenience scripts wrap):*
-- Restart: `uv run --with-requirements setup-requirements.txt python services.py restart --all`
-- Status: `uv run --with-requirements setup-requirements.txt python services.py status`
-- Stop: `uv run --with-requirements setup-requirements.txt python services.py stop --all`
+Start with `./services status --detailed`. For lifecycle commands, starting only an affected
+service, rebuilds, diagnostics, and recovery verification, follow the
+[service-management workflow](docs/init-system.md#service-management). It applies to
+both Docker and Podman and includes the managed LLM, wakeword, and TTS services.
 
 **Cloud Services (Deepgram/OpenAI):**
 - **Transcription not working**: Check Deepgram API key is correct

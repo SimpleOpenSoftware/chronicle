@@ -76,7 +76,7 @@ This starts:
 ## Deployment
 
 This project runs the Vite dev server (`webui-dev`) as the only webui — there is
-no separate static/nginx production build. The standard stack (`./start.sh`)
+no separate static/nginx production build. The standard stack (`./services start --all`)
 starts it on http://localhost:5173, and Caddy fronts it for HTTPS (microphone
 access, remote/Tailscale). Source is volume-mounted, so changes hot-reload with
 no rebuild.

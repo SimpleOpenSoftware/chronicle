@@ -236,7 +236,7 @@ export default function ExternalServices({
     setLastFailedOp(null)
     if (service.name === 'backend' && action !== 'start') {
       const confirmed = window.confirm(
-        'Stopping the backend takes down this dashboard — you will need ./start.sh on the host to bring it back. Continue?'
+        'Stopping the backend takes down this dashboard — you will need ./services start backend on the host to bring it back. Continue?'
       )
       if (!confirmed) return
     }
@@ -391,8 +391,7 @@ export default function ExternalServices({
           </h3>
           <p className="text-sm text-gray-500 dark:text-gray-400">
             Service manager agent is not reachable. Start it on the host with{' '}
-            <code className="px-1 bg-gray-100 dark:bg-gray-700 rounded">./start.sh</code> or{' '}
-            <code className="px-1 bg-gray-100 dark:bg-gray-700 rounded">uv run python services.py manager start</code>.
+            <code className="px-1 bg-gray-100 dark:bg-gray-700 rounded">./services manager start</code>.
           </p>
         </Card>
       )

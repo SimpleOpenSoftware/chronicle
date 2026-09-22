@@ -9,9 +9,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import discovery
-import services
-
 # Shared setup helpers (extras/chronicle-setup, installed via setup-requirements.txt)
 from chronicle_setup import (
     ConfigManager,
@@ -29,6 +26,9 @@ from chronicle_setup import (
 from dotenv import set_key
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
+
+import discovery
+import services
 
 console = Console()
 
@@ -1525,7 +1525,7 @@ def maybe_enable_remote_control():
     if shutil.which("claude") is None:
         console.print(
             "[dim]claude CLI not found — skipping. Install Claude Code and log in, "
-            "then run: services.py remote-control install[/dim]"
+            "then run: ./services remote-control install[/dim]"
         )
         return
     if shutil.which("tmux") is None:
@@ -1766,7 +1766,14 @@ def join_cluster():
     # 6. Start the service(s) + the node agent (which advertises on the Tailnet).
     #    build=True because images won't exist yet on a fresh node.
     console.print("\n🚀 Starting services + node agent…")
-    services.start_services(chosen, build=True)
+    # Deferred so the setup wizard does not initialize the operator CLI at startup.
+    from service_cli import main as service_cli
+
+    if service_cli(["start", *chosen, "--build"]) != 0:
+        console.print(
+            "[red]Service startup failed; inspect ./services status --detailed[/red]"
+        )
+        return
 
     # 7. Offer boot persistence for the node agent (systemd user service).
     maybe_install_agent_services()
@@ -2369,10 +2376,8 @@ def main():
 
     # Service Management Commands
     console.print("2. Start all configured services:")
-    console.print("   [cyan]./start.sh[/cyan]")
-    console.print(
-        "   [dim]Or: uv run --with-requirements setup-requirements.txt python services.py start --all --build[/dim]"
-    )
+    console.print("   [cyan]./services start --all[/cyan]")
+    console.print("   [dim]Or: ./services start --all --build[/dim]")
     console.print("")
     console.print("3. Or start individual services:")
 
@@ -2406,23 +2411,17 @@ def main():
 
     if configured_services:
         service_list = " ".join(configured_services)
-        console.print(
-            f"   [cyan]uv run --with-requirements setup-requirements.txt python services.py start {service_list}[/cyan]"
-        )
+        console.print(f"   [cyan]./services start {service_list}[/cyan]")
 
     console.print("")
     console.print("3. Check service status:")
-    console.print("   [cyan]./status.sh[/cyan]")
-    console.print(
-        "   [dim]Or: uv run --with-requirements setup-requirements.txt python services.py status[/dim]"
-    )
+    console.print("   [cyan]./services status[/cyan]")
+    console.print("   [dim]Or: ./services status[/dim]")
 
     console.print("")
     console.print("4. Stop services when done:")
-    console.print("   [cyan]./stop.sh[/cyan]")
-    console.print(
-        "   [dim]Or: uv run --with-requirements setup-requirements.txt python services.py stop --all[/dim]"
-    )
+    console.print("   [cyan]./services stop --all[/cyan]")
+    console.print("   [dim]Or: ./services stop --all[/dim]")
 
     # Show minidisc discovery info if Tailscale is available
     ts_dns_final, ts_ip_final = detect_tailscale_info()

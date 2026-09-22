@@ -1,6 +1,6 @@
 # The Chronicle backend stack. What each service is for, and why the non-obvious
 # settings below are the way they are: docs/backend/compose-stack.md
-# Drive it with ./start.sh / ./stop.sh / ./restart.sh, not by hand.
+# Drive it with ./services start --all / ./services stop --all / ./services restart --all, not by hand.
 
 # Explicit DNS upstreams; Tailscale's resolver first. Without these, aardvark
 # (Podman) can silently stop forwarding external queries; with only public ones,

@@ -15,7 +15,7 @@ It does two jobs that were previously two separate native processes:
 
 It also exposes node identity (/node) and a live cluster view (/cluster).
 
-Launched by services.py (any ./start.sh) with:
+Launched by services.py (any ./services start --all) with:
   SERVICE_MANAGER_TOKEN  — shared secret, required (auto-generated into
                            backend/.env on first start)
   SERVICE_MANAGER_PORT   — default 8775
@@ -62,6 +62,8 @@ import discovery  # noqa: E402  (repo-root discovery.py)
 import services  # noqa: E402  (repo-root services.py)
 import status  # noqa: E402  (repo-root status.py — restart-count helper)
 import updates  # noqa: E402  (repo-root updates.py — version + self-update)
+from service_operations import OperationRequest  # noqa: E402
+from service_operations import OperationLock, diagnostics, execute, redact
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,6 +129,18 @@ def require_token(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ):
+    # Local imports let token checks run after repository path initialization.
+    import secrets
+
+    from deployment_guard import control_token
+
+    shared_token = control_token(REPO_ROOT)
+    if (
+        shared_token
+        and credentials is not None
+        and secrets.compare_digest(credentials.credentials, shared_token)
+    ):
+        return
     # Valid bearer token always passes (local backend / docker-bridge callers).
     if TOKEN and credentials is not None and credentials.credentials == TOKEN:
         return
@@ -143,7 +157,7 @@ def require_token(
 # ── Operations: one compose operation at a time, polled by id ────────────────
 
 _ops_lock = threading.Lock()  # guards _operations dict
-_busy_lock = threading.Lock()  # serializes compose operations
+_busy_lock = OperationLock()  # serializes compose operations
 _operations: dict[str, dict] = {}
 _MAX_OPERATIONS = 50
 
@@ -174,6 +188,7 @@ def _report_operation_event(op: dict) -> None:
     """Append a service-control operation to the backend's rolling event ledger."""
     token = os.environ.get("SYSTEM_EVENT_INGEST_TOKEN") or TOKEN
     if not token:
+        op["audit_warning"] = "System Events ingest token is not configured"
         logger.warning(
             "Operation %s/%s was not added to the system-event ledger: no ingest token",
             op["service"],
@@ -197,6 +212,8 @@ def _report_operation_event(op: dict) -> None:
         "finished_at": op["finished_at"],
         "phase": op["phase"],
     }
+    if "results" in op:
+        metadata["results"] = op["results"]
     detail = op["log"].strip() or None
     payload = {
         "severity": "error" if status == "failed" else "info",
@@ -215,6 +232,7 @@ def _report_operation_event(op: dict) -> None:
         )
         response.raise_for_status()
     except requests.RequestException as exc:
+        op["audit_warning"] = "System Events unavailable; inspect node-manager logs"
         logger.warning(
             "Operation %s/%s could not be added to the system-event ledger: %s",
             service,
@@ -223,7 +241,7 @@ def _report_operation_event(op: dict) -> None:
         )
 
 
-def _run_operation(op: dict, fn):
+def _run_operation(op: dict, fn, guard_activation=True):
     """Run a compose operation in a thread, capturing services.py console output.
 
     ``fn`` is called with the op dict so it can publish progress via
@@ -235,20 +253,37 @@ def _run_operation(op: dict, fn):
         original_console = services.console
         services.console = Console(file=buf, force_terminal=False, width=120)
         try:
-            ok = fn(op)
-            op["ok"] = bool(ok)
-            op["status"] = "done" if ok else "failed"
+            if guard_activation and (
+                op["action"] == "start"
+                or op["action"] == "restart"
+                or op["action"].startswith("provider:")
+            ):
+                # Local import avoids the manager and placement router import cycle.
+                from deployment_guard import activation
+
+                with activation(REPO_ROOT, op["service"]):
+                    ok = fn(op)
+            else:
+                ok = fn(op)
+            outcome = {"ok": bool(ok), "status": "done" if ok else "failed"}
         except Exception as e:
             logger.exception("Operation %s/%s crashed", op["service"], op["action"])
-            op["ok"] = False
-            op["status"] = "failed"
+            outcome = {"ok": False, "status": "failed"}
             buf.write(f"\nException: {e}\n")
         finally:
             services.console = original_console
-            op["log"] = buf.getvalue()[-8000:]
-            op["finished_at"] = time.time()
-            _report_operation_event(op)
-            _busy_lock.release()
+            completion = {
+                **op,
+                **outcome,
+                "log": redact(buf.getvalue()[-8000:]),
+                "finished_at": time.time(),
+            }
+            try:
+                _report_operation_event(completion)
+            finally:
+                _busy_lock.release()
+                op.update(completion)
+
             logger.info(
                 "Operation %s %s → %s", op["action"], op["service"], op["status"]
             )
@@ -256,7 +291,7 @@ def _run_operation(op: dict, fn):
     threading.Thread(target=_go, daemon=True).start()
 
 
-def _start_operation(service: str, action: str, fn) -> dict:
+def _start_operation(service: str, action: str, fn, guard_activation=True) -> dict:
     if not _busy_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=409, detail="Another operation is already running"
@@ -264,7 +299,7 @@ def _start_operation(service: str, action: str, fn) -> dict:
     op = _record_operation(service, action)
     logger.info("Operation %s %s started (%s)", action, service, op["id"])
     _report_operation_event(op)
-    _run_operation(op, fn)
+    _run_operation(op, fn, guard_activation=guard_activation)
     return op
 
 
@@ -369,9 +404,20 @@ def _effective_health(name: str) -> tuple[str, str]:
     return health, detail
 
 
-def _service_entry(name: str, public_host: str | None = None) -> dict:
-    health, detail = _effective_health(name)
+def _service_entry(name: str, public_host: str | None = None, snapshot=None) -> dict:
+    snapshot = snapshot or status.collect_services([name])[name]
+    health = (
+        "healthy"
+        if snapshot["ready"]
+        else (
+            snapshot["container_status"]
+            if snapshot["container_status"] != "running"
+            else snapshot["health"]
+        )
+    )
+    detail = snapshot["detail"]
     return {
+        **snapshot,
         "name": name,
         # Label and ports are resolved from the service's .env, not the static
         # SERVICES entry: asr-services is one compose hosting many providers, so
@@ -663,6 +709,13 @@ def run_host_checks() -> list:
 
 
 def _watchdog_cycle(cfg: dict) -> None:
+    try:
+        reconcile_service_placement()
+    except Exception as exc:
+        logger.warning(
+            "Placement reconciliation unavailable; leaving running instances unchanged: %s",
+            exc,
+        )
     enabled_checks = cfg.get("checks") or {}
     for result in run_host_checks():
         if enabled_checks.get(result.id) is False:
@@ -838,9 +891,10 @@ def list_services(scope: str = "cluster"):
     self_host = _self_host()
     dns, ip = detect_tailscale_info()
     public_host = dns or ip or self_host
+    snapshots = status.collect_services()
     local = [
         {
-            **_service_entry(name, public_host),
+            **_service_entry(name, public_host, snapshots[name]),
             "node": self_host,
             "remote": False,
         }
@@ -871,6 +925,42 @@ def get_operation(op_id: str, node: str | None = None):
     return op
 
 
+@app.post("/operations", dependencies=[Depends(require_token)], status_code=202)
+def submit_operation(body: OperationRequest):
+    label = ",".join(body.services) if body.services else "all"
+    return {
+        "operation": _start_operation(
+            label, body.action, lambda op: execute(body, op), guard_activation=False
+        )
+    }
+
+
+@app.get("/diagnostics/status", dependencies=[Depends(require_token)])
+def diagnostic_status(services: str = ""):
+    try:
+        return {
+            "services": status.collect_services(
+                services.split(",") if services else None
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/diagnostics/{name}/{kind}", dependencies=[Depends(require_token)])
+def service_diagnostics(
+    name: str, kind: str, tail: int = 100, container: str | None = None
+):
+    if kind not in ("logs", "inspect"):
+        raise HTTPException(404, "Unknown diagnostic")
+    try:
+        return diagnostics(name, kind, tail, container)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(502, redact(str(exc))) from exc
+
+
 @app.post("/services/{name}/provider", dependencies=[Depends(require_token)])
 def set_provider(name: str, body: ProviderBody):
     # Forward to the owning node's agent if this isn't it (node stripped so the
@@ -886,6 +976,16 @@ def set_provider(name: str, body: ProviderBody):
         raise HTTPException(
             status_code=400, detail=f"{name} does not support provider switching"
         )
+
+    # Local imports avoid loading placement admission during manager bootstrap.
+    from deployment_guard import activation
+    from service_deployments import PlacementError
+
+    try:
+        with activation(REPO_ROOT, name):
+            pass
+    except PlacementError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
     env_path = REPO_ROOT / services.SERVICES[name]["path"] / ".env"
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -941,7 +1041,7 @@ def set_provider(name: str, body: ProviderBody):
         needs_container = bool(services._TTS_PROVIDER_TO_SERVICE.get(body.provider))
 
     # Keep config.yml's enabled set in step with the provider choice: the System
-    # page only shows/controls enabled services and ./start.sh only starts them, so
+    # page only shows/controls enabled services and ./services start --all only starts them, so
     # switching to a cloud (container-less) provider must disable the service and
     # switching to a local one must (re-)enable it — otherwise the dropdown that
     # made the switch disappears and the lifecycle drifts from the running state.
@@ -998,33 +1098,12 @@ def service_action(name: str, action: str, body: ActionBody | None = None):
             detail="Stopping the backend kills the WebUI. Pass force=true to confirm.",
         )
 
-    if action == "start":
-        if not services.check_service_enabled(name):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{name} is not enabled in config/config.yml — run the wizard first",
-            )
-
-        def fn(op):
-            op["phase"] = "Starting…"
-            return services.run_compose_command(name, "up", build=body.build)
-
-    elif action == "stop":
-
-        def fn(op):
-            op["phase"] = "Stopping…"
-            return services.run_compose_command(name, "down")
-
-    else:  # restart — down + up so provider/env changes take effect
-
-        def fn(op):
-            op["phase"] = "Stopping…"
-            if not services.run_compose_command(name, "down"):
-                return False
-            op["phase"] = "Starting…"
-            return services.run_compose_command(name, "up", build=body.build)
-
-    op = _start_operation(name, action, fn)
+    request = OperationRequest(
+        action=action, services=[name], build=body.build, recreate=body.recreate
+    )
+    op = _start_operation(
+        name, action, lambda op: execute(request, op), guard_activation=False
+    )
     return {"operation": op}
 
 
@@ -1100,7 +1179,7 @@ def _restart_self(delay: float = 3.0):
     Deferred a few seconds so the update operation's final poll can still read
     "done" from THIS process. Under systemd the unit restart re-resolves deps via
     uv; otherwise re-exec the same interpreter on the updated source (new deps in
-    setup-requirements.txt then need a manual ./start.sh, which is rare enough
+    setup-requirements.txt then need a manual ./services start --all, which is rare enough
     to accept).
     """
 
@@ -1201,6 +1280,13 @@ def remote_control_action(action: str):
             detail=f"remote-control {action} did not succeed (tmux/claude available?)",
         )
     return services.remote_control_status()
+
+
+# Deployment policy is independent of the backend so boot admission works while
+# the backend is unavailable. The gateway preserves streaming response bodies.
+from edge.deployments import install as install_deployments
+
+_deployment_store = install_deployments(app, sys.modules[__name__])
 
 
 def main():
