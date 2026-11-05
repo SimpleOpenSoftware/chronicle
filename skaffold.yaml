@@ -124,9 +124,9 @@ profiles:
           docker:
             dockerfile: Dockerfile.k8s
         - image: webui
-          context: backend/webui
+          context: .
           docker:
-            dockerfile: Dockerfile
+            dockerfile: backend/webui/Dockerfile.k8s
 
     deploy:
       helm:

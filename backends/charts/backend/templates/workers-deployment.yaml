@@ -1,3 +1,4 @@
+{{- if not .Values.workers.sidecar.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,25 +37,29 @@ spec:
           resources:
             {{- toYaml .Values.workers.resources | default .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: config-files
+              mountPath: /app/config
+              readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data-volume
               mountPath: {{ .Values.persistence.mountPath }}
             - name: data-volume
               mountPath: /app/audio_chunks
             {{- end }}
-            - name: mem0-ca-cert
-              mountPath: /etc/ssl/certs/mem0-ca.crt
-              subPath: ca.crt
-              readOnly: true
       volumes:
+        - name: config-files
+          configMap:
+            name: chronicle-config
+            items:
+              - key: defaults.yml
+                path: defaults.yml
+              - key: config.yml
+                path: config.yml
         {{- if .Values.persistence.enabled }}
         - name: data-volume
           persistentVolumeClaim:
             claimName: {{ include "backend.fullname" . }}-data
         {{- end }}
-        - name: mem0-ca-cert
-          configMap:
-            name: mem0-ca-cert
       {{- with .Values.workers.nodeSelector | default .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -67,3 +72,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}
