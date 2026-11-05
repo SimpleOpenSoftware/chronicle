@@ -6,6 +6,10 @@ metadata:
     {{- include "backend.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # The data PVC is ReadWriteOnce and the node has little spare memory, so stop
+  # the old pod before starting the new one instead of running both at once.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "backend.selectorLabels" . | nindent 6 }}
@@ -19,6 +23,11 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.workers.sidecar.enabled }}
+          # The sidecar owns the workers. start-k8s.sh would start a second fleet,
+          # and both fleets would transcribe every session.
+          command: ["python3", "-u", "src/backend/main.py"]
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -51,16 +60,15 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: config-files
+              mountPath: /app/config
+              readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data-volume
               mountPath: {{ .Values.persistence.mountPath }}
             - name: data-volume
               mountPath: /app/audio_chunks
             {{- end }}
-            - name: mem0-ca-cert
-              mountPath: /etc/ssl/certs/mem0-ca.crt
-              subPath: ca.crt
-              readOnly: true
 
         {{- if .Values.workers.sidecar.enabled }}
         # Workers sidecar container (optional)
@@ -81,26 +89,30 @@ spec:
           resources:
             {{- toYaml .Values.workers.resources | default .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: config-files
+              mountPath: /app/config
+              readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data-volume
               mountPath: {{ .Values.persistence.mountPath }}
             - name: data-volume
               mountPath: /app/audio_chunks
             {{- end }}
-            - name: mem0-ca-cert
-              mountPath: /etc/ssl/certs/mem0-ca.crt
-              subPath: ca.crt
-              readOnly: true
         {{- end }}
       volumes:
+        - name: config-files
+          configMap:
+            name: chronicle-config
+            items:
+              - key: defaults.yml
+                path: defaults.yml
+              - key: config.yml
+                path: config.yml
         {{- if .Values.persistence.enabled }}
         - name: data-volume
           persistentVolumeClaim:
             claimName: {{ include "backend.fullname" . }}-data
         {{- end }}
-        - name: mem0-ca-cert
-          configMap:
-            name: mem0-ca-cert
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

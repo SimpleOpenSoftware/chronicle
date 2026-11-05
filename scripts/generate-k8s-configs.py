@@ -45,9 +45,21 @@ def generate_k8s_manifests(namespace: str = "chronicle"):
             escaped_value = var_value.replace('"', '\\"')
             f.write(f'  {var_name}: "{escaped_value}"\n')
 
+        # Config files, mounted at /app/config by the backend chart
+        for file_name in ("defaults.yml", "config.yml"):
+            file_path = Path("config") / file_name
+            if not file_path.exists():
+                continue
+            f.write(f"  {file_name}: |\n")
+            for line in file_path.read_text().splitlines():
+                f.write(f"    {line}\n" if line else "\n")
+
     # Generate Secret
     secret_path = output_dir / "secrets.yaml"
-    with open(secret_path, "w") as f:
+    # Owner-only from creation: the file holds credentials (base64 is not encryption)
+    fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(secret_path, 0o600)  # O_CREAT mode does not change an existing file
+    with os.fdopen(fd, "w") as f:
         f.write("apiVersion: v1\n")
         f.write("kind: Secret\n")
         f.write("type: Opaque\n")

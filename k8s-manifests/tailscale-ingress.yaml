@@ -1,0 +1,25 @@
+# Tailnet entry point: https://chronicle-pure.<tailnet>.ts.net
+# One Ingress for both charts, because a Tailscale hostname can belong to only
+# one Ingress. Backend paths match backends/charts/backend/ingress-values.yaml.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chronicle-pure-ts
+  annotations:
+    tailscale.com/proxy-group: ushadow-proxies
+spec:
+  ingressClassName: tailscale
+  tls:
+    - hosts:
+        - chronicle-pure
+  rules:
+    - http:
+        paths:
+          - { path: /api, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /auth, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /users, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /ws, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /health, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /readiness, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /audio, pathType: Prefix, backend: { service: { name: backend, port: { number: 8000 } } } }
+          - { path: /, pathType: Prefix, backend: { service: { name: webui, port: { number: 80 } } } }

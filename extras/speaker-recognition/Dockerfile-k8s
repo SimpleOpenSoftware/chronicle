@@ -26,12 +26,14 @@ COPY src/ src/
 
 # Install dependencies and package
 # Use build arg to control CPU vs GPU mode
+# COMPUTE_MODE can be: cpu, gpu (defaults to cu121), cu121, cu126, cu128
 ARG COMPUTE_MODE=cpu
-RUN if [ "$COMPUTE_MODE" = "gpu" ]; then \
-        uv sync --no-default-groups --group gpu; \
-    else \
-        uv sync --no-default-groups --group cpu; \
-    fi
+RUN case "$COMPUTE_MODE" in \
+        gpu|cu121) uv sync --no-default-groups --extra cu121 ;; \
+        cu126) uv sync --no-default-groups --extra cu126 ;; \
+        cu128) uv sync --no-default-groups --extra cu128 ;; \
+        *) uv sync --no-default-groups --extra cpu ;; \
+    esac
 
 # Create directories
 RUN mkdir -p /app/audio_chunks /app/debug /app/data /models
