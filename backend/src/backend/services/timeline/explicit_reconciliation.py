@@ -14,12 +14,16 @@ from backend.models.timeline import (
 )
 from backend.services.immich_discovery import (
     check_immich_day_readiness,
+    immich_configured,
     import_immich_day_candidates,
     resolve_immich_user_id,
 )
 from backend.services.notifications import NotificationCommand, enqueue_notification
 from backend.services.redis_lock import distributed_lock
-from backend.services.timeline.dirty_ranges import authorize_explicit_range
+from backend.services.timeline.dirty_ranges import (
+    authorize_explicit_range,
+    cancel_range,
+)
 from backend.users import User
 
 # The readiness check can page through several Immich search windows before importing
@@ -61,7 +65,7 @@ async def request_explicit_reconciliation(
     start, _ = day_bounds(local_date, timezone_name)
     if start >= utcnow():
         raise ValueError("Cannot reconcile a future evidence interval")
-    if not skip_immich:
+    if not skip_immich and immich_configured():
         immich_owner_id = await resolve_immich_user_id()
         if immich_owner_id != user_id:
             raise PermissionError(
@@ -178,7 +182,8 @@ async def _request_explicit_reconciliation_locked(
             await request.save()
         return request, True
 
-    if not skip_immich:
+    # Importing also registers an Immich capture source, so skip it without Immich.
+    if not skip_immich and readiness.reason != "immich_unconfigured":
         await import_immich_day_candidates(user_id, readiness.target_assets)
     started_at, _ = day_bounds(local_date, timezone_name)
     ended_at = evidence_cutoff(request)
@@ -203,6 +208,59 @@ async def _request_explicit_reconciliation_locked(
     request.updated_at = utcnow()
     await request.save()
     return request, True
+
+
+class ReconciliationNotCancellable(ValueError):
+    """The request already finished, so there is nothing to stop."""
+
+
+CANCELLABLE_REQUEST_STATES = ("queued", "running")
+
+
+async def cancel_explicit_reconciliation(
+    *, user: User, request_id: str
+) -> TimelineReconciliationRequest:
+    """Stop one queued or running day request so the day can be requested again.
+
+    Order matters: the range is fenced first, so a worker that outlives the stop
+    command loses its lease rather than publishing; then the RQ job is stopped; the
+    request is marked last, because a still-active request is what blocks a retry.
+    """
+
+    user_id = str(user.id)
+    request = await TimelineReconciliationRequest.find_one(
+        TimelineReconciliationRequest.request_id == request_id,
+        TimelineReconciliationRequest.user_id == user_id,
+    )
+    if request is None:
+        raise LookupError("Reconciliation request not found")
+    if request.state not in CANCELLABLE_REQUEST_STATES:
+        raise ReconciliationNotCancellable(
+            f"Only a queued or running reconciliation can be cancelled "
+            f"(state={request.state})"
+        )
+    if request.dirty_range_id:
+        await cancel_range(
+            request.dirty_range_id,
+            user_id=user_id,
+            reason=f"Cancelled by user (request {request_id})",
+        )
+    if request.job_id:
+        await asyncio.to_thread(_stop_job, request.job_id)
+    request.state = "cancelled"
+    request.last_error = "Cancelled by user"
+    request.updated_at = utcnow()
+    await request.save()
+    return request
+
+
+def _stop_job(job_id: str) -> str:
+    # Lazy for the same worker-bootstrap reason as _queue_request.
+    from backend.controllers.queue_controller import (
+        stop_explicit_timeline_reconciliation,
+    )
+
+    return stop_explicit_timeline_reconciliation(job_id)
 
 
 def _queue_request(request_id: str) -> str | None:
