@@ -1,0 +1,10 @@
+{
+  "scheme": "chronicle",
+  "app_identifier": "com.chronicle.ush",
+  "team_id": "6SJ7NH4HSZ",
+  "asc_app_id": "6823126187",
+  "app_group": "group.chronicle",
+  "extensions": {
+    "com.chronicle.ush.share-extension": "ShareExtension"
+  }
+}

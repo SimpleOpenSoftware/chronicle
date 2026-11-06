@@ -1,0 +1,9 @@
+# Chronicle — Fastlane Appfile. All values come from ../build.json.
+require 'json'
+
+build_config = JSON.parse(File.read(File.join(File.dirname(__FILE__), '..', 'build.json')))
+
+app_identifier(build_config['app_identifier'])
+apple_id(ENV['FASTLANE_APPLE_ID'] || '')
+team_id(build_config['team_id'])
+itc_team_id(build_config['team_id'])
