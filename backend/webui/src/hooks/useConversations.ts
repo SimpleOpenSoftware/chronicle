@@ -83,6 +83,17 @@ export function useReprocessMemory() {
   })
 }
 
+export function useReprocessSummary() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (conversationId: string) => conversationsApi.reprocessSummary(conversationId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['conversations'] })
+      queryClient.invalidateQueries({ queryKey: ['conversation'] })
+    },
+  })
+}
+
 export function useReprocessSpeakers() {
   const queryClient = useQueryClient()
   return useMutation({

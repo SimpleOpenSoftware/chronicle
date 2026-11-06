@@ -23,6 +23,7 @@ from backend.controllers.queue_controller import (
     memory_queue,
     post_conv_enqueue_kwargs,
     start_post_conversation_jobs,
+    summary_bundle_in_flight,
     transcription_queue,
 )
 from backend.models.conversation import Conversation
@@ -1258,6 +1259,41 @@ async def reprocess_memory(
         return JSONResponse(
             status_code=500, content={"error": "Error starting memory reprocessing"}
         )
+
+
+async def reprocess_summary(conversation_id: str, user: User):
+    """Regenerate the title, short summary and detailed summary from the active transcript."""
+    conversation_model, error = await _get_conversation_or_error(conversation_id, user)
+    if error:
+        return error
+    if not conversation_model.transcript and not conversation_model.segments:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "This recording has no transcript to summarise yet"},
+        )
+    if summary_bundle_in_flight(conversation_id):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "A summary is already being generated for this recording"
+            },
+        )
+
+    jobs = enqueue_summary_job_bundle(
+        conversation_id,
+        meta={"conversation_id": conversation_id, "trigger": "summary_reprocess"},
+    )
+    logger.info(
+        f"Enqueued summary reprocessing {[job.id for job in jobs.values()]} "
+        f"for conversation {conversation_id}"
+    )
+    return JSONResponse(
+        content={
+            "message": f"Summary reprocessing started for conversation {conversation_id}",
+            "job_ids": {stage: job.id for stage, job in jobs.items()},
+            "status": "queued",
+        }
+    )
 
 
 async def reprocess_speakers(

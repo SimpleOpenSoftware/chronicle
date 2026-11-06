@@ -246,6 +246,32 @@ def enqueue_summary_job_bundle(
     }
 
 
+_SUMMARY_BUNDLE_PREFIXES = ("title_", "short_summary_", "detailed_summary_")
+_ACTIVE_JOB_STATUSES = {
+    JobStatus.QUEUED,
+    JobStatus.STARTED,
+    JobStatus.DEFERRED,
+    JobStatus.SCHEDULED,
+}
+
+
+def summary_bundle_in_flight(conversation_id: str) -> bool:
+    """True while any stage of this conversation's summary bundle is still pending.
+
+    Bundle jobs use fixed IDs, so enqueuing another bundle now would overwrite a
+    job that a worker may already hold.
+    """
+    suffix = conversation_id[:12]
+    for prefix in _SUMMARY_BUNDLE_PREFIXES:
+        try:
+            job = Job.fetch(f"{prefix}{suffix}", connection=redis_conn)
+        except NoSuchJobError:
+            continue
+        if job.get_status() in _ACTIVE_JOB_STATUSES:
+            return True
+    return False
+
+
 def get_queue(queue_name: str = DEFAULT_QUEUE) -> Queue:
     """Get an RQ queue by name."""
     queues = {
