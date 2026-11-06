@@ -274,4 +274,4 @@ plugins/email_summarizer/
 
 ## License
 
-MIT License - see project LICENSE file for details.
+GNU Affero General Public License v3.0 only - see project LICENSE file for details.

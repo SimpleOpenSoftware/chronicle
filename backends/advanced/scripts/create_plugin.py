@@ -362,7 +362,7 @@ plugins/{plugin_name}/
 
 ## License
 
-MIT License - see project LICENSE file for details.
+GNU Affero General Public License v3.0 only - see project LICENSE file for details.
 """
 
     readme_file = plugin_dir / "README.md"

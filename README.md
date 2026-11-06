@@ -179,3 +179,20 @@ Regardless - this repo will try to do the minimal of this - multiple OMI-like au
 - **Home automation integration** (planned)
 - **Multi-device coordination** (planned)
 - **Visual context capture** (smart glasses integration planned)
+
+## License and branding
+
+Chronicle is licensed under the [GNU Affero General Public License version 3
+only](LICENSE) (`AGPL-3.0-only`), except where a file or component explicitly
+states a different license. Commercial use, paid hosting, and redistribution
+are allowed. Distributed covered derivatives must remain under AGPLv3 with
+corresponding source available; modified versions used over a network must
+also offer their corresponding source to remote users, as specified by the license.
+
+The Chronicle name and logo identify the official project. Public forks and
+independent services should use their own branding and must not imply official
+affiliation or endorsement. Truthful statements such as "based on Chronicle"
+are welcome. See the [trademark policy](TRADEMARKS.md) for details.
+
+See [NOTICE](NOTICE) for the preserved historical MIT notice and attribution.
+Earlier MIT releases remain available under their original terms.
