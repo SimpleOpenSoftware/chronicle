@@ -17,6 +17,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from backend.app_config import get_app_config
+from backend.config_loader import ConfigSaveError
+from backend.model_registry import MissingModelCredentialsError
 
 logger = logging.getLogger(__name__)
 request_logger = logging.getLogger("api.requests")
@@ -222,6 +224,32 @@ def setup_exception_handlers(app: FastAPI) -> None:
                 "detail": "Unable to connect to server. Please check your connection and try again.",
                 "error_type": "connection_failure",
                 "error_category": "network",
+            },
+        )
+
+    @app.exception_handler(ConfigSaveError)
+    async def config_save_exception_handler(request: Request, exc: ConfigSaveError):
+        """A settings write failed; tell the caller why instead of a bare 500."""
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": str(exc),
+                "error_type": "config_save_failure",
+                "error_category": "configuration",
+            },
+        )
+
+    @app.exception_handler(MissingModelCredentialsError)
+    async def missing_credentials_exception_handler(
+        request: Request, exc: MissingModelCredentialsError
+    ):
+        """An LLM call was attempted against a hosted model with no API key."""
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": str(exc),
+                "error_type": "missing_model_credentials",
+                "error_category": "configuration",
             },
         )
 
