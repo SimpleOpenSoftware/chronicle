@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { Alert } from 'react-native';
-import { BleAudioCodec, OmiConnection } from 'friend-lite-react-native';
+import { OmiConnection } from 'friend-lite-react-native';
 import type { AppSettings } from './useAppSettings';
 import type { AudioStreamSource } from './useAudioStreamer';
 import type { PhoneCaptureSession } from './usePhoneAudioRecorder';
@@ -64,10 +64,10 @@ export const useAudioStreamingOrchestrator = ({
     }
 
     try {
+      // TEMPORARY: the SDK reports pcm8 for any codec id except 20, and when the read fails.
+      // Log only, so the backend's Opus validation decides during the device test.
       const codec = await omiConnection.getAudioCodec();
-      if (codec !== BleAudioCodec.OPUS) {
-        throw new Error(`Wearable must stream Opus; device reported ${codec}`);
-      }
+      console.warn(`[AudioOrchestrator] Wearable codec reported by SDK: ${codec}`);
       const sourceId = deviceConnection.connectedDeviceId;
       const finalUrl = buildAudioWebSocketUrl(settings.webSocketUrl);
       await originalStartAudioListener(async (audioBytes) => {
@@ -76,14 +76,16 @@ export const useAudioStreamingOrchestrator = ({
             captureEpoch: 0,
             capturedAtMs: Date.now(),
             monotonicTimestampMs: performance.now(),
-            frameDurationMs: 60,
+            frameDurationMs: 20,
             opus: audioBytes,
           });
         }
       });
       await audioStreamer.startStreaming(finalUrl, { kind: 'wearable', sourceId });
     } catch (error) {
-      Alert.alert('Error', 'Could not start audio listening or streaming.');
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error('[AudioOrchestrator] Wearable start failed:', error);
+      Alert.alert('Error', `Could not start audio listening or streaming.\n\n${reason}`);
       await originalStopAudioListener();
       await audioStreamer.stopStreaming();
     }
