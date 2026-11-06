@@ -89,6 +89,8 @@ persistence:
   size: 10Gi
   mountPath: /app/data
 
+# Extra /etc/hosts entries, e.g. a Tailnet host the cluster DNS cannot resolve.
+hostAliases: []
 nodeSelector: {}
 tolerations: []
 affinity: {}
