@@ -34,6 +34,37 @@ from backend.openai_factory import create_openai_client, is_reasoning_model
 
 logger = logging.getLogger(__name__)
 
+
+class MissingModelCredentialsError(RuntimeError):
+    """A hosted model was selected but its API key is not configured."""
+
+
+def require_api_key(
+    api_key: Optional[str],
+    url: str,
+    model_name: str,
+    *,
+    operation: Optional[str] = None,
+) -> str:
+    """Return ``api_key``, or raise when a hosted HTTPS endpoint has none.
+
+    Local servers (llama.cpp, Ollama, Tailnet ASR) declare a placeholder such as
+    ``no-key``. A key that resolved to empty for an HTTPS URL means a hosted
+    provider whose environment variable is unset; calling it would only fail
+    later as an opaque 401 inside a background job.
+    """
+    if api_key:
+        return api_key
+    if url.startswith("https://"):
+        used_by = f" (used by LLM operation '{operation}')" if operation else ""
+        raise MissingModelCredentialsError(
+            f"Model '{model_name}'{used_by} calls {url} but its api_key is empty. "
+            "Set the environment variable its api_key references in config, "
+            "or select a different model in Settings > AI Model Settings."
+        )
+    return ""
+
+
 # Operations whose normal routing role is not the primary LLM. Keeping this policy
 # beside the resolver makes the effective route inspectable without teaching every
 # caller or diagnostic which default it should use.
@@ -254,6 +285,12 @@ class ModelDef(BaseModel):
                 return _with_scheme(discovered)
         return _with_scheme(self.discovery_default or "")
 
+    def require_api_key(self, operation: Optional[str] = None) -> str:
+        """Return the API key, or raise when a hosted endpoint has none."""
+        return require_api_key(
+            self.api_key, self.resolved_url(), self.name, operation=operation
+        )
+
     @model_validator(mode="after")
     def validate_model(self) -> ModelDef:
         """Cross-field validation."""
@@ -319,6 +356,7 @@ class ResolvedLLMOperation(BaseModel):
     max_tokens: Optional[int] = None
     response_format: Optional[Dict[str, Any]] = None  # {"type": "json_object"} or None
     reasoning_effort: Optional[str] = None  # OpenAI reasoning models OR thinking models
+    operation: Optional[str] = None  # llm_operations name, for actionable errors
 
     @property
     def reasoning_allowed(self) -> bool:
@@ -433,7 +471,7 @@ class ResolvedLLMOperation(BaseModel):
         Uses create_openai_client which handles Langfuse tracing.
         """
         return create_openai_client(
-            api_key=self.model_def.api_key or "",
+            api_key=self.model_def.require_api_key(self.operation),
             base_url=self.model_def.resolved_url(),
             is_async=is_async,
         )
@@ -609,6 +647,7 @@ class AppModels(BaseModel):
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             response_format=response_format,
             reasoning_effort=reasoning_effort,
+            operation=name,
         )
 
     def explain_llm_operation(self, name: str) -> Dict[str, Optional[str]]:
