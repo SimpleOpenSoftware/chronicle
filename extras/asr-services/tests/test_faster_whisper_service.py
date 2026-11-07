@@ -1,10 +1,21 @@
 """Readiness and environment contracts for the Faster-Whisper provider."""
 
 import asyncio
+import sys
+import types
 from unittest.mock import Mock
 
 import pytest
-from providers.faster_whisper import service as module
+
+# These tests replace the transcriber with a fake, so the real faster_whisper
+# package (and its CUDA wheels) is never used. A stub module lets the service
+# import without installing that provider's dependency group in CI.
+if "faster_whisper" not in sys.modules:
+    _stub = types.ModuleType("faster_whisper")
+    _stub.WhisperModel = object
+    sys.modules["faster_whisper"] = _stub
+
+from providers.faster_whisper import service as module  # noqa: E402
 
 
 @pytest.mark.parametrize(
