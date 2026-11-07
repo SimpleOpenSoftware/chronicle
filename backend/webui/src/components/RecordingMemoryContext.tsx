@@ -1,4 +1,3 @@
-import { sourceDate } from "../utils/sourceTime";
 import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -13,6 +12,7 @@ import { Button } from "./ui";
 import { CandidateChanges } from "./timeline/ReviewDesk";
 import ContextRefreshes from "./ContextRefreshes";
 import { sourceLabel } from "./timeline/SessionMemoryBoard";
+import { formatDateTime, formatTime, useDisplayTimezone } from '../utils/datetime'
 
 interface Context {
   organization_requests?: { request_id?: string }[];
@@ -54,15 +54,16 @@ export default function RecordingMemoryContext({
   const client = useQueryClient();
   const [params] = useSearchParams();
   const space = params.get("memory_space_id") || undefined;
+  const timezone = useDisplayTimezone();
   const [clarification, setClarification] = useState("");
   const [requestId, setRequestId] = useState<string>();
   const [inspect, setInspect] = useState(false);
   const query = useQuery({
-    queryKey: ["recording-context", recordingId, space],
+    queryKey: ["recording-context", recordingId, space, timezone],
     queryFn: async () =>
       (
         await api.get<Context>(`/api/recordings/${recordingId}/context`, {
-          params: { timezone: "Asia/Kolkata", memory_space_id: space },
+          params: { timezone, memory_space_id: space },
         })
       ).data,
     refetchInterval: 5000,
@@ -80,7 +81,7 @@ export default function RecordingMemoryContext({
     mutationFn: (day: string) =>
       api.post(`/api/recordings/${recordingId}/organize-day`, {
         local_date: day,
-        timezone: "Asia/Kolkata",
+        timezone,
       }),
     onSuccess: (response) => {
       setRequestId(response.data.request_id);
@@ -170,10 +171,8 @@ export default function RecordingMemoryContext({
           {!data.event_date_known && (
             <p className="text-sm text-gray-600 dark:text-gray-300">
               Recording date unknown. Uploaded{" "}
-              {sourceDate(data.uploaded_at).toLocaleString("en-IN", {
-                timeZone: "Asia/Kolkata",
-              })}{" "}
-              IST. This session stays undated.
+              {formatDateTime(data.uploaded_at)}. This session stays
+              undated.
             </p>
           )}
           {data.event_date_known && !data.sessions.length && (
@@ -220,18 +219,11 @@ export default function RecordingMemoryContext({
               <div className="min-w-0">
                 <h3 className="break-words font-medium">{s.title}</h3>
                 <p className="mt-1 text-xs text-gray-600 dark:text-gray-300">
-                  {sourceDate(s.started_at).toLocaleTimeString("en-IN", {
-                    timeZone: "Asia/Kolkata",
-                    hour: "numeric",
+                  {formatTime(s.started_at, {
+                    hour: "2-digit",
                     minute: "2-digit",
                   })}
-                  –
-                  {sourceDate(s.ended_at).toLocaleTimeString("en-IN", {
-                    timeZone: "Asia/Kolkata",
-                    hour: "numeric",
-                    minute: "2-digit",
-                  })}{" "}
-                  IST
+                  –{formatTime(s.ended_at)}
                 </p>
                 <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
                   {s.summary}
@@ -423,7 +415,7 @@ export default function RecordingMemoryContext({
                   <CandidateChanges
                     proposal={proposal}
                     day="undated"
-                    timezone="Asia/Kolkata"
+                    timezone={timezone}
                   />
                   <Button
                     size="sm"
