@@ -142,7 +142,9 @@ profiles:
               image.repository: "{{.IMAGE_REPO_backend}}"
               image.tag: "{{.IMAGE_TAG_backend}}"
               # Override specific Kubernetes-specific values (not in env file)
-              env.MONGODB_URI: "mongodb://mongodb.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:27017/chronicle"
+              # $(MONGO_ROOT_PASSWORD) is expanded by Kubernetes from the
+              # chronicle-secrets envFrom, so the password never enters Helm values.
+              env.MONGODB_URI: "mongodb://root:$(MONGO_ROOT_PASSWORD)@mongodb.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:27017/chronicle?authSource=admin"
               env.REDIS_URL: "redis://redis-master.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:6379/0"
               persistence.storageClass: "openebs-hostpath"
               persistence.size: "10Gi"
