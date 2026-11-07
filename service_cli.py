@@ -8,7 +8,6 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import dotenv_values
@@ -110,9 +109,12 @@ def print_operation(op, as_json=False):
     if as_json:
         print(json.dumps(op, indent=2))
         return
-    stamp = datetime.fromtimestamp(
-        op.get("started_at", time.time()), ZoneInfo("Asia/Kolkata")
-    ).strftime("%Y-%m-%d %H:%M:%S IST")
+    # The operator's local zone, with its abbreviation (e.g. GMT, BST, IST).
+    stamp = (
+        datetime.fromtimestamp(op.get("started_at", time.time()))
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
     print(f"{op['id']} {op['status']} — {op.get('phase', '')} ({stamp})")
     for name, result in op.get("results", {}).items():
         print(f"  {name}: {result['state']} — {result.get('detail', '')}")

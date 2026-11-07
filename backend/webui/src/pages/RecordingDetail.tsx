@@ -26,6 +26,7 @@ import { useWaveformZoomDisabled } from '../components/transcript/useWaveformZoo
 import SplitConversationModal from '../components/dataAudit/SplitConversationModal'
 import { getStorageKey } from '../utils/storage'
 import { Button, IconButton } from '../components/ui'
+import { PRECISE_DATE_TIME, formatDateTime } from '../utils/datetime'
 
 interface Segment {
   text: string
@@ -194,10 +195,10 @@ export default function RecordingDetail({ dataset = false }: { dataset?: boolean
       const isoString = timestamp.endsWith('Z') || timestamp.includes('+') || (timestamp.includes('T') && timestamp.split('T')[1].includes('-'))
         ? timestamp
         : timestamp + 'Z'
-      return new Date(isoString).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
+      return formatDateTime(isoString, PRECISE_DATE_TIME)
     }
     if (timestamp === 0) return 'Unknown date'
-    return new Date(timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
+    return formatDateTime(timestamp * 1000, PRECISE_DATE_TIME)
   }
 
   const formatDuration = (seconds: number) => {

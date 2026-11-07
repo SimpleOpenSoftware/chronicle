@@ -3,7 +3,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 import SourceSearch from '../components/SourceSearch'
 import { useAuth } from '../contexts/AuthContext'
-import { sourceDate } from '../utils/sourceTime'
 import { MessageSquare, RefreshCw, Calendar, User, Play, Pause, MoreVertical, RotateCcw, Zap, FileText, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Save, X, AlertTriangle, Pencil, Star, Clock, Mic } from 'lucide-react'
 import { conversationsApi, annotationsApi, speakerApi } from '../services/api'
 import { useConversations, useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSummary, useReprocessSpeakers, useReprocessOrphan, useToggleStar } from '../hooks/useConversations'
@@ -13,6 +12,7 @@ import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
 import TranscriptEditor from '../components/transcript/TranscriptEditor'
 import { Button, Checkbox, IconButton } from '../components/ui'
 import { TITLE_NOT_GENERATED } from '../lib/constants'
+import { formatDateTime } from '../utils/datetime'
 
 interface Conversation {
   conversation_id: string
@@ -166,8 +166,9 @@ export default function Recordings() {
 
   const formatDate = (timestamp: number | string) => {
     if (!timestamp) return 'Date unknown'
-    return sourceDate(typeof timestamp === 'number' ? new Date(timestamp * 1000).toISOString() : timestamp)
-      .toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) + ' IST'
+    return formatDateTime(typeof timestamp === 'number' ? timestamp * 1000 : timestamp, {
+      day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+    })
   }
 
 
