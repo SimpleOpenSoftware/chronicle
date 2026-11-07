@@ -42,6 +42,7 @@ import {
   StateBadge,
 } from '../components/ui';
 import type { StateTone } from '../components/ui';
+import { PRECISE_DATE_TIME, PRECISE_TIME, formatDateTime, formatTime } from '../utils/datetime'
 
 function queueDate(value: string | number): Date {
   return typeof value === 'string' ? sourceDate(value) : new Date(value);
@@ -622,7 +623,7 @@ const Queue: React.FC = () => {
   };
 
   const formatDate = (dateString: string) => {
-    return queueDate(dateString).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' });
+    return formatDateTime(queueDate(dateString), PRECISE_DATE_TIME);
   };
 
   // Short display names for the Jobs table. Keyed on the RQ job function names in
@@ -906,13 +907,13 @@ const Queue: React.FC = () => {
                                     {job.created_at && (
                                       <div className="flex justify-between">
                                         <span>Created:</span>
-                                        <span className="text-gray-800 dark:text-gray-200">{queueDate(job.created_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
+                                        <span className="text-gray-800 dark:text-gray-200">{formatTime(queueDate(job.created_at), PRECISE_TIME)}</span>
                                       </div>
                                     )}
                                     {job.meta?.speech_detected_at && (
                                       <div className="flex justify-between">
                                         <span>Speech Detected:</span>
-                                        <span className="text-green-700 dark:text-green-400 font-medium">{queueDate(job.meta.speech_detected_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
+                                        <span className="text-green-700 dark:text-green-400 font-medium">{formatDateTime(queueDate(job.meta.speech_detected_at), PRECISE_DATE_TIME)}</span>
                                       </div>
                                     )}
                                     {job.meta?.status && (
@@ -1080,9 +1081,9 @@ const Queue: React.FC = () => {
                                 </div>
                                 <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 truncate">
                                   Conversation: {conversationId.substring(0, 8)}... •
-                                  {createdAt && `Started: ${queueDate(createdAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })} • `}
+                                  {createdAt && `Started: ${formatTime(queueDate(createdAt), PRECISE_TIME)} • `}
                                   Words: {wordCount}
-                                  {lastUpdate && ` • Updated: ${queueDate(lastUpdate).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}`}
+                                  {lastUpdate && ` • Updated: ${formatTime(queueDate(lastUpdate), PRECISE_TIME)}`}
                                 </div>
                                 {transcript && (
                                   <div className="mt-1 text-xs text-gray-700 dark:text-gray-300 italic truncate">
@@ -1244,7 +1245,7 @@ const Queue: React.FC = () => {
                                                     left: `${startPercent}%`,
                                                     width: `${widthPercent}%`
                                                   }}
-                                                  title={`Started: ${queueDate(startTime).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}\nDuration: ${formatDuration(duration)}`}
+                                                  title={`Started: ${formatTime(queueDate(startTime), PRECISE_TIME)}\nDuration: ${formatDuration(duration)}`}
                                                 >
                                                   <span className="text-xs text-white font-medium px-2 truncate">
                                                     {formatDuration(duration)}
@@ -1299,7 +1300,7 @@ const Queue: React.FC = () => {
                                         <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
                                           <div>
                                             {job.started_at && (
-                                              <span>Started: {queueDate(job.started_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
+                                              <span>Started: {formatTime(queueDate(job.started_at), PRECISE_TIME)}</span>
                                             )}
                                             {job.started_at && (
                                               <span> • Duration: {formatDuration(job)}</span>
@@ -1602,7 +1603,7 @@ const Queue: React.FC = () => {
                                   Conversation: {conversationId.substring(0, 8)}... •
                                   Words: {wordCount}
                                   {createdAt && (
-                                    <> • Created: {queueDate(createdAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</>
+                                    <> • Created: {formatDateTime(queueDate(createdAt), PRECISE_DATE_TIME)}</>
                                   )}
                                 </div>
                                 {/* Show title/summary for completed, or transcript for in-progress or when no title exists */}
@@ -1765,7 +1766,7 @@ const Queue: React.FC = () => {
                                                       left: `${startPercent}%`,
                                                       width: `${widthPercent}%`
                                                     }}
-                                                    title={`Started: ${queueDate(startTime).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}\nDuration: ${formatDuration(duration)}${job.meta?.batch_progress ? `\n${job.meta.batch_progress.message}` : ''}`}
+                                                    title={`Started: ${formatTime(queueDate(startTime), PRECISE_TIME)}\nDuration: ${formatDuration(duration)}${job.meta?.batch_progress ? `\n${job.meta.batch_progress.message}` : ''}`}
                                                   >
                                                     <span className="text-xs text-white font-medium px-2 truncate">
                                                       {job.status === 'started' && job.meta?.batch_progress
@@ -1830,7 +1831,7 @@ const Queue: React.FC = () => {
                                           <div className="mt-1 text-xs text-gray-600 dark:text-gray-400 space-y-0.5 pl-4">
                                             <div>
                                               {job.started_at && (
-                                                <span>Started: {queueDate(job.started_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</span>
+                                                <span>Started: {formatTime(queueDate(job.started_at), PRECISE_TIME)}</span>
                                               )}
                                               {job.started_at && (
                                                 <span> • Duration: {formatDuration(job)}</span>
@@ -2078,7 +2079,7 @@ const Queue: React.FC = () => {
                       return (
                         <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                           <td className="px-4 py-2 text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap">
-                            {queueDate(evt.timestamp * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}
+                            {formatTime(queueDate(evt.timestamp * 1000), PRECISE_TIME)}
                           </td>
                           <td className="px-4 py-2">
                             <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${getEventColor(evt.event)}`}>
@@ -2223,7 +2224,7 @@ const Queue: React.FC = () => {
                 .sort((a, b) => queueDate(b.created_at).getTime() - queueDate(a.created_at).getTime()).map((job) => (
                 <tr key={job.job_id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                   <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                    {queueDate(job.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    {formatDateTime(job.created_at, { timeZoneName: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td className="px-4 py-3 max-w-xs">
                     <div className="text-xs font-mono text-gray-600 dark:text-gray-400 truncate" title={job.meta?.conversation_id || 'N/A'}>
@@ -2476,7 +2477,7 @@ const Queue: React.FC = () => {
                       <div className="bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded mb-3 space-y-2">
                         {visibleJob.meta.speech_detected_at && (
                           <div className="text-sm">
-                            <span className="font-medium">Speech Detected At:</span> {queueDate(visibleJob.meta.speech_detected_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}
+                            <span className="font-medium">Speech Detected At:</span> {formatDateTime(queueDate(visibleJob.meta.speech_detected_at), PRECISE_DATE_TIME)}
                           </div>
                         )}
                         {visibleJob.meta.detected_speakers && visibleJob.meta.detected_speakers.length > 0 && (
@@ -2558,7 +2559,7 @@ const Queue: React.FC = () => {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <Label>Time</Label>
-                  <p className="text-sm text-gray-900 dark:text-gray-100">{queueDate(visibleEvent.timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })}</p>
+                  <p className="text-sm text-gray-900 dark:text-gray-100">{formatDateTime(queueDate(visibleEvent.timestamp * 1000), PRECISE_DATE_TIME)}</p>
                 </div>
                 <div>
                   <Label>Event</Label>

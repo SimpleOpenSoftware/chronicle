@@ -9,6 +9,7 @@ import { useExternalServices } from '../hooks/useSystem'
 import { useAuth } from '../contexts/AuthContext'
 import { sourceDate } from '../utils/sourceTime'
 import { Button, Alert } from '../components/ui'
+import { PRECISE_DATE_TIME, formatDateTime } from '../utils/datetime'
 
 interface AnnotationTypeCounts {
   total: number
@@ -21,7 +22,7 @@ interface AnnotationTypeCounts {
 
 function formatTimestamp(iso: string | null | undefined): string {
   if (!iso) return 'No recorded run'
-  return sourceDate(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
+  return formatDateTime(sourceDate(iso), PRECISE_DATE_TIME)
 }
 
 // One card per model we can teach. Speaker recognition is instant kNN enrollment
