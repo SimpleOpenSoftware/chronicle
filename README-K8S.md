@@ -1,824 +1,242 @@
-# Chronicle Kubernetes Setup Guide
+# Chronicle on Kubernetes
 
-This guide walks you through setting up Chronicle from scratch on a fresh Ubuntu system, including MicroK8s installation, Docker registry configuration, and deployment via Skaffold.
+This guide deploys Chronicle to a MicroK8s cluster with Skaffold and Helm. All
+deploy steps run from the repository root through `make`.
 
-## System Architecture
+- **Build machine**: where you run `make`. It builds the images and pushes them
+  to the cluster registry. It can be another architecture (for example an arm64
+  Mac): the speaker images build for amd64 on a buildx builder you choose.
+- **Cluster**: one or more MicroK8s nodes. One node hosts the image registry.
 
-- **Build Machine**: Your development machine with Docker (for building images)
-- **Kubernetes Node (k8s_control_plane)**: Ubuntu server running MicroK8s cluster
-- **Docker Registry**: Runs on the Kubernetes node for image storage
+## Contents
 
-## Table of Contents
+1. [Prepare the cluster](#1-prepare-the-cluster)
+2. [Prepare the build machine](#2-prepare-the-build-machine)
+3. [Configure](#3-configure)
+4. [First-time setup](#4-first-time-setup)
+5. [Deploy](#5-deploy)
+6. [Settings changed in the app](#6-settings-changed-in-the-app)
+7. [Check and maintain](#7-check-and-maintain)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Known limitations](#9-known-limitations)
 
-1. [System Requirements](#system-requirements)
-2. [Ubuntu Installation](#ubuntu-installation)
-3. [MicroK8s Installation](#microk8s-installation)
-4. [MicroK8s Registry Setup](#microk8s-registry-setup)
-5. [Repository Setup](#repository-setup)
-6. [Environment Configuration](#environment-configuration)
-7. [Deployment](#deployment)
-8. [Verification](#verification)
-9. [Troubleshooting](#troubleshooting)
+## 1. Prepare the cluster
 
-## System Requirements
+**Run on each cluster node.**
 
-### Build Machine (Your Development Machine)
-- **OS**: macOS, Linux, or Windows with WSL2
-- **Docker**: Docker Desktop or Docker Engine
-- **Tools**: Git, curl/wget
-
-### Kubernetes Node (k8s_control_plane)
-- **Hardware**: Minimum 8GB RAM, 4 CPU cores, 50GB storage
-- **Network**: Static IP configuration (recommended: 192.168.1.42)
-- **OS**: Ubuntu 22.04 LTS or later
-- **Architecture**: x86_64 (AMD64)
-
-## Ubuntu Installation
-
-**Run on: Kubernetes Node (k8s_control_plane)**
-
-1. **Download Ubuntu Server 22.04 LTS**
+1. Install MicroK8s:
    ```bash
-   # Download from https://ubuntu.com/download/server
-   # Or use wget:
-   wget https://releases.ubuntu.com/22.04/ubuntu-22.04.3-live-server-amd64.iso
-   ```
-
-2. **Install Ubuntu Server**
-   - Boot from USB/DVD
-   - Choose "Install Ubuntu Server"
-   - Configure network with static IP (recommended: 192.168.1.42)
-   - Set hostname (e.g., `k8s_control_plane`)
-   - Create user account
-   - Install OpenSSH server
-
-3. **Post-Installation Setup**
-   ```bash
-   # Update system
-   sudo apt update && sudo apt upgrade -y
-
-   # Install essential packages
-   sudo apt install -y curl wget git vim htop tree
-
-   # Configure firewall
-   sudo ufw allow ssh
-   sudo ufw allow 6443  # Kubernetes API
-   sudo ufw allow 32000  # Docker registry
-   sudo ufw enable
-   ```
-
-## MicroK8s Installation
-
-**Run on: Kubernetes Node (k8s_control_plane)**
-
-1. **Install MicroK8s**
-   ```bash
-   # Install MicroK8s
    sudo snap install microk8s --classic
-
-   # Add user to microk8s group
    sudo usermod -a -G microk8s $USER
-   sudo chown -f -R $USER ~/.kube
-
-   # Log out and back in, or run:
    newgrp microk8s
+   microk8s status --wait-ready
    ```
-
-2. **Configure as Control Plane**
+2. To add a node, run `microk8s add-node` on an existing node, then run the
+   printed `microk8s join ...` command on the new node.
+3. On one node, enable the add-ons:
    ```bash
-   # Start MicroK8s
-   sudo microk8s start
-
-   # Wait for all services to be ready
-   sudo microk8s status --wait-ready
-
-   # Generate join token for worker nodes
-   sudo microk8s add-node
-   # This will output a command like:
-   # sudo microk8s join 192.168.1.42:25000/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   # Save this command for worker node setup
+   microk8s enable dns ingress metrics-server registry
    ```
-
-3. **Start MicroK8s**
-   ```bash
-   # Start MicroK8s
-   sudo microk8s start
-
-   # Wait for all services to be ready
-   sudo microk8s status --wait-ready
-   ```
-
-4. **Enable Required Add-ons**
-   ```bash
-   # Enable essential add-ons
-   sudo microk8s enable dns
-   sudo microk8s enable ingress
-   sudo microk8s enable storage
-   sudo microk8s enable metrics-server
-
-   # Wait for add-ons to be ready
-   sudo microk8s status --wait-ready
-   ```
-
-5. **Configure kubectl**
-   ```bash
-   # Create kubectl alias
-   echo 'alias kubectl="microk8s kubectl"' >> ~/.bashrc
-   source ~/.bashrc
-
-   # Verify installation
-   kubectl get nodes
-   kubectl get pods -A
-   ```
-
-## Worker Node Installation
-
-**Run on: Each Worker Node**
-
-1. **Install Ubuntu Server (Same as Control Plane)**
-   ```bash
-   # Follow the same Ubuntu installation steps as the control plane
-   # Use different hostname (e.g., k8s_worker_01, k8s_worker_02)
-   # Configure static IP (e.g., 192.168.1.43, 192.168.1.44)
-   # Ensure network connectivity to control plane (192.168.1.42)
-   ```
-
-2. **Install MicroK8s**
-   ```bash
-   # Install MicroK8s
-   sudo snap install microk8s --classic
-
-   # Add user to microk8s group
-   sudo usermod -a -G microk8s $USER
-   sudo chown -f -R $USER ~/.kube
-
-   # Log out and back in, or run:
-   newgrp microk8s
-   ```
-
-3. **Join the Cluster**
-   ```bash
-   # Use the join command from the control plane
-   # Replace with your actual join token
-   sudo microk8s join 192.168.1.42:25000/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-   # Wait for node to join
-   sudo microk8s status --wait-ready
-   ```
-
-4. **Verify Node Status**
-   ```bash
-   # On the control plane, verify the worker node joined
-   kubectl get nodes
-
-   # The worker node should show as Ready
-   # Example output:
-   # NAME                STATUS   ROLES    AGE   VERSION
-   # k8s_control_plane   Ready    <none>   1h    v1.28.0
-   # k8s_worker_01      Ready    <none>   5m    v1.28.0
-   ```
-
-5. **Configure Worker Node for Registry Access**
-   ```bash
-   # From your build machine, configure the worker node
-   ./configure-insecure-registry-remote.sh 192.168.1.43
-
-   # Repeat for each worker node with their respective IPs
-   ```
-
-## MicroK8s Registry Setup
-
-**Run on: Kubernetes Node (k8s_control_plane)**
-
-1. **Enable Built-in Registry**
-   ```bash
-   # Enable the built-in MicroK8s registry (not enabled by default)
-   sudo microk8s enable registry
-
-   # Wait for registry to be ready
-   sudo microk8s status --wait-ready
-
-   # Verify registry is running
-   kubectl get pods -n container-registry
-   ```
-
-2. **Configure Registry Access**
-   ```bash
-   # The registry runs on port 32000 by default
-   # Verify it's accessible
-   curl http://localhost:32000/v2/
-   ```
-
-3. **Configure Remote Access (from Build Machine)**
-   ```bash
-   # From your build machine, configure MicroK8s to trust the insecure registry
-   chmod +x scripts/configure-insecure-registry-remote.sh
-
-   # Run the configuration script with your node IP address
-   # Usage: ./scripts/configure-insecure-registry-remote.sh <ip_address> [ssh_user]
-   ./scripts/configure-insecure-registry-remote.sh 192.168.1.42
-
-   # Or with custom SSH user:
-   # ./scripts/configure-insecure-registry-remote.sh 192.168.1.42 myuser
-   ```
-
-## Storage Configuration
-
-**Run on: Kubernetes Node (k8s_control_plane)**
-
-1. **Install OpenEBS Hostpath Provisioner**
-
-   the default hostpath provisioner seems to have a bug in it that makes it not work. If you want to use the default
-   one, then you will need to update the charts to use that for the PVC.
-
-   ```bash
-   # Apply the hostpath provisioner
-   kubectl apply -f k8s-manifests/hostpath-provisioner-official.yaml
-
-   # Verify storage class
-   kubectl get storageclass
-   ```
-
-## Repository Setup
-
-**Run on: Build Machine (Your Development Machine)**
-
-### **Directory Structure**
-```
-chronicle/
-├── scripts/                    # Kubernetes deployment and management scripts
-│   ├── deploy-all-services.sh  # Deploy all services
-│   ├── cluster-status.sh       # Check cluster health
-│   ├── setup-nvidia-operator.sh # Setup GPU support
-│   ├── test-gpu-pod.sh        # Test GPU access
-│   ├── cleanup-all.sh          # Remove all deployments
-│   ├── configure-insecure-registry-remote.sh # Configure registry access
-│   └── generate-configmap.sh   # Generate ConfigMap templates
-├── k8s-manifests/             # Standalone Kubernetes manifests
-│   └── hostpath-provisioner-official.yaml # Storage provisioner
-├── skaffold.env.template      # Configuration template
-├── skaffold.yaml              # Skaffold deployment configuration
-├── init.sh                    # Docker Compose setup
-└── deploy-speaker-recognition.sh # Standalone speaker recognition
-```
-
-### **Repository Setup**
-
-1. **Clone Repository**
-   ```bash
-   # Clone Chronicle repository with submodules
-   git clone --recursive https://github.com/SimpleOpenSoftware/chronicle.git
-   cd chronicle
-
-   # If you already cloned without --recursive, initialize submodules:
-   # git submodule update --init --recursive
-
-   # Verify template files are present
-   ls -la skaffold.env.template
-   ls -la backend/.env.template
-   ```
-
-   > **Note:** The `--recursive` flag downloads the optional Mycelia submodule (an alternative memory backend with timeline visualization). Most deployments use the default Chronicle memory system and don't need Mycelia.
-
-2. **Install Required Tools**
-
-   **kubectl** (required for Skaffold and Helm):
-   - Visit: https://kubernetes.io/docs/tasks/tools/
-   - Follow the official installation guide for your platform
-
-   **Skaffold**:
-   - Visit: https://skaffold.dev/docs/install/
-   - Follow the official installation guide
-
-   **Helm**:
-   - Visit: https://helm.sh/docs/intro/install/
-   - Follow the official installation guide
-
-   **Verify installations:**
-   ```bash
-   kubectl version --client
-   skaffold version
-   helm version
-   ```
-
-## Environment Configuration
-
-**Important**: Never commit your actual `.env` or `skaffold.env` files to version control. Only the `.template` files should be committed.
-
-**Run on: Build Machine (Your Development Machine)**
-
-1. **Create Environment File**
-   ```bash
-   # Copy template (if it exists)
-   # cp backend/.env.template backend/.env
-
-   # Note: Most environment variables are automatically set by Skaffold during deployment
-   # including MONGODB_URI and other Kubernetes-specific values
-   ```
-
-2. **Configure Skaffold Environment**
-   ```bash
-   # Copy the template file
-   cp skaffold.env.template skaffold.env
-
-   # Edit skaffold.env with your specific values
-   vim skaffold.env
-
-   # Essential variables to configure:
-   REGISTRY=192.168.1.42:32000  # Use IP address for immediate access
-   # Alternative: REGISTRY=k8s_control_plane:32000 (requires adding 'k8s_control_plane 192.168.1.42' to /etc/hosts)
-   BACKEND_IP=192.168.1.42
-   BACKEND_NODEPORT=30270
-   WEBUI_NODEPORT=31011
-
-   # Optional: Configure speaker recognition service
-   HF_TOKEN=hf_your_huggingface_token_here
-   DEEPGRAM_API_KEY=your_deepgram_api_key_here
-
-   # Note: MONGODB_URI is automatically generated by Skaffold based on
-   # your infrastructure namespace and service names
-   ```
-
-3. **Configuration Variables Reference**
-
-   **Required Variables:**
-   - `REGISTRY`: Docker registry for image storage
-   - `BACKEND_IP`: IP address of your Kubernetes control plane
-   - `BACKEND_NODEPORT`: Port for backend service (30000-32767)
-   - `WEBUI_NODEPORT`: Port for WebUI service (30000-32767)
-   - `INFRASTRUCTURE_NAMESPACE`: Namespace for MongoDB and FalkorDB
-   - `APPLICATION_NAMESPACE`: Namespace for your application
-
-   **Optional Variables (for Speaker Recognition):**
-   - `HF_TOKEN`: Hugging Face token for Pyannote models
-   - `DEEPGRAM_API_KEY`: Deepgram API key for speech-to-text
-   - `COMPUTE_MODE`: GPU or CPU mode for ML services
-   - `SIMILARITY_THRESHOLD`: Speaker identification threshold
-
-   **Automatically Generated:**
-   - `MONGODB_URI`: Generated from infrastructure namespace
-   - `IMAGE_REPO_*`: Generated from Skaffold build process
-   - `IMAGE_TAG_*`: Generated from Skaffold build process
-
-5. **Generate ConfigMap (if needed)**
-   ```bash
-   # Note: Most environment variables are handled by Skaffold automatically
-   # If you need custom environment variables, you can:
-
-   # Option 1: Use the script (if it exists)
-   # chmod +x scripts/generate-helm-configmap.sh
-   # ./scripts/generate-helm-configmap.sh
-
-   # Option 2: Add them directly to the Helm chart values
-   # Edit backends/charts/backend/values.yaml
-   ```
-
-## Available Scripts
-
-**Run on: Build Machine (Your Development Machine)**
-
-The following scripts are available in the `scripts/` folder to simplify common operations:
-
-### **Deployment Scripts**
+   The registry listens on port `32000`. Check it with
+   `curl http://localhost:32000/v2/`.
+4. Install the OpenEBS local hostpath provisioner
+   ([OpenEBS docs](https://openebs.io/docs)). The charts use the storage class
+   `openebs-hostpath`. Check it with `kubectl get storageclass`.
+5. GPU nodes only: install the NVIDIA GPU operator with
+   `scripts/k8s/gpu/setup-nvidia-operator.sh`, then test it with
+   `scripts/k8s/gpu/test-gpu-pod.sh`.
+
+## 2. Prepare the build machine
+
+Install these tools:
+
+| Tool | Used for |
+|---|---|
+| `kubectl` | talking to the cluster (needs a kubeconfig for it) |
+| `skaffold` | building and deploying |
+| `helm` | the charts that Skaffold deploys |
+| Docker with `buildx` | building images |
+| `uv` | running the config scripts (`make config-k8s`) |
+
+Then clone the repository:
 ```bash
-# Deploy all services in the correct order
-./scripts/deploy-all-services.sh
-
-# Deploy with custom registry
-./scripts/deploy-all-services.sh 192.168.1.43:32000
-
-# Check cluster status and health
-./scripts/cluster-status.sh
-
-# Check status of specific namespace
-./scripts/cluster-status.sh chronicle
+git clone https://github.com/SimpleOpenSoftware/chronicle.git
+cd chronicle
 ```
 
-### **Setup Scripts**
-```bash
-# Configure insecure registry access for remote nodes
-./scripts/configure-insecure-registry-remote.sh 192.168.1.42
+## 3. Configure
 
-# Setup NVIDIA GPU operator
-./scripts/setup-nvidia-operator.sh
-```
-
-### **Maintenance Scripts**
-```bash
-# Clean up all deployments (with confirmation)
-./scripts/cleanup-all.sh
-
-# Force cleanup without confirmation
-./scripts/cleanup-all.sh --force
-```
-
-### **GPU Testing Scripts**
-```bash
-# Test GPU access in Kubernetes
-./scripts/test-gpu-pod.sh
-
-# Test with specific GPU count
-./scripts/test-gpu-pod.sh 2
-```
-
-### **Configuration Scripts**
-```bash
-# Generate ConfigMap data template from .env file
-./scripts/generate-configmap.sh
-
-# This creates a Helm template that can be included in charts
-# Output: backends/charts/backend/templates/env-data.yaml
-```
-
-**Note**: All scripts automatically read configuration from `skaffold.env` and provide helpful error messages if configuration is missing.
-
-**When to use generate-configmap.sh**: Use this script when you want to:
-- Create environment-specific ConfigMaps from `.env` files
-- Generate Helm templates that can be included in other charts
-- Manage environment variables in a more maintainable way
-- Override the default hardcoded values in the Helm charts
-
-**Removed Scripts**: The following scripts were removed as they are no longer needed:
-- `generate-helm-configmap.sh` - Environment variables are now handled automatically by Skaffold
-
-## Kubernetes Manifests
-
-**Location**: `k8s-manifests/` directory
-
-This directory contains standalone Kubernetes manifests that are not managed by Skaffold:
-
-- **`hostpath-provisioner-official.yaml`** - OpenEBS hostpath storage provisioner
-  - Applied manually: `kubectl apply -f k8s-manifests/hostpath-provisioner-official.yaml`
-  - Creates the `openebs-hostpath` storage class used by all services
-
-## Deployment
-
-**Run on: Build Machine (Your Development Machine)**
-
-1. **Deploy All Services (Recommended)**
-   ```bash
-   # Deploy everything in the correct order
-   ./scripts/deploy-all-services.sh
-
-   # This will automatically:
-   # - Deploy infrastructure (MongoDB, FalkorDB)
-   # - Deploy main application (Backend, WebUI)
-   # - Deploy additional services (if configured)
-   # - Wait for each service to be ready
-   # - Verify all deployments
-   ```
-
-2. **Manual Deployment (Alternative)**
-   ```bash
-   # Deploy infrastructure first
-   skaffold run --profile=infrastructure
-
-   # Wait for infrastructure to be ready
-   kubectl get pods -n root
-
-   # Deploy main application
-   skaffold run --profile=backend --default-repo=192.168.1.42:32000
-
-   # Monitor deployment
-   skaffold run --profile=backend --default-repo=192.168.1.42:32000 --tail
-   ```
-
-3. **Verify Deployment**
-   ```bash
-   # Check all resources
-   kubectl get all -n chronicle
-   kubectl get all -n root
-
-   # Check Ingress
-   kubectl get ingress -n chronicle
-
-   # Check services
-   kubectl get svc -n chronicle
-   ```
-
-## Multi-Node Cluster Management
-
-**Run on: Build Machine (Your Development Machine)**
-
-### **Cluster Status and Management**
-```bash
-# View all nodes in the cluster
-kubectl get nodes -o wide
-
-# Get detailed node information
-kubectl describe node k8s_control_plane
-kubectl describe node k8s_worker_01
-
-# Check node resources
-kubectl top nodes
-
-# View node labels and taints
-kubectl get nodes --show-labels
-```
-
-### **Pod Scheduling and Distribution**
-```bash
-# Check pod distribution across nodes
-kubectl get pods -A -o wide
-
-# Force pod scheduling to specific node (if needed)
-kubectl label node k8s_worker_01 node-role.kubernetes.io/worker=true
-
-# Check node capacity and allocatable resources
-kubectl describe node k8s_worker_01 | grep -A 5 "Allocated resources"
-```
-
-### **Worker Node Maintenance**
-```bash
-# Drain a worker node before maintenance
-kubectl drain k8s_worker_01 --ignore-daemonsets --delete-emptydir-data
-
-# After maintenance, uncordon the node
-kubectl uncordon k8s_worker_01
-
-# Remove a worker node from the cluster
-kubectl delete node k8s_worker_01
-```
-
-## Additional Services Deployment
-
-**Run on: Build Machine (Your Development Machine)**
-
-### 1. **Speaker Recognition Service**
+All deploy settings live in one file, `config.env`. It is gitignored.
 
 ```bash
-# Deploy speaker recognition with GPU support
-skaffold run --profile=speaker-recognition --default-repo=k8s_control_plane:32000
-
-# Monitor deployment
-skaffold run --profile=speaker-recognition --default-repo=k8s_control_plane:32000 --tail
-
-# Verify deployment
-kubectl get pods -n speech
-kubectl get svc -n speech
+cp config.env.template config.env
 ```
 
-### 2. **ASR (Automatic Speech Recognition) Services**
+Edit at least these values:
+
+| Variable | Meaning |
+|---|---|
+| `CONTAINER_REGISTRY` | the cluster registry, for example `<node>:32000` |
+| `INFRASTRUCTURE_NAMESPACE` | namespace of MongoDB and Redis |
+| `APPLICATION_NAMESPACE` | namespace of the backend and WebUI |
+| `DOMAIN`, `DOMAIN_PREFIX`, `EXTERNAL_DOMAIN` | host names for the ingress |
+| `MONGO_ROOT_PASSWORD` | the backend logs in to MongoDB as `root` with it |
+| `AUTH_SECRET_KEY`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` | login |
+| `OPENAI_API_KEY`, `DEEPGRAM_API_KEY` | LLM and speech-to-text providers |
+
+For speaker recognition, also set:
+
+| Variable | Meaning |
+|---|---|
+| `HF_TOKEN` | Hugging Face token for the pyannote models |
+| `COMPUTE_MODE` | `cpu`, `cu126` or `cu128`. Use `cu126` for Pascal GPUs (GTX 10xx); `cu128` drops them |
+| `SPEAKER_NODE` | the node with the NVIDIA GPU |
+| `BUILDX_BUILDER` | an amd64 buildx builder (`docker buildx ls` lists them) |
+| `SPEAKER_SERVICE_URL` | the backend's in-cluster address of the speaker service |
+
+Application settings (models, memory, plugins) live in `config/config.yml`,
+`config/defaults.yml` and `config/plugins.yml`, the same as for Docker Compose.
+
+`make config-k8s` turns these into the files the deploy uses. It runs before
+every deploy, so you do not edit these files:
+
+| Generated file | Contents |
+|---|---|
+| `k8s-manifests/configmap.yaml` | `config.env` values, plus the three `config/*.yml` files |
+| `k8s-manifests/secrets.yaml` | values whose name contains `SECRET`, `KEY`, `TOKEN` or `PASSWORD` (mode 600) |
+| `skaffold.env` | the `config.env` values that `skaffold.yaml` uses |
+
+It applies the ConfigMap and Secret to `APPLICATION_NAMESPACE`, and copies them
+to the `speech` namespace. All three files are gitignored.
+
+## 4. First-time setup
 
 ```bash
-# Deploy ASR services (Moonshine, Parakeet)
-skaffold run --profile=asr-services --default-repo=k8s_control_plane:32000
-
-# Monitor deployment
-skaffold run --profile=asr-services --default-repo=k8s_control_plane:32000 --tail
-
-# Verify deployment
-kubectl get pods -n asr
-kubectl get svc -n asr
+make setup-k8s
 ```
 
-### 3. **NVIDIA GPU Operator Setup**
+It asks for the registry node's IP address, then:
 
-**Prerequisites:**
-- NVIDIA GPU(s) installed on the Kubernetes node
-- NVIDIA drivers installed on the host system
+1. lets that node pull from the insecure registry
+   (`scripts/k8s/configure-insecure-registry-remote.sh <ip> [ssh_user]`; run it
+   again for each other node);
+2. prepares the shared model storage for speaker recognition
+   (`scripts/k8s/setup-storage.sh`);
+3. runs `make config-k8s`;
+4. deploys MongoDB and Redis (`make setup-infrastructure`);
+5. applies the cross-namespace RBAC (`make setup-rbac`);
+6. creates the shared models PVC (`make setup-storage-pvc`).
 
-**Installation:**
+Optional, for Tailscale access: `kubectl apply -n <APPLICATION_NAMESPACE> -f
+k8s-manifests/tailscale-ingress.yaml`. No `make` target applies it. It needs the
+Tailscale Kubernetes operator, and its `tailscale.com/proxy-group` annotation
+names a ProxyGroup: change it to one in your tailnet.
+
+## 5. Deploy
+
+| Command | What it deploys |
+|---|---|
+| `make deploy` | backend and WebUI (it runs `deploy-k8s` when `DEPLOYMENT_MODE = kubernetes`) |
+| `make deploy-speaker` | speaker recognition, in the `speech` namespace |
+| `make deploy-k8s-full` | MongoDB and Redis, then backend and WebUI |
+
+`make deploy-apps` and `make deploy-k8s` are the same as `make deploy` in
+Kubernetes mode.
+
+Every deploy runs `make config-k8s` first, then `skaffold run` with a profile.
+The backend profile builds two images:
+
+- `backend` from `backend/Dockerfile.k8s`. It runs the API with the workers as
+  a sidecar container in the same pod.
+- `webui` from `backend/webui/Dockerfile.k8s`.
+
+`make deploy-speaker` builds its two images for amd64 with
+`scripts/k8s/buildx-push.sh` on `BUILDX_BUILDER`, and pins the pod to
+`SPEAKER_NODE`.
+
+The ASR services have no `make` target. Deploy them with Skaffold directly:
 ```bash
-# Use the automated setup script
-./scripts/setup-nvidia-operator.sh
-
-# Or manually install:
-# Add NVIDIA Helm repository
-helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-helm repo update
-
-# Install NVIDIA GPU Operator
-helm install gpu-operator nvidia/gpu-operator \
-  --namespace gpu-operator \
-  --create-namespace \
-  --set driver.enabled=false \
-  --set toolkit.enabled=false
-
-# Wait for GPU operator to be ready
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=gpu-operator -n gpu-operator --timeout=300s
-
-# Verify GPU detection
-kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, gpu: .status.allocatable."nvidia.com/gpu"}'
-
-# Check GPU operator pods
-kubectl get pods -n gpu-operator
+set -a; source skaffold.env; set +a
+skaffold run --profile=parakeet-asr --default-repo=<CONTAINER_REGISTRY>   # or moonshine-asr
 ```
 
-**GPU-Enabled Pod Configuration:**
-```yaml
-# Example pod spec with GPU access
-spec:
-  containers:
-  - name: gpu-container
-    image: nvidia/cuda:11.8-base-ubuntu20.04
-    resources:
-      limits:
-        nvidia.com/gpu: 1
-    command: ["nvidia-smi"]
-```
+## 6. Settings changed in the app
 
-**Test GPU Access:**
+Under Docker Compose, the Settings page writes to `config/` on the host. In
+Kubernetes the backend and workers use `/app/data/config` on the data volume
+(`CONFIG_DIR`). A ConfigMap is read-only, so it is only the seed.
+
+Each time the pod starts, the `config-seed` init container
+(`backend/src/backend/config_seed.py`) updates that folder from the ConfigMap:
+
+- `defaults.yml` is always replaced. It holds code defaults, not settings.
+- `config.yml` and `plugins.yml` are copied the first time. After that, every
+  setting already in the live file keeps its live value. Only keys that are new
+  in the repository are added.
+
+So a redeploy never undoes a change made in the app. Two results of this:
+
+- If you change an existing value in `config/config.yml`, a redeploy does not
+  apply it. Change it in the app instead, or edit the live file (the image has
+  no editor, so copy it out and back):
+  ```bash
+  POD=$(kubectl get pod -n <APPLICATION_NAMESPACE> -l app.kubernetes.io/name=backend -o name | head -1)
+  kubectl cp -n <APPLICATION_NAMESPACE> -c backend ${POD#pod/}:/app/data/config/config.yml live-config.yml
+  # edit live-config.yml, then:
+  kubectl cp -n <APPLICATION_NAMESPACE> -c backend live-config.yml ${POD#pod/}:/app/data/config/config.yml
+  kubectl rollout restart -n <APPLICATION_NAMESPACE> deploy/backend
+  ```
+- A list is one value. If the live file has a `models:` list, a model added to
+  the repository's list does not appear.
+
+## 7. Check and maintain
+
+| Command | What it does |
+|---|---|
+| `make k8s-status` | cluster health (`scripts/k8s/cluster-status.sh [namespace]`) |
+| `make check-apps` | pods and services in `APPLICATION_NAMESPACE` |
+| `make check-infrastructure` | pods and services in `INFRASTRUCTURE_NAMESPACE` |
+| `make k8s-cleanup` | frees registry storage |
+| `make k8s-purge` | removes unused images from the registry and nodes |
+
+Useful `kubectl` commands:
 ```bash
-# Test GPU functionality
-./scripts/test-gpu-pod.sh
-
-# Test with multiple GPUs
-./scripts/test-gpu-pod.sh 2
+kubectl logs -n <APPLICATION_NAMESPACE> deploy/backend -c backend
+kubectl logs -n <APPLICATION_NAMESPACE> deploy/backend -c backend-workers
+kubectl logs -n <APPLICATION_NAMESPACE> deploy/backend -c config-seed
+kubectl logs -n <APPLICATION_NAMESPACE> deploy/webui
+kubectl port-forward -n <APPLICATION_NAMESPACE> svc/backend 8000:8000
+kubectl rollout restart -n <APPLICATION_NAMESPACE> deploy/backend
 ```
 
-## Verification
+Check the backend: `curl http://<backend-host>/health`.
 
-**Run on: Build Machine (Your Development Machine)**
+## 8. Troubleshooting
 
-1. **Check Application Health**
-   ```bash
-   # Check backend health
-   curl -k https://chronicle.192-168-1-42.nip.io:32623/health
+- **Image pull fails**: the node does not trust the registry. Run
+  `scripts/k8s/configure-insecure-registry-remote.sh <node-ip>` for that node.
+- **PVC stays `Pending`**: check `kubectl get storageclass` for
+  `openebs-hostpath`.
+- **Settings page says the config is read-only**: the pod still mounts the
+  ConfigMap. This happens only with `persistence.enabled=false`.
+- **`make config-k8s` says "config.env is missing Skaffold variables"**: add the
+  named variables to `config.env`. Run the script through `make`, which loads
+  `config.env`; run alone, it sees no values.
+- **GPU pod is `Pending`**: check
+  `kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, gpu: .status.allocatable."nvidia.com/gpu"}'`
+  and the GPU operator pods (`kubectl get pods -n gpu-operator`). Run
+  `nvidia-smi` on the node. If the driver does not load on a Secure Boot
+  machine, its signing key may not be enrolled.
 
-   # Check WebUI
-   curl -k https://chronicle.192-168-1-42.nip.io:32623/
-   ```
+## 9. Known limitations
 
-2. **Access WebUI**
-   - Open browser to: `https://chronicle.192-168-1-42.nip.io:32623/`
-   - Accept self-signed certificate warning
-   - Create admin user account
-   - Test audio recording functionality
-
-3. **Test WebSocket Connection**
-   - Open browser console
-   - Check for WebSocket connection success
-   - Verify audio recording works
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Registry Access Issues**
-   ```bash
-   # Test registry connectivity (run on Kubernetes node)
-   curl http://k8s_control_plane:32000/v2/
-
-   # Check MicroK8s containerd config (run on Kubernetes node)
-   sudo cat /var/snap/microk8s/current/args/certs.d/k8s_control_plane:32000/hosts.toml
-   ```
-
-2. **Storage Issues**
-   ```bash
-   # Check storage class (run on build machine)
-   kubectl get storageclass
-
-   # Check persistent volumes (run on build machine)
-   kubectl get pv
-   kubectl get pvc -A
-   ```
-
-3. **Ingress Issues**
-   ```bash
-   # Check Ingress controller (run on build machine)
-   kubectl get pods -n ingress-nginx
-
-   # Check Ingress configuration (run on build machine)
-   kubectl describe ingress -n chronicle
-   ```
-
-4. **Build Issues**
-   ```bash
-   # Clean and rebuild (run on build machine)
-   skaffold clean
-   skaffold run --profile=backend --default-repo=k8s_control_plane:32000
-   ```
-
-5. **GPU Issues**
-   ```bash
-   # Check GPU operator status (run on build machine)
-   kubectl get pods -n gpu-operator
-   kubectl describe pod -n gpu-operator <pod-name>
-
-   # Check GPU detection on nodes
-   kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, gpu: .status.allocatable."nvidia.com/gpu"}'
-
-   # Check GPU operator logs
-   kubectl logs -n gpu-operator deployment/gpu-operator
-
-   # Verify NVIDIA drivers on host (run on Kubernetes node)
-   nvidia-smi
-   ```
-
-6. **Multi-Node Cluster Issues**
-   ```bash
-   # Check node connectivity (run on build machine)
-   kubectl get nodes
-   kubectl describe node <node-name>
-
-   # Check node status and conditions
-   kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, status: .status.conditions[] | select(.type=="Ready") | .status, message: .message}'
-
-   # Check if pods can be scheduled
-   kubectl get pods -A -o wide
-   kubectl describe pod <pod-name> -n <namespace>
-
-   # Check node resources and capacity
-   kubectl top nodes
-   kubectl describe node <node-name> | grep -A 10 "Allocated resources"
-
-   # Verify network connectivity between nodes
-   # Run on each node:
-   ping <other-node-ip>
-   curl -s http://<other-node-ip>:32000/v2/  # Registry access
-   ```
-
-### Useful Commands
-
-```bash
-# View logs (run on build machine)
-kubectl logs -n chronicle deployment/backend
-kubectl logs -n chronicle deployment/webui
-
-# Port forward for debugging (run on build machine)
-kubectl port-forward -n chronicle svc/backend 8000:8000
-kubectl port-forward -n chronicle svc/webui 8080:80
-
-# Check resource usage (run on build machine)
-kubectl top pods -n chronicle
-kubectl top nodes
-
-# Restart deployments (run on build machine)
-kubectl rollout restart deployment/backend -n chronicle
-kubectl rollout restart deployment/webui -n chronicle
-```
-
-## Maintenance
-
-**Run on: Build Machine (Your Development Machine)**
-
-1. **Regular Updates**
-   ```bash
-   # Update Docker images
-   skaffold run --profile=backend --default-repo=k8s_control_plane:32000
-   ```
-
-**Run on: Kubernetes Node (k8s_control_plane)**
-
-1. **System Updates**
-   ```bash
-   # Update system packages
-   sudo apt update && sudo apt upgrade -y
-
-   # Update MicroK8s
-   sudo snap refresh microk8s
-   ```
-
-2. **Backup Configuration**
-   ```bash
-   # Backup environment files (run on build machine)
-   cp backend/.env backend/.env.backup
-   cp skaffold.env skaffold.env.backup
-
-   # Backup Kubernetes manifests (run on build machine)
-   kubectl get all -n chronicle -o yaml > chronicle-backup.yaml
-   kubectl get all -n root -o yaml > infrastructure-backup.yaml
-   ```
-
-## Alternative: Docker Compose Setup
-
-If you prefer to use Docker Compose instead of Kubernetes, use the `init.sh` script:
-
-**Run on: Build Machine (Your Development Machine)**
-
-```bash
-# Make script executable
-chmod +x init.sh
-
-# Run interactive setup
-./init.sh
-```
-
-This will guide you through setting up Chronicle using Docker Compose instead of Kubernetes.
-
-## Speaker Recognition Deployment
-
-For standalone speaker recognition deployment (without full Kubernetes setup):
-
-**Run on: Build Machine (Your Development Machine)**
-
-```bash
-# Make script executable
-chmod +x deploy-speaker-recognition.sh
-
-# Run deployment
-./deploy-speaker-recognition.sh
-```
-
-This script handles speaker recognition service deployment with proper environment configuration.
-
-## Support
-
-For additional support:
-- Check the main [README.md](README.md)
-- Review [AGENTS.md](AGENTS.md) for development notes
-
----
-
-**Note**: This setup supports both single-node and multi-node MicroK8s clusters. For production use, multi-node clusters provide better reliability, scalability, and resource distribution. The worker node installation section above provides complete instructions for expanding your cluster.
+- `skaffold.yaml` names cluster nodes directly: the backend and WebUI are pinned
+  to `anubis`, and the shared model storage lists `anubis` and `babel`. Edit
+  these for your cluster.
+- The `infrastructure` profile deploys MongoDB with authentication off, but the
+  backend logs in as `root` with `MONGO_ROOT_PASSWORD`. On a new cluster, enable
+  MongoDB authentication with that password, or use a MongoDB that has it.
+- The backend data volume is `ReadWriteOnce`. The backend pod uses `Recreate`,
+  so a deploy stops the old pod before it starts the new one.
+- For Docker Compose instead of Kubernetes, use `./wizard.sh` and `./services`
+  (see [quickstart.md](quickstart.md)).
