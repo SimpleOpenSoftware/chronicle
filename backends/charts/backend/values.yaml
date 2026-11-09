@@ -91,6 +91,19 @@ persistence:
 
 # Extra /etc/hosts entries, e.g. a Tailnet host the cluster DNS cannot resolve.
 hostAliases: []
+
+# Pin the pods to one node (kubernetes.io/hostname). Empty: any node.
+node: ""
+
+# Tailscale ingress (needs the Tailscale Kubernetes operator). Serves the API
+# and the WebUI at https://<hostname>.<tailnet>.ts.net. Empty hostname: none.
+tailscale:
+  hostname: ""
+  # ProxyGroup to serve it from. Empty: the operator makes a proxy for it.
+  proxyGroup: ""
+  webuiService: webui
+  webuiPort: 80
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

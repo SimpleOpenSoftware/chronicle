@@ -95,7 +95,11 @@ spec:
       hostAliases:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.workers.nodeSelector | default .Values.nodeSelector }}
+      {{- $nodeSelector := deepCopy ((.Values.workers.nodeSelector | default .Values.nodeSelector) | default dict) }}
+      {{- with .Values.node }}
+      {{- $_ := set $nodeSelector "kubernetes.io/hostname" . }}
+      {{- end }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -94,6 +94,14 @@ For speaker recognition, also set:
 | `BUILDX_BUILDER` | an amd64 buildx builder (`docker buildx ls` lists them) |
 | `SPEAKER_SERVICE_URL` | the backend's in-cluster address of the speaker service |
 
+Optional. Leave a value empty to turn it off:
+
+| Variable | Meaning |
+|---|---|
+| `APP_NODE` | pin the backend and WebUI pods to this node |
+| `TAILSCALE_HOSTNAME` | serve the API and WebUI at `https://<name>.<tailnet>.ts.net` (needs the Tailscale Kubernetes operator) |
+| `TAILSCALE_PROXY_GROUP` | the Tailscale ProxyGroup for that ingress. Empty: the operator makes a proxy for it |
+
 Application settings (models, memory, plugins) live in `config/config.yml`,
 `config/defaults.yml` and `config/plugins.yml`, the same as for Docker Compose.
 
@@ -127,10 +135,8 @@ It asks for the registry node's IP address, then:
 5. applies the cross-namespace RBAC (`make setup-rbac`);
 6. creates the shared models PVC (`make setup-storage-pvc`).
 
-Optional, for Tailscale access: `kubectl apply -n <APPLICATION_NAMESPACE> -f
-k8s-manifests/tailscale-ingress.yaml`. No `make` target applies it. It needs the
-Tailscale Kubernetes operator, and its `tailscale.com/proxy-group` annotation
-names a ProxyGroup: change it to one in your tailnet.
+For Tailscale access, set `TAILSCALE_HOSTNAME` in `config.env`. `make deploy`
+then creates the ingress with the backend chart.
 
 ## 5. Deploy
 
@@ -230,9 +236,6 @@ Check the backend: `curl http://<backend-host>/health`.
 
 ## 9. Known limitations
 
-- `skaffold.yaml` names cluster nodes directly: the backend and WebUI are pinned
-  to `anubis`, and the shared model storage lists `anubis` and `babel`. Edit
-  these for your cluster.
 - The `infrastructure` profile deploys MongoDB with authentication off, but the
   backend logs in as `root` with `MONGO_ROOT_PASSWORD`. On a new cluster, enable
   MongoDB authentication with that password, or use a MongoDB that has it.

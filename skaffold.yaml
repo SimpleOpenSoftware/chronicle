@@ -76,11 +76,6 @@ profiles:
               nodeSelector.hostname: "{{.SPEAKER_NODE}}"
               # Shared models configuration
               global.sharedModels.enabled: "true"
-              global.sharedModels.useHostPath: "true"
-              global.sharedModels.size: "20Gi"
-              global.sharedModels.hostPath: "/shared/models"
-              global.sharedModels.nodes[0]: "anubis"
-              global.sharedModels.nodes[1]: "babel"
 
   # Infrastructure profile - deploy once, rarely updated
   - name: infrastructure
@@ -151,8 +146,10 @@ profiles:
               # Ingress configuration
               ingress.hosts[0].host: "{{.BACKEND_HOST}}"
               ingress.hosts[1].host: "{{.EXTERNAL_DOMAIN}}"
-              # Node selector
-              nodeSelector.kubernetes\.io/hostname: anubis
+              # Empty APP_NODE: any node. Empty TAILSCALE_HOSTNAME: no Tailscale ingress.
+              node: "{{.APP_NODE}}"
+              tailscale.hostname: "{{.TAILSCALE_HOSTNAME}}"
+              tailscale.proxyGroup: "{{.TAILSCALE_PROXY_GROUP}}"
 
           - name: webui
             chartPath: backends/charts/webui
@@ -164,8 +161,7 @@ profiles:
               # Ingress configuration
               ingress.hosts[0].host: "{{.WEBUI_HOST}}"
               ingress.hosts[1].host: "{{.EXTERNAL_DOMAIN}}"
-              # Node selector
-              nodeSelector.kubernetes\.io/hostname: anubis
+              node: "{{.APP_NODE}}"
 
   - name: test-env
     portForward:

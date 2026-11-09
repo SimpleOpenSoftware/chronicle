@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent / "lib"))
 
 from env_utils import (
+    OPTIONAL_SKAFFOLD_VARIABLES,
     classify_secrets,
     format_variable,
     get_resolved_env_vars,
@@ -26,7 +27,7 @@ def generate_skaffold_env(all_vars: dict) -> None:
     override config.env. Regenerating it here keeps both in step.
     """
     needed = get_skaffold_variables()
-    missing = sorted(needed - all_vars.keys())
+    missing = sorted(needed - all_vars.keys() - OPTIONAL_SKAFFOLD_VARIABLES)
     if missing:
         raise SystemExit(
             f"config.env is missing Skaffold variables: {', '.join(missing)}"
@@ -37,7 +38,7 @@ def generate_skaffold_env(all_vars: dict) -> None:
             "# Edit config.env instead. Contains only variables used by skaffold.yaml.\n\n"
         )
         for name in sorted(needed):
-            f.write(format_variable(name, all_vars[name], "skaffold") + "\n")
+            f.write(format_variable(name, all_vars.get(name, ""), "skaffold") + "\n")
     print("  - skaffold.env")
 
 
