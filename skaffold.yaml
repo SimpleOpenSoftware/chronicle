@@ -44,24 +44,23 @@ profiles:
               image.repository: "{{.IMAGE_REPO_parakeet_asr}}"
               image.tag: "{{.IMAGE_TAG_parakeet_asr}}"
 
+  # Built on the amd64 buildx builder named by BUILDX_BUILDER (config.env) and
+  # pushed directly; bare --build-arg values come from the environment
+  # (COMPUTE_MODE, VITE_ALLOWED_HOSTS from skaffold.env). Run: make deploy-speaker
   - name: speaker-recognition
     build:
+      platforms: ["linux/amd64"]
       local:
         push: true
-        useDockerCLI: true
       artifacts:
         - image: speaker-recognition
           context: extras/speaker-recognition
-          docker:
-            dockerfile: Dockerfile-k8s
-            buildArgs:
-              COMPUTE_MODE: "{{.COMPUTE_MODE}}"
+          custom:
+            buildCommand: ../../scripts/k8s/buildx-push.sh Dockerfile-k8s --build-arg COMPUTE_MODE
         - image: speaker-recognition-ui
           context: extras/speaker-recognition/webui
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              VITE_ALLOWED_HOSTS: "{{.VITE_ALLOWED_HOSTS}}"
+          custom:
+            buildCommand: ../../../scripts/k8s/buildx-push.sh Dockerfile --build-arg VITE_ALLOWED_HOSTS
     deploy:
       helm:
         releases:

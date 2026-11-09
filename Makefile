@@ -19,7 +19,7 @@ export $(shell sed 's/=.*//' config.env | grep -v '^\s*$$' | grep -v '^\s*\#')
 SCRIPTS_DIR := scripts
 K8S_SCRIPTS_DIR := $(SCRIPTS_DIR)/k8s
 
-.PHONY: help menu setup-k8s setup-infrastructure setup-rbac setup-storage-pvc config config-docker config-k8s config-all clean deploy deploy-docker deploy-k8s deploy-k8s-full deploy-infrastructure deploy-apps check-infrastructure check-apps build-backend up-backend down-backend k8s-status k8s-cleanup k8s-purge audio-manage test-robot test-robot-integration test-robot-unit test-robot-endpoints test-robot-specific test-robot-clean
+.PHONY: help menu setup-k8s setup-infrastructure setup-rbac setup-storage-pvc config config-docker config-k8s config-all clean deploy deploy-docker deploy-k8s deploy-k8s-full deploy-speaker deploy-infrastructure deploy-apps check-infrastructure check-apps build-backend up-backend down-backend k8s-status k8s-cleanup k8s-purge audio-manage test-robot test-robot-integration test-robot-unit test-robot-endpoints test-robot-specific test-robot-clean
 
 # Default target
 .DEFAULT_GOAL := menu
@@ -50,6 +50,7 @@ menu: ## Show interactive menu (default)
 	@echo "  deploy-docker      🐳 Deploy with Docker Compose"
 	@echo "  deploy-k8s         ☸️  Deploy to Kubernetes with Skaffold"
 	@echo "  deploy-k8s-full    🏗️  Deploy infrastructure + applications"
+	@echo "  deploy-speaker     🗣️  Build + deploy speaker recognition (GPU, speech ns)"
 	@echo
 	@echo "🔧 Utilities:"
 	@echo "  k8s-purge          🗑️  Purge unused images (registry + container)"
@@ -92,6 +93,7 @@ help: ## Show detailed help for all targets
 	@echo "  deploy-docker      Deploy with Docker Compose"
 	@echo "  deploy-k8s         Deploy to Kubernetes with Skaffold"
 	@echo "  deploy-k8s-full    Deploy infrastructure + applications"
+	@echo "  deploy-speaker     Build + deploy speaker recognition to the speech namespace"
 	@echo
 	@echo "🔧 KUBERNETES UTILITIES:"
 	@echo "  k8s-status         Check Kubernetes cluster status and health"
@@ -264,6 +266,11 @@ deploy-k8s: config-k8s ## Deploy to Kubernetes using Skaffold
 	@echo "☸️  Deploying to Kubernetes with Skaffold..."
 	@set -a; source skaffold.env; set +a; skaffold run --profile=backend --default-repo=$(CONTAINER_REGISTRY)
 	@echo "✅ Kubernetes deployment completed"
+
+deploy-speaker: config-k8s ## Build (amd64, via BUILDX_BUILDER) and deploy speaker recognition
+	@echo "🗣️  Deploying speaker recognition to the speech namespace..."
+	@set -a; source skaffold.env; set +a; skaffold run --profile=speaker-recognition --default-repo=$(CONTAINER_REGISTRY)
+	@echo "✅ Speaker recognition deployed (backend URL: $(SPEAKER_SERVICE_URL))"
 
 deploy-k8s-full: deploy-infrastructure deploy-apps ## Deploy infrastructure + applications to Kubernetes
 	@echo "✅ Full Kubernetes deployment completed"
