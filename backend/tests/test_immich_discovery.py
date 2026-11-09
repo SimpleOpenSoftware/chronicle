@@ -241,15 +241,16 @@ async def test_external_library_assets_do_not_satisfy_gate(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unconfigured_immich_blocks_without_network(monkeypatch):
+async def test_unconfigured_immich_is_ready_without_network(monkeypatch):
     monkeypatch.setattr(immich_discovery, "_settings", lambda: None)
 
     result = await immich_discovery.check_immich_day_readiness(
         date(2026, 8, 15), "Asia/Kolkata"
     )
 
-    assert result.ready is False
+    assert result.ready is True
     assert result.reason == "immich_unconfigured"
+    assert result.target_assets == []
 
 
 @pytest.mark.asyncio

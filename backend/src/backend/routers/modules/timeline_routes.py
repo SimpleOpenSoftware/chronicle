@@ -61,6 +61,7 @@ from backend.services.timeline.consolidation import (
 )
 from backend.services.timeline.dirty_ranges import (
     DirtyRangeDismissalError,
+    DirtyRangeLeaseLost,
     dismiss_failed_range,
 )
 from backend.services.timeline.dispatch import enqueue_episode_detailed_summary
@@ -74,6 +75,8 @@ from backend.services.timeline.evidence_relations import (
     infer_evidence_relations,
 )
 from backend.services.timeline.explicit_reconciliation import (
+    ReconciliationNotCancellable,
+    cancel_explicit_reconciliation,
     reconciliation_request_payload,
     request_explicit_reconciliation,
 )
@@ -561,6 +564,20 @@ async def reconcile_timeline_day(
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
     return {**reconciliation_request_payload(request), "created": created}
+
+
+@router.post("/reconciliation/{request_id}/cancel")
+async def cancel_reconciliation_request(
+    request_id: str,
+    user: User = Depends(current_active_user),
+):
+    try:
+        request = await cancel_explicit_reconciliation(user=user, request_id=request_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (ReconciliationNotCancellable, DirtyRangeLeaseLost) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return reconciliation_request_payload(request)
 
 
 @router.get("/reconciliation/{request_id}")
