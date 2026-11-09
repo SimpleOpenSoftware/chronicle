@@ -44,24 +44,23 @@ profiles:
               image.repository: "{{.IMAGE_REPO_parakeet_asr}}"
               image.tag: "{{.IMAGE_TAG_parakeet_asr}}"
 
+  # Built on the amd64 buildx builder named by BUILDX_BUILDER (config.env) and
+  # pushed directly; bare --build-arg values come from the environment
+  # (COMPUTE_MODE, VITE_ALLOWED_HOSTS from skaffold.env). Run: make deploy-speaker
   - name: speaker-recognition
     build:
+      platforms: ["linux/amd64"]
       local:
         push: true
-        useDockerCLI: true
       artifacts:
         - image: speaker-recognition
           context: extras/speaker-recognition
-          docker:
-            dockerfile: Dockerfile-k8s
-            buildArgs:
-              COMPUTE_MODE: "{{.COMPUTE_MODE}}"
+          custom:
+            buildCommand: ../../scripts/k8s/buildx-push.sh Dockerfile-k8s --build-arg COMPUTE_MODE
         - image: speaker-recognition-ui
           context: extras/speaker-recognition/webui
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              VITE_ALLOWED_HOSTS: "{{.VITE_ALLOWED_HOSTS}}"
+          custom:
+            buildCommand: ../../../scripts/k8s/buildx-push.sh Dockerfile --build-arg VITE_ALLOWED_HOSTS
     deploy:
       helm:
         releases:
@@ -77,11 +76,6 @@ profiles:
               nodeSelector.hostname: "{{.SPEAKER_NODE}}"
               # Shared models configuration
               global.sharedModels.enabled: "true"
-              global.sharedModels.useHostPath: "true"
-              global.sharedModels.size: "20Gi"
-              global.sharedModels.hostPath: "/shared/models"
-              global.sharedModels.nodes[0]: "anubis"
-              global.sharedModels.nodes[1]: "babel"
 
   # Infrastructure profile - deploy once, rarely updated
   - name: infrastructure
@@ -124,9 +118,9 @@ profiles:
           docker:
             dockerfile: Dockerfile.k8s
         - image: webui
-          context: backend/webui
+          context: .
           docker:
-            dockerfile: Dockerfile
+            dockerfile: backend/webui/Dockerfile.k8s
 
     deploy:
       helm:
@@ -142,7 +136,9 @@ profiles:
               image.repository: "{{.IMAGE_REPO_backend}}"
               image.tag: "{{.IMAGE_TAG_backend}}"
               # Override specific Kubernetes-specific values (not in env file)
-              env.MONGODB_URI: "mongodb://mongodb.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:27017/chronicle"
+              # $(MONGO_ROOT_PASSWORD) is expanded by Kubernetes from the
+              # chronicle-secrets envFrom, so the password never enters Helm values.
+              env.MONGODB_URI: "mongodb://root:$(MONGO_ROOT_PASSWORD)@mongodb.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:27017/chronicle?authSource=admin"
               env.REDIS_URL: "redis://redis-master.{{.INFRASTRUCTURE_NAMESPACE}}.svc.cluster.local:6379/0"
               persistence.storageClass: "openebs-hostpath"
               persistence.size: "10Gi"
@@ -150,8 +146,10 @@ profiles:
               # Ingress configuration
               ingress.hosts[0].host: "{{.BACKEND_HOST}}"
               ingress.hosts[1].host: "{{.EXTERNAL_DOMAIN}}"
-              # Node selector
-              nodeSelector.kubernetes\.io/hostname: anubis
+              # Empty APP_NODE: any node. Empty TAILSCALE_HOSTNAME: no Tailscale ingress.
+              node: "{{.APP_NODE}}"
+              tailscale.hostname: "{{.TAILSCALE_HOSTNAME}}"
+              tailscale.proxyGroup: "{{.TAILSCALE_PROXY_GROUP}}"
 
           - name: webui
             chartPath: backends/charts/webui
@@ -163,8 +161,7 @@ profiles:
               # Ingress configuration
               ingress.hosts[0].host: "{{.WEBUI_HOST}}"
               ingress.hosts[1].host: "{{.EXTERNAL_DOMAIN}}"
-              # Node selector
-              nodeSelector.kubernetes\.io/hostname: anubis
+              node: "{{.APP_NODE}}"
 
   - name: test-env
     portForward:

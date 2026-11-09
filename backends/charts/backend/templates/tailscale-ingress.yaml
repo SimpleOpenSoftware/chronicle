@@ -1,0 +1,41 @@
+{{- with .Values.tailscale.hostname }}
+{{- $backend := include "backend.fullname" $ }}
+{{- $port := $.Values.service.port }}
+# Tailnet entry point: https://{{ . }}.<tailnet>.ts.net
+# One Ingress for the API and the WebUI, because a Tailscale hostname can belong
+# to only one Ingress. Backend paths match ingress-values.yaml.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $backend }}-tailscale
+  labels:
+    {{- include "backend.labels" $ | nindent 4 }}
+  {{- with $.Values.tailscale.proxyGroup }}
+  annotations:
+    tailscale.com/proxy-group: {{ . | quote }}
+  {{- end }}
+spec:
+  ingressClassName: tailscale
+  tls:
+    - hosts:
+        - {{ . | quote }}
+  rules:
+    - http:
+        paths:
+          {{- range list "/api" "/auth" "/users" "/ws" "/health" "/readiness" "/audio" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $backend }}
+                port:
+                  number: {{ $port }}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $.Values.tailscale.webuiService }}
+                port:
+                  number: {{ $.Values.tailscale.webuiPort }}
+{{- end }}
