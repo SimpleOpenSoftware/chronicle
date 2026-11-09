@@ -26,7 +26,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
 import backend.services.privacy as privacy
-from backend.model_registry import AppModels, ResolvedLLMOperation, get_models_registry
+from backend.model_registry import (
+    AppModels,
+    ResolvedLLMOperation,
+    get_models_registry,
+    require_api_key,
+)
 from backend.services.inference_artifacts import canonical_hash, persist_inference_run
 
 from ..session_write import WriteSourcePermissions
@@ -452,7 +457,10 @@ def _resolve_pi_config(
         provider=_provider_slug(str(model_def.model_provider)),
         model=resolved.model_name,
         base_url=base_url,
-        api_key=resolved.api_key or "no-key",
+        api_key=require_api_key(
+            resolved.api_key, base_url, model_def.name, operation=operation
+        )
+        or "no-key",
         thinking=_thinking_level(settings.get("thinking"), resolved),
         max_tokens=max_tokens,
         context_window=context_window,
