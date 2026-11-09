@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
 import { timelineApi } from '../services/api'
 import { timezonesEquivalent } from '../components/timeline/timelineNavigation'
+import { setDisplayTimezone } from '../utils/datetime'
 
 /**
  * One timezone authority for day projections and chronological memory review.
@@ -18,6 +19,7 @@ export function useTimelineTimezone() {
     mutationFn: () => timelineApi.setTimezone(browserTimezone),
     onSuccess: async () => {
       setOverride(browserTimezone)
+      setDisplayTimezone(browserTimezone)
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['semantic-timeline'] }),
         queryClient.invalidateQueries({ queryKey: ['timeline-review-queue'] }),

@@ -14,6 +14,7 @@ import {
   type SystemEventsSummary,
 } from '../services/api'
 import { Button, Alert, Checkbox } from '../components/ui'
+import { formatDateTime, useDisplayTimezone } from '../utils/datetime'
 
 // ---- Severity + category styling ------------------------------------------
 
@@ -40,23 +41,11 @@ const CATEGORY_CHIP: Record<string, string> = {
 
 const SEVERITIES: Severity[] = ['critical', 'error', 'warning', 'info']
 const CATEGORIES = ['service', 'client', 'pipeline', 'job', 'memory', 'plugin', 'config', 'api', 'log']
-const SYSTEM_EVENTS_TIME_ZONE = 'Asia/Kolkata'
-const systemEventsTimeFormatter = new Intl.DateTimeFormat('en-GB', {
-  timeZone: SYSTEM_EVENTS_TIME_ZONE,
-  day: '2-digit',
-  month: 'short',
-  year: 'numeric',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hour12: false,
-})
-
 function formatTime(iso: string | null): string {
-  if (!iso) return '—'
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return '—'
-  return `${systemEventsTimeFormatter.format(date)} IST`
+  return (iso && formatDateTime(iso, {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'short',
+  })) || '—'
 }
 
 // ---- One event row ---------------------------------------------------------
@@ -331,6 +320,7 @@ function describeSimilarSelection(events: SystemEvent[], selectedIds: Set<string
 }
 
 export default function SystemEvents() {
+  const displayTimezone = useDisplayTimezone()
   const { isAdmin } = useAuth()
   const queryClient = useQueryClient()
 
@@ -509,7 +499,7 @@ export default function SystemEvents() {
       </div>
 
       <p className="mb-5 text-sm text-gray-500 dark:text-gray-400">
-        Events from the last 30 days. Times in IST. Unacknowledged counts include historical events, not just current failures.
+        Events from the last 30 days. Times in {displayTimezone}. Unacknowledged counts include historical events, not just current failures.
       </p>
 
       {error && (

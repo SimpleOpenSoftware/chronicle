@@ -3,6 +3,7 @@ import { Clock, ToggleLeft, ToggleRight, Edit3, Check, X, Play, RefreshCw, Eye }
 import cronstrue from 'cronstrue'
 import { useCronJobs, useToggleCronJob, useUpdateCronSchedule, useRunCronJob } from '../hooks/useFinetuning'
 import { Alert, Button, Card, IconButton, StateBadge, StateTone } from './ui'
+import { formatDateTime, useDisplayTimezone } from '../utils/datetime'
 
 // Human-friendly names + what kind of automation each job is. Trigger-now lives
 // on the Training page; this card owns only "should it run / when".
@@ -34,10 +35,11 @@ function humanCron(expr: string): string {
 
 function formatTs(iso: string | null): string {
   if (!iso) return 'Never'
-  return `${new Date(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' })} IST`
+  return formatDateTime(iso)
 }
 
 export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
+  const timezone = useDisplayTimezone()
   const { data: jobs = [], isLoading, refetch } = useCronJobs()
   const toggleJob = useToggleCronJob()
   const updateSchedule = useUpdateCronSchedule()
@@ -96,7 +98,7 @@ export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
         Automation &amp; Schedules
       </h3>
       <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-        Next runs are shown in IST. Enabling or disabling a job takes effect immediately.
+        Next runs are shown in {timezone}. Enabling or disabling a job takes effect immediately.
       </p>
 
       {error && (

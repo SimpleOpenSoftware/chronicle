@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import { authApi, browserSession, type CurrentUser } from '../services/api'
 import { getStorageKey } from '../utils/storage'
+import { setDisplayTimezone } from '../utils/datetime'
 import { SESSION_CHANGED, savedToken, signedOut, logoutPending } from '../services/browserSession'
 
 interface AuthContextType {
@@ -27,6 +28,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Check if user is admin
   const isAdmin = user?.is_superuser || false
+
+  // Every displayed timestamp follows the user's saved zone (browser zone when unset).
+  useEffect(() => setDisplayTimezone(user?.timezone), [user?.timezone])
 
   useEffect(() => {
     const sync = () => {

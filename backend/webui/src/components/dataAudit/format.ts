@@ -1,4 +1,5 @@
 import { sourceDate } from '../../utils/sourceTime'
+import { PRECISE_DATE_TIME, formatDateTime } from '../../utils/datetime'
 
 export function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0) return '0s'
@@ -20,7 +21,7 @@ export function formatClock(seconds: number): string {
 
 export function formatDate(iso: string | null): string {
   if (!iso) return '—'
-  return sourceDate(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
+  return formatDateTime(sourceDate(iso), PRECISE_DATE_TIME)
 }
 
 // Processing-status chip for a Data Audit row. Returns null for the normal
