@@ -7,6 +7,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { systemApi, clientsApi, deviceInputApi } from '../services/api'
 import { timeAgo } from '../utils/timeAgo'
 import { Alert, Button, IconButton } from '../components/ui'
+import { PRECISE_TIME, formatTime } from '../utils/datetime'
 
 interface DiscoveredService {
   name: string
@@ -186,7 +187,7 @@ export default function Network() {
         <div className="flex items-center space-x-4">
           {lastUpdated && (
             <span className="text-sm text-gray-600 dark:text-gray-400">
-              Last scan: {lastUpdated.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+              Last scan: {formatTime(lastUpdated, PRECISE_TIME)}
             </span>
           )}
           <Button
@@ -230,7 +231,7 @@ export default function Network() {
           <div className="mb-4 flex flex-wrap items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-gray-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-gray-200">
             <span>
               Pairing code <code className="mx-1 font-mono font-bold">{pairing.data.code}</code>
-              expires {new Date(pairing.data.expires_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.
+              expires {formatTime(pairing.data.expires_at, PRECISE_TIME)}.
             </span>
             <IconButton label="Copy pairing code" onClick={() => navigator.clipboard.writeText(pairing.data!.code)}>
               <Copy className="h-4 w-4" />
