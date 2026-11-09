@@ -72,8 +72,9 @@ def generate_k8s_manifests(namespace: str = "chronicle"):
             escaped_value = var_value.replace('"', '\\"')
             f.write(f'  {var_name}: "{escaped_value}"\n')
 
-        # Config files, mounted at /app/config by the backend chart
-        for file_name in ("defaults.yml", "config.yml"):
+        # Config files: the seed that the chart's config-seed init container merges
+        # into the writable config dir (backend/src/backend/config_seed.py)
+        for file_name in ("defaults.yml", "config.yml", "plugins.yml"):
             file_path = Path("config") / file_name
             if not file_path.exists():
                 continue
