@@ -251,7 +251,7 @@ def test_wizard_removes_obsolete_pi_model_but_preserves_explicit_limits(init_mod
                 },
                 "backends": {
                     "pi": {
-                        "model": "old-kraken-model",
+                        "model": "old-backend-node-model",
                         "context_window": 8192,
                         "max_tokens": 2048,
                     }

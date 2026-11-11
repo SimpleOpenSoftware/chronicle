@@ -62,12 +62,12 @@ def test_alignment_url_requires_explicit_model_capability(monkeypatch):
 def test_alignment_url_uses_capable_local_asr_origin(monkeypatch):
     model = SimpleNamespace(
         capabilities=["transcription", "forced_alignment"],
-        resolved_url=lambda: "http://rainbow:8767/transcribe?format=json",
+        resolved_url=lambda: "http://capture-node:8767/transcribe?format=json",
     )
     registry = SimpleNamespace(get_default=lambda model_type: model)
     monkeypatch.setattr(forced_alignment, "get_models_registry", lambda: registry)
 
-    assert forced_alignment._align_url() == "http://rainbow:8767/align"
+    assert forced_alignment._align_url() == "http://capture-node:8767/align"
 
 
 def test_speaker_batches_are_bounded_by_count_and_total_duration():

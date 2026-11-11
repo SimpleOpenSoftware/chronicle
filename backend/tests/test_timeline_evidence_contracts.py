@@ -26,14 +26,14 @@ START = datetime(2026, 9, 3, 10, tzinfo=timezone.utc)
 
 def _item(identifier: str, track_id: str) -> TimelineEvidenceItem:
     locator = EvidenceLocator(
-        capture_source_id="screenpipe-rainbow",
+        capture_source_id="screenpipe-capture-node",
         modality="screen",
         track_id=track_id,
     )
     return TimelineEvidenceItem(
         evidence_id=identifier,
         kind="observation",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         locator=locator,
         started_at=START,
         ended_at=START + timedelta(minutes=1),
@@ -49,7 +49,7 @@ def test_device_input_requires_a_typed_locator_at_ingress():
     with pytest.raises(ValidationError, match="locator"):
         DeviceInputItem(
             user_id="user",
-            source_id="screenpipe-rainbow",
+            source_id="screenpipe-capture-node",
             kind="observation",
             source_item_id="observation:1",
             captured_at=START,
@@ -61,7 +61,7 @@ def test_device_input_rejects_locator_for_a_different_capture_source():
     with pytest.raises(ValueError, match="authenticated source"):
         DeviceInputItem(
             user_id="user",
-            source_id="screenpipe-rainbow",
+            source_id="screenpipe-capture-node",
             kind="observation",
             source_item_id="observation:1",
             captured_at=START,
@@ -111,11 +111,11 @@ def test_context_compaction_never_combines_simultaneous_display_tracks():
 def test_device_evidence_retains_full_samples_and_resolvable_frame_anchors():
     row = SimpleNamespace(
         id="row-one",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         kind="observation",
         source_item_id="observation:1",
         locator=EvidenceLocator(
-            capture_source_id="screenpipe-rainbow",
+            capture_source_id="screenpipe-capture-node",
             modality="screen",
             track_id="Display 2",
         ),
@@ -191,7 +191,7 @@ def test_manifest_resolves_exact_anchor_and_rejects_unsupported_interior_boundar
 
 def test_manifest_rejects_anchor_for_unknown_evidence():
     locator = EvidenceLocator(
-        capture_source_id="screenpipe-rainbow",
+        capture_source_id="screenpipe-capture-node",
         modality="screen",
         track_id="Display 1",
     )

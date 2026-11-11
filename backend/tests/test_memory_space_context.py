@@ -51,7 +51,7 @@ async def test_returned_frames_are_bounded_and_only_explicit_selection_is_admitt
     conversation = _conversation(memory_review_state="context_requested")
     job = DeviceInputJob.model_construct(
         user_id="user-1",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         purpose="memory_space_note_review",
         payload={
             "conversation_id": conversation.conversation_id,
@@ -117,7 +117,7 @@ async def test_selected_frames_use_structured_vision_settings(monkeypatch):
         lambda: SimpleNamespace(vision=vision_settings),
     )
     frame = Conversation.MemoryContextFrame(
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         frame_id=42,
         captured_at=datetime(2026, 8, 30, 5, 16, tzinfo=timezone.utc),
         content_type="image/jpeg",

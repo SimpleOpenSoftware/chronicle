@@ -94,7 +94,7 @@ async def test_direct_memory_writer_receives_selected_images_as_pixels(
     await MemoryAgent(tmp_path).run(
         "I am showing the notebook now.",
         "conversation-1",
-        images=[("rainbow.png", b"real-pixel-bytes")],
+        images=[("selected-frame.png", b"real-pixel-bytes")],
     )
 
     content = captured["messages"][1]["content"]

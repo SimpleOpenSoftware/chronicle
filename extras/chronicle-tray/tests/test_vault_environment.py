@@ -133,7 +133,7 @@ def test_scoped_pair_acknowledges_server_rescan(tmp_path, monkeypatch):
     manager.config = SimpleNamespace(
         api_key="client-key",
         backend_url="https://chronicle.example",
-        device_name="rainbow",
+        device_name="capture-node",
         local_vault_dir=str(tmp_path / "Main"),
     )
     manager.syncthing = SyncthingStub()

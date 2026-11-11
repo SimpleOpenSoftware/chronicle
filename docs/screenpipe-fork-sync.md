@@ -1,82 +1,50 @@
 # Screenpipe fork sync
 
-Chronicle consumes the `chronicle` branch of
-[`AnkushMalaker/screenpipe`](https://github.com/AnkushMalaker/screenpipe). It is
-a single patch stack rebased directly onto `screenpipe/screenpipe`'s `main`.
-The older `custom/linux-timeline-stability` intermediate branch no longer
-exists; its commits were folded into `chronicle` in August 2026.
+Chronicle's recorder source is the `chronicle-recorder` branch of
+[`AnkushMalaker/screenpipe`](https://github.com/AnkushMalaker/screenpipe), based
+directly on upstream `screenpipe/screenpipe` `main`. The historical `chronicle`
+branch remains intact; the new branch does not replay its old history.
 
 ## Automated sync
 
-`.github/workflows/sync-screenpipe-fork.yml` runs daily and can also be started
-manually. It:
-
-1. checks out the fork's `chronicle` branch with full history;
-2. fetches only `main` from upstream;
-3. rebases `chronicle` onto `upstream/main` when it is behind;
-4. pushes with `--force-with-lease`; and
-5. opens or updates a Chronicle issue if the rebase conflicts.
+`.github/workflows/sync-screenpipe-fork.yml` runs daily from Chronicle's default
+branch, `dev`, and can also be started manually. It checks out `chronicle-recorder`
+with full history, fetches upstream `main`, and rebases when upstream advances.
+A successful rebase pushes with `--force-with-lease`; conflicts leave the fork
+unchanged and open or update a Chronicle issue. This workflow checks whether the
+rebase applies; it does not build, install, or validate the recorder on a device.
 
 The workflow needs the `SCREENPIPE_FORK_TOKEN` repository secret with write
-access to `AnkushMalaker/screenpipe`. A manual dry run can be dispatched with:
+access to the fork. Start a manual dry run with:
 
 ```bash
-gh workflow run sync-screenpipe-fork.yml -F push=false
+gh workflow run sync-screenpipe-fork.yml --ref dev -F push=false
 ```
 
-Use `-F`, not `-f`, so GitHub receives a boolean rather than the truthy string
-`"false"`.
+Use `-F` to send a boolean. The workflow also rejects the string `"false"`.
 
 ## Local sync and conflict recovery
 
-The fork is normally cloned at `untracked/screenpipe` with the upstream remote
-named `origin` and the writable fork remote named `fork`. The script resolves
-the remotes by URL, so their names are not a contract.
-
-First check divergence without changing the worktree:
+Use a fresh directory to preserve existing work. The commands below use `origin`
+for the writable fork and fetch upstream directly by URL:
 
 ```bash
-cd untracked/screenpipe
-./sync-fork.sh --check
+git clone --branch chronicle-recorder https://github.com/AnkushMalaker/screenpipe.git screenpipe-sync
+cd screenpipe-sync
+expected=$(git rev-parse HEAD)
+git fetch --no-tags https://github.com/screenpipe/screenpipe main
+git rebase FETCH_HEAD
 ```
 
-Then rebase locally. The script uses `--autostash` because Tauri builds commonly
-leave generated schema changes in the worktree:
+Resolve conflicts, stage only the resolved files, and run `git rebase --continue`.
+Use `git rebase --abort` to abandon the attempt. Review the diff and run tests
+appropriate to the affected recorder areas before publishing. A clean rebase alone
+does not prove capture, privacy, or audio behavior.
 
 ```bash
-./sync-fork.sh
+git push --force-with-lease=refs/heads/chronicle-recorder:$expected origin HEAD:refs/heads/chronicle-recorder
 ```
 
-If Git stops on a conflict, resolve it, stage the resolved files, and continue:
-
-```bash
-git add <files>
-git rebase --continue
-```
-
-Run tests appropriate to the touched Screenpipe areas (see the fork's
-`AGENTS.md` and `TESTING.md`), then publish the rewritten branch:
-
-```bash
-./sync-fork.sh --push
-```
-
-The push deliberately uses `--force-with-lease`. Never replace it with an
-unconditional force push.
-
-## Topology invariant
-
-The automation and `untracked/screenpipe/sync-fork.sh` must agree on this
-relationship:
-
-```text
-screenpipe/screenpipe main -> AnkushMalaker/screenpipe chronicle
-```
-
-When changing the branch topology, update both files together and verify the
-remote branches with:
-
-```bash
-git -C untracked/screenpipe ls-remote --heads fork chronicle
-git -C untracked/screenpipe ls-remote --heads origin main
-```
+The explicit expected commit protects concurrent changes to the remote branch.
+Never replace it with an unconditional force push. Keep the workflow and this
+runbook aligned; the recorder branch does not require a custom sync script.

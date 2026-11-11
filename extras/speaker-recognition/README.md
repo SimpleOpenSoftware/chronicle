@@ -46,7 +46,7 @@ For non-interactive setup:
 ```bash
 ./init.sh --hf-token YOUR_TOKEN --compute-mode cpu
 # Or for HTTPS with specific IP:
-./init.sh --hf-token YOUR_TOKEN --compute-mode gpu --enable-https --server-ip 100.83.66.30
+./init.sh --hf-token YOUR_TOKEN --compute-mode gpu --enable-https --server-ip YOUR_SERVER_IP
 ```
 
 ### 4. SSL Certificates (automatic)
@@ -859,7 +859,7 @@ python laptop_client.py list
 python laptop_client.py remove --speaker-id "john"
 
 # Use different service URL
-python laptop_client.py --service-url "http://192.168.1.100:8001" identify
+python laptop_client.py --service-url "http://YOUR_SERVER_IP:8001" identify
 ```
 
 ### Laptop Client Features
