@@ -2,11 +2,11 @@ import json
 
 import httpx
 import pytest
+from edge.deployments import Gateway
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from edge.deployments import Gateway
 from service_deployments import Plan
+
 from tests.unit.test_service_deployments import plan
 
 
@@ -49,26 +49,31 @@ def test_request_time_failover_and_primary_recovery_preserve_payload():
             (request.method, request.url.host, request.url.path, request.content)
         )
         if request.url.path == "/health":
-            if request.url.host == "kraken" and not primary_up:
+            if request.url.host == "backend-node" and not primary_up:
                 return httpx.Response(503, json={"status": "loading"})
             return httpx.Response(200, json={"model": "same-model"})
         return httpx.Response(
             200, stream=Stream(), headers={"content-type": "text/event-stream"}
         )
 
-    client = app_for(plan("ha", ("kraken", "rainbow")), upstream)
+    client = app_for(plan("ha", ("backend-node", "capture-node")), upstream)
     r = client.post(
         "/proxy/chat/completions",
         content=b'{"stream":true}',
         headers={"Authorization": "Bearer private"},
     )
-    assert r.status_code == 200 and r.headers["x-chronicle-instance"] == "rainbow"
+    assert r.status_code == 200 and r.headers["x-chronicle-instance"] == "capture-node"
     assert r.text == "data: first\n\ndata: [DONE]\n\n"
-    assert seen[-1] == ("POST", "rainbow", "/v1/chat/completions", b'{"stream":true}')
+    assert seen[-1] == (
+        "POST",
+        "capture-node",
+        "/v1/chat/completions",
+        b'{"stream":true}',
+    )
     primary_up = True
     assert (
         client.post("/proxy/chat/completions", json={}).headers["x-chronicle-instance"]
-        == "kraken"
+        == "backend-node"
     )
 
 
@@ -81,17 +86,17 @@ def test_submitted_post_is_never_replayed_on_timeout():
         posts.append(request.url.host)
         raise httpx.ReadTimeout("ambiguous response timeout")
 
-    r = app_for(plan("ha", ("kraken", "rainbow")), upstream).post(
+    r = app_for(plan("ha", ("backend-node", "capture-node")), upstream).post(
         "/proxy/chat/completions", json={"prompt": "one"}
     )
-    assert r.status_code == 502 and posts == ["kraken"]
+    assert r.status_code == 502 and posts == ["backend-node"]
 
 
 def test_wrong_model_and_all_failed_return_unavailable():
     def upstream(request):
         return httpx.Response(200, json={"model": "wrong-model"})
 
-    r = app_for(plan("ha", ("kraken", "rainbow")), upstream).post(
+    r = app_for(plan("ha", ("backend-node", "capture-node")), upstream).post(
         "/proxy/chat/completions", json={}
     )
     assert r.status_code == 503
@@ -109,7 +114,7 @@ def test_single_never_selects_an_unlisted_fallback():
         app_for(plan(), upstream).post("/proxy/chat/completions", json={}).status_code
         == 503
     )
-    assert hosts == ["rainbow"]
+    assert hosts == ["capture-node"]
 
 
 def test_failover_over_real_http_connections():
@@ -164,7 +169,7 @@ def test_failover_over_real_http_connections():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
     try:
-        p = plan("ha", ("kraken", "rainbow")).model_dump()
+        p = plan("ha", ("backend-node", "capture-node")).model_dump()
         for instance, server in zip(
             p["deployments"]["llm-services"]["instances"], servers
         ):
@@ -186,9 +191,9 @@ def test_failover_over_real_http_connections():
 
         with TestClient(app) as client:
             for primary_up, expected in [
-                (True, "kraken"),
-                (False, "rainbow"),
-                (True, "kraken"),
+                (True, "backend-node"),
+                (False, "capture-node"),
+                (True, "backend-node"),
             ]:
                 available[0] = primary_up
                 response = client.post("/chat", json={"stream": True})

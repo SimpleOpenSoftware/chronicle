@@ -27,7 +27,7 @@ backfill apply, app release, live Swiggy request, or payment was performed.
 | Branch | `feature/full-duplex-voice-cutover` |
 | Implementation candidate | `02b7a3b89d22b097935fb60fb86dec59f4d918a0` |
 | Base lineage | `dev`, with curated source changes committed at `210e0c73` |
-| Host | `Kraken` |
+| Host | Linux validation host |
 | OS | Linux 6.6.87.2 WSL2, x86_64 |
 | Date | 2026-08-16 UTC |
 | Test container engine | Podman |
@@ -119,10 +119,10 @@ Portable post-fix checks passed:
 
 `app/modules/chronicle-duplex-audio/ios/Package.swift` now makes the production-used
 Swift cancellation/state policy tests directly runnable with `swift test`. They remain
-unexecuted on this Linux host and are a required Rainbow gate. The Android policy tests
+unexecuted on this Linux host and are a required native-toolchain gate. The Android policy tests
 likewise remain unexecuted until an Android toolchain is available.
 
-The executable `scripts/rainbow-testflight-handoff.sh` fetches an exact remote SHA into
+The executable `scripts/ios-testflight-handoff.sh` fetches an exact remote SHA into
 a new detached worktree, runs the portable checks and Swift package tests, and prints
 the explicit TestFlight workflow-dispatch command. It does not contain credentials or
 upload a build by itself.

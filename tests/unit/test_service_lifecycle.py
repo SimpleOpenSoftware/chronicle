@@ -7,15 +7,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import deployment_guard
 import pytest
 import requests
-import yaml
-
-import deployment_guard
 import service_cli
 import services
 import status
+import yaml
 from service_deployments import PlacementError
+
 from tests.unit.test_service_deployments import plan
 
 
@@ -127,7 +127,7 @@ def test_admission_denial_is_nonzero(lifecycle, monkeypatch, action):
 def configure_placement(root, monkeypatch, snapshot):
     config = {
         "service_placement": {
-            "node_id": "kraken",
+            "node_id": "backend-node",
             "coordinator_url": "http://authority:8775",
         }
     }
@@ -155,7 +155,9 @@ def configure_placement(root, monkeypatch, snapshot):
 
 
 @pytest.mark.parametrize("action", ["start", "restart"])
-@pytest.mark.parametrize("owners", [("rainbow",), ("kraken",), ("rainbow", "kraken")])
+@pytest.mark.parametrize(
+    "owners", [("capture-node",), ("backend-node",), ("capture-node", "backend-node")]
+)
 def test_bulk_activation_selects_local_owner_and_ha_members(
     lifecycle, monkeypatch, action, owners
 ):
@@ -168,7 +170,9 @@ def test_bulk_activation_selects_local_owner_and_ha_members(
         lambda name, *a, **k: invoked.append(name) or True,
     )
     assert run_cli(monkeypatch, action, "--all") == 0
-    assert set(invoked) == ({"llm-services", "tts"} if "kraken" in owners else {"tts"})
+    assert set(invoked) == (
+        {"llm-services", "tts"} if "backend-node" in owners else {"tts"}
+    )
     assert requests_made.count("http://authority:8775/deployments") == 1
 
 
@@ -179,7 +183,7 @@ def test_bulk_activation_fails_closed(lifecycle, monkeypatch, action, fault):
     if fault == "malformed":
         snapshot = {"deployments": []}
     elif fault == "unregistered":
-        snapshot["nodes"].pop("kraken")
+        snapshot["nodes"].pop("backend-node")
     configure_placement(lifecycle, monkeypatch, snapshot)
     if fault == "offline":
         original_get = deployment_guard.requests.get
@@ -215,7 +219,9 @@ def test_stop_all_does_not_require_authority_or_filter_excluded_services(
 def test_bulk_selection_is_authenticated_and_does_not_replace_admission(
     lifecycle, monkeypatch
 ):
-    configure_placement(lifecycle, monkeypatch, plan(owners=("kraken",)).model_dump())
+    configure_placement(
+        lifecycle, monkeypatch, plan(owners=("backend-node",)).model_dump()
+    )
     monkeypatch.setenv("SERVICE_PLACEMENT_TOKEN", "test-control-token")
     original_get = deployment_guard.requests.get
     order = []

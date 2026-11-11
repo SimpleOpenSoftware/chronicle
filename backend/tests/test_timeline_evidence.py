@@ -58,8 +58,8 @@ def test_adjacent_app_rows_are_compacted_without_becoming_episode_boundaries():
         TimelineEvidenceItem(
             evidence_id=f"observation:{index}",
             kind="observation",
-            source_id="rainbow",
-            locator=_screen_locator("rainbow"),
+            source_id="capture-node",
+            locator=_screen_locator("capture-node"),
             started_at=start,
             ended_at=start,
             role="application_state",
@@ -158,11 +158,11 @@ def test_same_window_on_different_browser_pages_is_not_compacted():
 
 def test_adjacent_distinct_games_remain_separate_evidence():
     start = datetime(2026, 8, 6, tzinfo=timezone.utc)
-    aoe = _app_item("aoe", "rainbow", start)
+    aoe = _app_item("aoe", "capture-node", start)
     aoe.metadata.update(
         {"app_name": "steam_app_1466860", "window_name": "Age of Empires IV"}
     )
-    rematch = _app_item("rematch", "rainbow", start + timedelta(seconds=10))
+    rematch = _app_item("rematch", "capture-node", start + timedelta(seconds=10))
     rematch.metadata.update({"app_name": "steam_app_2138720", "window_name": "REMATCH"})
 
     compacted = _coalesce_application_evidence([aoe, rematch])
@@ -221,8 +221,8 @@ def test_open_observation_uses_latest_marker_as_provisional_end():
     row = SimpleNamespace(
         id="open-game",
         user_id="user",
-        source_id="rainbow",
-        locator=_screen_locator("rainbow"),
+        source_id="capture-node",
+        locator=_screen_locator("capture-node"),
         kind="observation",
         source_item_id="observation:open-game",
         captured_at=start,

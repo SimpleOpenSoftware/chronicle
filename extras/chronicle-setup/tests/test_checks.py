@@ -33,9 +33,9 @@ STATUS_RUNNING = json.dumps(
         "BackendState": "Running",
         "AuthURL": "",
         "Self": {
-            "HostName": "Kraken",
-            "DNSName": "kraken.parrot-census.ts.net.",
-            "TailscaleIPs": ["100.83.66.30", "fd7a:115c:a1e0::ac01:4222"],
+            "HostName": "backend-node",
+            "DNSName": "backend-node.example.ts.net.",
+            "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"],
             "Online": True,
             "KeyExpiry": "2027-01-28T05:28:38Z",
         },
@@ -44,7 +44,7 @@ STATUS_RUNNING = json.dumps(
 
 # The broken state: daemon up, interface present, but no key.
 STATUS_LOGGED_OUT = json.dumps(
-    {"BackendState": "NeedsLogin", "AuthURL": "", "Self": {"HostName": "Kraken"}}
+    {"BackendState": "NeedsLogin", "AuthURL": "", "Self": {"HostName": "backend-node"}}
 )
 
 # Epoch of the KeyExpiry above. Derived rather than hand-written, because an
@@ -58,7 +58,7 @@ PREFS_WITHOUT_OPERATOR = json.dumps({"WantRunning": True, "LoggedOut": False})
 CERT_PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 CERT_SUMMARY = (
     "issuer=C = US, O = Let's Encrypt, CN = YE1\n"
-    "subject=CN = kraken.parrot-census.ts.net\n"
+    "subject=CN = backend-node.example.ts.net\n"
     "notAfter=Oct 28 13:47:26 2026 GMT\n"
 )
 
@@ -175,7 +175,7 @@ def test_magicdns_ok_when_container_resolves_the_node(monkeypatch, have_all_bina
             [
                 (["status"], (0, STATUS_RUNNING, "")),
                 RUNNING_CONTAINER,
-                (["getent"], (0, "100.83.66.30  kraken.parrot-census.ts.net\n", "")),
+                (["getent"], (0, "100.64.0.10  backend-node.example.ts.net\n", "")),
             ]
         ),
     )
@@ -206,10 +206,10 @@ def test_magicdns_fails_when_only_public_upstreams_are_pinned(
 
     result = checks.check_container_magicdns(ctx)
     assert result.status == FAIL
-    assert "kraken.parrot-census.ts.net" in result.detail
+    assert "backend-node.example.ts.net" in result.detail
     assert "100.100.100.100" in (result.remedy or "")
     # Probed by the node's own name, trailing dot stripped.
-    assert runner.argv_containing("kraken.parrot-census.ts.net")
+    assert runner.argv_containing("backend-node.example.ts.net")
 
 
 def test_magicdns_not_applicable_without_a_tailnet(monkeypatch, have_all_binaries):
@@ -248,7 +248,7 @@ def test_login_ok_when_running(monkeypatch, have_all_binaries):
     install(monkeypatch, FakeRunner([(["status"], (0, STATUS_RUNNING, ""))]))
     result = checks.check_tailscale_login(CheckContext())
     assert result.status == OK
-    assert "kraken.parrot-census.ts.net" in result.detail
+    assert "backend-node.example.ts.net" in result.detail
 
 
 def test_login_fails_when_logged_out(monkeypatch, have_all_binaries):
@@ -292,7 +292,9 @@ def test_key_expiry_fails_when_already_expired(monkeypatch, have_all_binaries):
 
 def test_key_expiry_ok_when_disabled(monkeypatch, have_all_binaries):
     """No KeyExpiry means expiry is disabled — the desired end state, not a gap."""
-    status = json.dumps({"BackendState": "Running", "Self": {"HostName": "Kraken"}})
+    status = json.dumps(
+        {"BackendState": "Running", "Self": {"HostName": "backend-node"}}
+    )
     install(monkeypatch, FakeRunner([(["status"], (0, status, ""))]))
     result = checks.check_tailscale_key_expiry(CheckContext())
     assert result.status == OK
@@ -427,7 +429,7 @@ def test_tls_ok_with_valid_cert(monkeypatch, have_all_binaries):
         ),
     )
     result = checks.check_tls_cert(
-        CheckContext(https_host="kraken.parrot-census.ts.net")
+        CheckContext(https_host="backend-node.example.ts.net")
     )
     assert result.status == OK
     assert "Let's Encrypt" in result.detail
@@ -441,17 +443,17 @@ def test_tls_uses_sni(monkeypatch, have_all_binaries):
             [(["s_client"], (0, CERT_PEM, "")), (["x509"], (0, CERT_SUMMARY, ""))]
         ),
     )
-    checks.check_tls_cert(CheckContext(https_host="kraken.parrot-census.ts.net"))
+    checks.check_tls_cert(CheckContext(https_host="backend-node.example.ts.net"))
     argv = runner.argv_containing("s_client")[0]
     assert "-servername" in argv
-    assert "kraken.parrot-census.ts.net" in argv
+    assert "backend-node.example.ts.net" in argv
 
 
 def test_tls_fails_when_no_certificate_served(monkeypatch, have_all_binaries):
     """What the broken node did: handshake produced no certificate at all."""
     install(monkeypatch, FakeRunner([(["s_client"], (1, "", "connect: errno=111"))]))
     result = checks.check_tls_cert(
-        CheckContext(https_host="kraken.parrot-census.ts.net")
+        CheckContext(https_host="backend-node.example.ts.net")
     )
     assert result.status == FAIL
     assert "cert access denied" in result.remedy
@@ -465,7 +467,7 @@ def test_tls_warns_when_expiring(monkeypatch, have_all_binaries):
         ),
     )
     result = checks.check_tls_cert(
-        CheckContext(https_host="kraken.parrot-census.ts.net")
+        CheckContext(https_host="backend-node.example.ts.net")
     )
     assert result.status == WARN
 

@@ -280,7 +280,7 @@ def test_short_shortlist_is_returned_whole():
 
 def test_tracker_rejects_frames_from_another_display_track():
     tracker = ObservationTracker(
-        capture_source_id="screenpipe-rainbow", track_id="Display 1"
+        capture_source_id="screenpipe-capture-node", track_id="Display 1"
     )
     tracker.process_rows(
         [frame(1, 0, "Code", "collector.py", device_name="Display 1")],
@@ -304,7 +304,7 @@ def test_tracker_rejects_frames_from_another_display_track():
 
 def test_observation_event_carries_a_typed_display_locator():
     tracker = ObservationTracker(
-        capture_source_id="screenpipe-rainbow", track_id="Display 2"
+        capture_source_id="screenpipe-capture-node", track_id="Display 2"
     )
 
     [opened] = tracker.process_rows(
@@ -322,7 +322,7 @@ def test_observation_event_carries_a_typed_display_locator():
     )
 
     assert opened["locator"] == {
-        "capture_source_id": "screenpipe-rainbow",
+        "capture_source_id": "screenpipe-capture-node",
         "modality": "screen",
         "track_id": "Display 2",
     }

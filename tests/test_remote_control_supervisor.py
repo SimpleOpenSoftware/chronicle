@@ -13,7 +13,7 @@ def test_remote_control_unit_stops_cleanly_when_auth_is_unavailable(
     monkeypatch.setattr(
         services,
         "_claude_rc_command",
-        lambda: ["/opt/claude", "remote-control", "--name", "Kraken"],
+        lambda: ["/opt/claude", "remote-control", "--name", "Backend node"],
     )
     monkeypatch.setattr(
         services.shutil,

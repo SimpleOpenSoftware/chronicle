@@ -164,12 +164,12 @@ async def test_audio_route_persists_explicit_provider_local_track(monkeypatch):
         direction="input",
         content_hash=hashlib.sha256(payload).hexdigest(),
         meeting_id=None,
-        source=SimpleNamespace(user_id="user", source_id="screenpipe-rainbow"),
+        source=SimpleNamespace(user_id="user", source_id="screenpipe-capture-node"),
     )
 
     assert response == {"status": "accepted", "item_id": "item-1"}
     assert captured["locator"].model_dump() == {
-        "capture_source_id": "screenpipe-rainbow",
+        "capture_source_id": "screenpipe-capture-node",
         "modality": "audio",
         "track_id": "Desk Mic (input)",
     }
@@ -184,11 +184,11 @@ async def test_observation_open_race_rejects_conflicting_immutable_identity(
     captured_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
     existing = SimpleNamespace(
         user_id="user",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         kind="observation",
         source_item_id="observation:42",
         locator=EvidenceLocator(
-            capture_source_id="screenpipe-rainbow",
+            capture_source_id="screenpipe-capture-node",
             modality="screen",
             track_id="display-one",
         ),
@@ -226,7 +226,7 @@ async def test_observation_open_race_rejects_conflicting_immutable_identity(
                     )
                 ]
             ),
-            SimpleNamespace(user_id="user", source_id="screenpipe-rainbow"),
+            SimpleNamespace(user_id="user", source_id="screenpipe-capture-node"),
         )
 
     assert exc_info.value.status_code == 409
@@ -245,11 +245,11 @@ def _audio_item(*, track_id: str = "Desk Mic (input)", digest: str):
     captured_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
     return SimpleNamespace(
         user_id="user",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         kind="audio",
         source_item_id="42",
         locator=EvidenceLocator(
-            capture_source_id="screenpipe-rainbow",
+            capture_source_id="screenpipe-capture-node",
             modality="audio",
             track_id=track_id,
         ),
@@ -270,7 +270,7 @@ async def _ingest_audio(payload: bytes = b"fixture-audio"):
         direction="input",
         content_hash=hashlib.sha256(payload).hexdigest(),
         meeting_id=None,
-        source=SimpleNamespace(user_id="user", source_id="screenpipe-rainbow"),
+        source=SimpleNamespace(user_id="user", source_id="screenpipe-capture-node"),
     )
 
 
@@ -334,7 +334,7 @@ async def test_audio_compacted_duplicate_requires_the_same_track(
     async def compacted(*_args):
         return SimpleNamespace(
             locator=EvidenceLocator(
-                capture_source_id="screenpipe-rainbow",
+                capture_source_id="screenpipe-capture-node",
                 modality="audio",
                 track_id="System Audio (output)",
             )
@@ -365,11 +365,13 @@ async def test_complete_job_replays_bson_timestamp_precision(
         {"captured_at": captured_at, "ended_at": ended_at}
     ).decode()
     locator = EvidenceLocator(
-        capture_source_id="screenpipe-rainbow", modality="screen", track_id="monitor_35"
+        capture_source_id="screenpipe-capture-node",
+        modality="screen",
+        track_id="monitor_35",
     )
     existing = device_input_model(
         user_id="user",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         kind="screen_context",
         source_item_id="frame:130882",
         locator=locator,
@@ -385,7 +387,7 @@ async def test_complete_job_replays_bson_timestamp_precision(
     elif conflict == "locator":
         incoming_locator = locator.model_copy(update={"track_id": "monitor_1309"})
     job = SimpleNamespace(
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         context_request_id=None,
         status="claimed",
         purpose="conversation_enrichment",
@@ -416,7 +418,7 @@ async def test_complete_job_replays_bson_timestamp_precision(
             )
         ]
     )
-    source = SimpleNamespace(user_id="user", source_id="screenpipe-rainbow")
+    source = SimpleNamespace(user_id="user", source_id="screenpipe-capture-node")
     if conflict:
         with pytest.raises(device_input_routes.HTTPException) as exc:
             await device_input_routes.complete_job("job", body, source)

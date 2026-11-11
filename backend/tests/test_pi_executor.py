@@ -53,7 +53,7 @@ def no_inference_artifact_writes(monkeypatch, tmp_path):
 def _runtime_config(
     *,
     api_key="super-secret-key",
-    base_url="http://kraken:8083/v1",
+    base_url="http://backend-node:8083/v1",
     temperature=0.2,
     sampling=None,
     response_format=None,
@@ -270,7 +270,7 @@ async def test_pi_writer_attaches_selected_images_to_initial_message(
     await PiMemoryAgent(root).run(
         "I am showing the notebook now.",
         "conversation-1",
-        images=[("rainbow.png", b"selected-frame")],
+        images=[("selected-frame.png", b"selected-frame")],
     )
 
     attachments = [arg for arg in captured["command"] if arg.startswith("@")]
@@ -331,7 +331,7 @@ def test_config_uses_registry_operation_budget_without_backend_model_override(
         reasoning_allowed=True,
         model_def=model_def,
         model_name="upstream/qwen:Q4_K_M",
-        base_url="http://kraken:8083/v1",
+        base_url="http://backend-node:8083/v1",
         api_key=None,
         max_tokens=9000,
         reasoning_effort="medium",
@@ -367,7 +367,7 @@ def test_config_uses_registry_operation_budget_without_backend_model_override(
     assert calls == [("memory_write", None)]
     assert config.provider == "chronicle-llama-cpp-local"
     assert config.model == "upstream/qwen:Q4_K_M"
-    assert config.base_url == "http://kraken:8083/v1"
+    assert config.base_url == "http://backend-node:8083/v1"
     assert config.api_key == "no-key"
     assert config.thinking == "low"
     assert config.max_tokens == 9000

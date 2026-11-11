@@ -1,17 +1,17 @@
 import threading
 from types import SimpleNamespace
 
+from edge.deployments import install
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from edge.deployments import install
 from tests.unit.test_service_deployments import plan
 
 
 def agent(tmp_path):
     (tmp_path / "config").mkdir()
     (tmp_path / "config/config.yml").write_text(
-        "service_placement:\n  node_id: rainbow\n  coordinator_url: http://rainbow:8775\n  authority: true\n"
+        "service_placement:\n  node_id: capture-node\n  coordinator_url: http://capture-node:8775\n  authority: true\n"
     )
     app = FastAPI()
     manager = SimpleNamespace(
@@ -32,16 +32,18 @@ def agent(tmp_path):
 def test_registered_routes_validate_and_reject_excluded_start(tmp_path):
     client, manager, store = agent(tmp_path)
     p = plan().model_dump()
-    p["nodes"] = {"rainbow": "http://rainbow:8775"}
+    p["nodes"] = {"capture-node": "http://capture-node:8775"}
     saved = client.put("/deployments", json=p)
     assert saved.status_code == 200
     assert client.get("/deployment-state/llm-services").json()["protocol"] == 1
     denied = client.post(
-        "/deployments/activate", json={"service": "llm-services", "node": "kraken"}
+        "/deployments/activate",
+        json={"service": "llm-services", "node": "backend-node"},
     )
     assert denied.status_code == 409 and "Register node" in denied.json()["detail"]
     admitted = client.post(
-        "/deployments/activate", json={"service": "llm-services", "node": "rainbow"}
+        "/deployments/activate",
+        json={"service": "llm-services", "node": "capture-node"},
     )
     assert admitted.status_code == 200
     assert client.put("/deployments", json=saved.json()["plan"]).status_code == 409
@@ -71,7 +73,7 @@ def test_reconciliation_stops_only_confirmed_excluded_instance(tmp_path):
     # The helper import stays local to keep this test fixture independent at collection.
     from tests.unit.test_service_deployments import stopped
 
-    store.configure(plan(owners=("kraken",)), stopped)
+    store.configure(plan(owners=("backend-node",)), stopped)
     manager.services.compose_ps_json = lambda _: [{"state": "running"}]
     called = []
     manager._start_operation = lambda name, action, fn: called.append((name, action))
@@ -83,9 +85,8 @@ def test_real_agent_auth_accepts_shared_control_token_for_localhost(
     tmp_path, monkeypatch
 ):
     # Local imports allow manager globals to be patched for this isolated app.
-    from fastapi import Depends
-
     from edge import service_manager
+    from fastapi import Depends
 
     (tmp_path / "backend").mkdir()
     (tmp_path / "backend/.env").write_text("SERVICE_PLACEMENT_TOKEN=shared-control\n")

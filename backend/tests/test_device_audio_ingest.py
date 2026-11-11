@@ -38,17 +38,17 @@ def item(
 def test_audio_stream_key_separates_microphone_from_system_output():
     microphone = SimpleNamespace(
         user_id="user",
-        source_id="rainbow",
+        source_id="capture-node",
         locator=EvidenceLocator(
-            capture_source_id="rainbow", modality="audio", track_id="desk-mic"
+            capture_source_id="capture-node", modality="audio", track_id="desk-mic"
         ),
         metadata={"direction": "input"},
     )
     system = SimpleNamespace(
         user_id="user",
-        source_id="rainbow",
+        source_id="capture-node",
         locator=EvidenceLocator(
-            capture_source_id="rainbow", modality="audio", track_id="speakers"
+            capture_source_id="capture-node", modality="audio", track_id="speakers"
         ),
         metadata={"direction": "output"},
     )
@@ -60,9 +60,9 @@ def test_audio_stream_key_separates_same_direction_provider_tracks():
     def microphone(track_id: str):
         return SimpleNamespace(
             user_id="user",
-            source_id="rainbow",
+            source_id="capture-node",
             locator=EvidenceLocator(
-                capture_source_id="rainbow", modality="audio", track_id=track_id
+                capture_source_id="capture-node", modality="audio", track_id=track_id
             ),
             metadata={"direction": "input"},
         )
@@ -76,32 +76,32 @@ def test_capture_source_identity_retains_same_direction_provider_track():
     def microphone(track_id: str):
         return SimpleNamespace(
             user_id="user",
-            source_id="rainbow",
+            source_id="capture-node",
             source_item_id="chunk-1",
             locator=EvidenceLocator(
-                capture_source_id="rainbow", modality="audio", track_id=track_id
+                capture_source_id="capture-node", modality="audio", track_id=track_id
             ),
             metadata={"direction": "input"},
         )
 
-    assert _audio_capture_source_id("rainbow", "input", [microphone("desk-mic")]) == (
-        "rainbow:input:desk-mic"
-    )
+    assert _audio_capture_source_id(
+        "capture-node", "input", [microphone("desk-mic")]
+    ) == ("capture-node:input:desk-mic")
     assert (
-        _audio_capture_source_id("rainbow", "input", [microphone("headset-mic")])
-        == "rainbow:input:headset-mic"
+        _audio_capture_source_id("capture-node", "input", [microphone("headset-mic")])
+        == "capture-node:input:headset-mic"
     )
 
 
 def test_audio_evidence_item_retains_provider_local_track_locator():
     started_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
     locator = EvidenceLocator(
-        capture_source_id="rainbow", modality="audio", track_id="desk-mic"
+        capture_source_id="capture-node", modality="audio", track_id="desk-mic"
     )
     span = SimpleNamespace(
         id="span-1",
         user_id="user",
-        source_id="rainbow",
+        source_id="capture-node",
         locator=locator,
         source_item_ids=["chunk-1"],
         first_source_item_id="chunk-1",
@@ -324,7 +324,7 @@ async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
 
     class PendingItem:
         user_id = "507f1f77bcf86cd799439011"
-        source_id = "rainbow"
+        source_id = "capture-node"
         source_item_id = "audio-1"
         kind = "audio"
         state = "received"
@@ -332,7 +332,7 @@ async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
         ended_at = captured_at + timedelta(seconds=30)
         metadata = {"direction": "input"}
         locator = EvidenceLocator(
-            capture_source_id="rainbow", modality="audio", track_id="desk-mic"
+            capture_source_id="capture-node", modality="audio", track_id="desk-mic"
         )
         deleted = False
 
@@ -352,7 +352,7 @@ async def test_no_speech_keeps_raw_capture_without_materializing_conversation(
         )
     events = []
     captured_range = AudioRangeRef(
-        capture_source_id="rainbow:input",
+        capture_source_id="capture-node:input",
         time_basis="recorded",
         chunk_ids=["507f1f77bcf86cd799439012"],
         capture_session_ids=["screenpipe-capture"],
@@ -439,9 +439,9 @@ async def test_speech_materializes_a_visible_conversation_claim(monkeypatch, tmp
     source_item = SimpleNamespace(
         source_item_id="audio-1",
         user_id="user-1",
-        source_id="rainbow",
+        source_id="capture-node",
         locator=EvidenceLocator(
-            capture_source_id="rainbow", modality="audio", track_id="desk-mic"
+            capture_source_id="capture-node", modality="audio", track_id="desk-mic"
         ),
         captured_at=started_at,
         ended_at=started_at + timedelta(seconds=30),
@@ -470,7 +470,7 @@ async def test_speech_materializes_a_visible_conversation_claim(monkeypatch, tmp
         profile=profile,
     )
     audio_range = AudioRangeRef(
-        capture_source_id="rainbow:input",
+        capture_source_id="capture-node:input",
         time_basis="recorded",
         chunk_ids=["507f1f77bcf86cd799439012"],
         started_at=segment.started_at,
@@ -514,7 +514,7 @@ async def test_speech_materializes_a_visible_conversation_claim(monkeypatch, tmp
 
     conversation_id = await _ingest_segment(
         SimpleNamespace(id="user-1"),
-        "rainbow",
+        "capture-node",
         "input",
         segment,
         audio_range,
@@ -523,7 +523,7 @@ async def test_speech_materializes_a_visible_conversation_claim(monkeypatch, tmp
     assert conversation_id == "conversation-1"
     assert received["data_purpose"] == "conversation"
     assert received["external_source_id"] == (
-        "screenpipe:rainbow:input:desk-mic:audio-1-audio-1"
+        "screenpipe:capture-node:input:desk-mic:audio-1-audio-1"
     )
     # VAD creates a provisional source record. It must remain memory-eligible so a
     # later settled conversational Timeline episode can dispatch the memory write;

@@ -46,7 +46,7 @@ fi
 pushd "${WORKTREE_PATH}/app" >/dev/null
 
 if [[ "$(node --version)" != v22.* ]]; then
-  echo "Rainbow must use Node 22 to match the TestFlight workflow" >&2
+  echo "The validation host must use Node 22 to match the TestFlight workflow" >&2
   exit 1
 fi
 
@@ -67,7 +67,7 @@ swift test --package-path modules/chronicle-duplex-audio/ios
 popd >/dev/null
 
 echo
-echo "Rainbow validation passed for ${EXPECTED_SHA}."
+echo "Native validation passed for ${EXPECTED_SHA}."
 echo "Review the generated Expo config and autolinking output, then submit with:"
 echo
 echo "gh workflow run ios-testflight.yml --repo ${REPOSITORY} --ref ${BRANCH}"

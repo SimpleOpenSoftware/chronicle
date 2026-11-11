@@ -150,7 +150,7 @@ internally by querying `podman ps` scoped to the compose project label.
   problem is the mount). Git cannot store an empty directory, so any runtime dir
   a compose file mounts is missing on a fresh checkout. The failure is quiet:
   the container is left in `created`, not `exited`, so nothing is listening and
-  `./services start --all` reports success for the rest of the stack. Seen on kraken, where
+  `./services start --all` reports success for the rest of the stack. Observed on a deployment where
   `extras/asr-services`' `./debug` and `./lora_adapters` left the ASR service
   unstarted for days and dictation 503'd with "Cannot reach transcription
   service". Fix: commit a `.gitkeep` in each mounted runtime dir (done for those
