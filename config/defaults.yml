@@ -39,13 +39,13 @@ models:
 
   # Fallback LLM: retried once when the main LLM is unreachable (connection
   # failure/timeout/5xx). Enabled by setting defaults.fallback_llm: fallback-llm
-  # (the wizard asks). gpt-5-nano = cheapest OpenAI reasoning-class model.
+  # (the wizard asks). gpt-5.6-luna = cheapest OpenAI reasoning-class model.
   - name: fallback-llm
     description: Fallback LLM used when the primary LLM is unreachable
     model_type: llm
     model_provider: openai
     api_family: openai
-    model_name: gpt-5-nano
+    model_name: gpt-5.6-luna
     model_url: https://api.openai.com/v1
     api_key: ${oc.env:OPENAI_API_KEY,''}
     model_params:
