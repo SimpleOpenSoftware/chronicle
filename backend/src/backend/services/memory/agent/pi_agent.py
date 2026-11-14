@@ -29,6 +29,7 @@ import backend.services.privacy as privacy
 from backend.model_registry import (
     AppModels,
     ResolvedLLMOperation,
+    check_output_tokens,
     get_models_registry,
     require_api_key,
 )
@@ -207,6 +208,10 @@ class _PiRuntimeConfig:
     system_prompt_prefix: str = ""
     compat: Dict[str, Any] = field(default_factory=dict)
     reasoning_allowed: bool = False
+    # The model's declared completion cap, kept so a later per-feature override of
+    # max_tokens (timeline.pi.max_tokens) is checked against the same model.
+    max_output_tokens: Optional[int] = None
+    model_entry: str = ""
 
     def __post_init__(self) -> None:
         if not self.reasoning_allowed:
@@ -442,6 +447,11 @@ def _resolve_pi_config(
         name="max_tokens",
         default=DEFAULT_MAX_TOKENS,
     )
+    # resolved.max_tokens is already checked by the registry; the settings fallback
+    # and the built-in default are not.
+    max_tokens = check_output_tokens(
+        model_def, max_tokens, setting="memory.backends.pi.max_tokens"
+    )
     if max_tokens > context_window - MIN_PROMPT_HEADROOM_TOKENS:
         raise PiExecutorError(
             "memory.backends.pi.max_tokens must leave at least "
@@ -471,6 +481,8 @@ def _resolve_pi_config(
         ),
         reasoning=bool(model_def.thinking),
         reasoning_allowed=resolved.reasoning_allowed,
+        max_output_tokens=getattr(model_def, "max_output_tokens", None),
+        model_entry=str(model_def.name),
         temperature=resolved.temperature,
         sampling={
             key: model_params[key]

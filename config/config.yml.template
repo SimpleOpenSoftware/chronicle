@@ -58,12 +58,13 @@ models:
   embedding_dimensions: 768
   model_output: vector
 - name: openai-llm
-  description: OpenAI GPT-4o-mini
+  description: OpenAI GPT-4.1-mini
   model_type: llm
   model_provider: openai
   api_family: openai
-  model_name: gpt-4o-mini
+  model_name: gpt-4.1-mini
   model_url: https://api.openai.com/v1
+  max_output_tokens: 32768
   api_key: ${oc.env:OPENAI_API_KEY,''}
   model_params:
     temperature: 0.2
