@@ -1,8 +1,8 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react'
 import { authApi, browserSession, type CurrentUser } from '../services/api'
 import { getStorageKey } from '../utils/storage'
 import { setDisplayTimezone } from '../utils/datetime'
-import { SESSION_CHANGED, savedToken, signedOut, logoutPending } from '../services/browserSession'
+import { SESSION_CHANGED, savedToken, signedOut, logoutPending, takeHandoffToken } from '../services/browserSession'
 
 interface AuthContextType {
   user: CurrentUser | null
@@ -24,6 +24,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const [connectionError, setConnectionError] = useState(false)
   const [retry, setRetry] = useState(0)
+  // A host app (e.g. Ushadow) may open this page with #token=… to sign the user in.
+  const handoff = useRef<string | null | undefined>(undefined)
+  if (handoff.current === undefined) handoff.current = takeHandoffToken()
   const retryConnection = () => setRetry(value => value + 1)
 
   // Check if user is admin
@@ -58,6 +61,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let timer: ReturnType<typeof setTimeout>
     const check = async () => {
       try {
+        const hostToken = handoff.current
+        if (hostToken) {
+          handoff.current = null
+          // A rejected handoff falls back to the saved session or the sign-in form.
+          try { await browserSession.exchange(hostToken) } catch (error) { console.warn('Sign-in handoff rejected', error) }
+        }
         if (signedOut()) {
           setUser(null)
           setConnectionError(false)
