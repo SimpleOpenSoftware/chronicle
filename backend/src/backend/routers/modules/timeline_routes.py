@@ -19,6 +19,7 @@ import backend.services.inference_artifacts as inference_artifacts
 import backend.services.privacy as privacy
 import backend.services.timeline.memory_sources as memory_sources
 from backend.auth import current_active_user
+from backend.model_registry import OutputLimitExceeded
 from backend.models.audio_chunk import AudioChunkDocument
 from backend.models.conversation import Conversation
 from backend.models.notification import NotificationIntent
@@ -73,6 +74,9 @@ from backend.services.timeline.evidence import load_reconciliation_evidence
 from backend.services.timeline.evidence_relations import (
     EvidenceRelationPreview,
     infer_evidence_relations,
+)
+from backend.services.timeline.executor import (
+    check_output_limits as check_timeline_output_limits,
 )
 from backend.services.timeline.explicit_reconciliation import (
     ReconciliationNotCancellable,
@@ -554,6 +558,10 @@ async def reconcile_timeline_day(
     user: User = Depends(current_active_user),
 ):
     timezone = _validate_timezone(body.timezone)
+    try:
+        check_timeline_output_limits()
+    except OutputLimitExceeded as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     try:
         request, created = await request_explicit_reconciliation(
             user=user,

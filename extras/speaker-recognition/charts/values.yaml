@@ -35,10 +35,9 @@ speaker:
     SPEAKER_SERVICE_HOST: "0.0.0.0"
     SPEAKER_SERVICE_PORT: "8085"
 
-# Node selector configuration
+# Pin the pods to the GPU node (kubernetes.io/hostname). Empty: any node.
 nodeSelector:
-  enabled: true
-  hostname: "babel"
+  hostname: ""
 
 webui:
   image:
