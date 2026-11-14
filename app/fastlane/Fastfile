@@ -1,0 +1,364 @@
+require 'json'
+
+# Chronicle — Fastlane iOS deployment (from the ushadow-sdk mobile template)
+#
+# Configuration is read from build.json in the app root:
+#   {
+#     "scheme": "chronicle",
+#     "app_identifier": "com.chronicle.ush",
+#     "team_id": "6SJ7NH4HSZ",
+#     "asc_app_id": "6823126187",
+#     "app_group": "group.chronicle",
+#     "extensions": { "com.chronicle.ush.share-extension": "ShareExtension" }
+#   }
+#
+# app.json keeps the upstream bundle identifier. Prebuild runs with
+# IOS_BUNDLE_ID and IOS_APP_GROUP set (see app.config.js), so the generated
+# project, the share extension (<app_identifier>.share-extension) and the app
+# group all follow build.json. The app group must match the one registered on
+# both App IDs, or the match profiles reject the entitlements.
+#
+# App Store Connect API key credentials come from .env.local (gitignored).
+#
+# Lanes:
+#   fastlane beta        - Build and upload to TestFlight
+#   fastlane build       - Build only (no upload)
+#   fastlane submit      - Upload an existing IPA to TestFlight
+#   fastlane bump_build  - Increment build number
+
+env_file = File.join(__dir__, '..', '.env.local')
+if File.exist?(env_file)
+  File.foreach(env_file) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?('#')
+    key, value = line.split('=', 2)
+    ENV[key.strip] = value.strip if key && value
+  end
+end
+
+default_platform(:ios)
+
+# ════════════════════════════════════════════════════════════════════════
+# Configuration helpers
+# ════════════════════════════════════════════════════════════════════════
+
+def project_root
+  File.expand_path('..', __dir__)
+end
+
+def build_config
+  @build_config ||= begin
+    path = File.join(project_root, 'build.json')
+    UI.user_error!("build.json not found at #{path}.") unless File.exist?(path)
+    JSON.parse(File.read(path))
+  end
+end
+
+def app_scheme
+  build_config['scheme']
+end
+
+def app_identifier
+  build_config['app_identifier']
+end
+
+def app_extensions
+  build_config['extensions'] || {}
+end
+
+def app_group
+  build_config['app_group'] || "group.#{app_identifier}"
+end
+
+def apple_team_id
+  build_config['team_id'] || ENV['APPLE_TEAM_ID'] || ''
+end
+
+def ios_workspace
+  "./ios/#{app_scheme}.xcworkspace"
+end
+
+def ios_project
+  "./ios/#{app_scheme}.xcodeproj"
+end
+
+# ════════════════════════════════════════════════════════════════════════
+# Lanes
+# ════════════════════════════════════════════════════════════════════════
+
+platform :ios do
+  before_all do
+    # No git state checks - allow deploys with uncommitted changes
+  end
+
+  # ── Beta: Build + TestFlight ─────────────────────────────────────────
+
+  desc "Build and upload to TestFlight"
+  lane :beta do
+    api_key = app_store_connect_api_key_from_env
+
+    prebuild_ios
+
+    # Sync build number with App Store Connect. Take the max of ASC's latest
+    # and the project's, because builds still processing may not show in ASC.
+    UI.message("📦 Syncing build number with App Store Connect...")
+    asc_build = app_store_build_number(
+      app_identifier: app_identifier,
+      live: false,
+      api_key: api_key,
+    ).to_i
+    project_build = get_build_number(xcodeproj: ios_project).to_i
+    next_build = [asc_build, project_build].max + 1
+    UI.message("ASC build: #{asc_build}, project build: #{project_build} → using #{next_build}")
+    increment_build_number(build_number: next_build, xcodeproj: ios_project)
+
+    version = get_version_number(xcodeproj: ios_project, target: app_scheme)
+    build = get_build_number(xcodeproj: ios_project)
+    UI.success("Building version #{version} (#{build})")
+
+    UI.message("🔨 Building iOS app...")
+    build_ios_app(skip_prebuild: true)
+
+    ipa_path = lane_context[SharedValues::IPA_OUTPUT_PATH]
+    UI.message("IPA path: #{ipa_path}")
+    ipa_build = sh("unzip -p '#{ipa_path}' 'Payload/#{app_scheme}.app/Info.plist' | plutil -extract CFBundleVersion raw -o - -").strip rescue "unknown"
+    UI.message("Build number inside IPA: #{ipa_build}")
+
+    UI.message("🚀 Uploading to TestFlight...")
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa_path,
+      skip_waiting_for_build_processing: true,
+      distribute_external: false,
+      notify_external_testers: false,
+      changelog: "Build #{build} - Automated deployment via Fastlane"
+    )
+
+    UI.success("✅ Successfully uploaded to TestFlight!")
+    UI.success("Version: #{version} (Build: #{build})")
+    UI.message("📱 Build will appear in TestFlight in ~5-10 minutes")
+  end
+
+  # ── Build only ──────────────────────────────────────────────────────
+
+  desc "Build iOS app only (no upload)"
+  lane :build do
+    UI.message("🔨 Building iOS app...")
+    build_ios_app(skip_package_ipa: false)
+    UI.success("✅ Build complete!")
+    UI.message("IPA location: #{lane_context[SharedValues::IPA_OUTPUT_PATH]}")
+  end
+
+  # ── Submit existing IPA ─────────────────────────────────────────────
+
+  desc "Submit existing build to TestFlight"
+  lane :submit do |options|
+    api_key = app_store_connect_api_key_from_env
+    ipa_path = options[:ipa] ||
+               lane_context[SharedValues::IPA_OUTPUT_PATH] ||
+               File.expand_path("../build/#{app_scheme}.ipa", __dir__)
+
+    UI.user_error!("No IPA file found at #{ipa_path}. Run 'fastlane beta' first.") unless File.exist?(ipa_path)
+
+    UI.message("Using IPA: #{ipa_path}")
+    UI.message("🚀 Uploading to TestFlight...")
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa_path,
+      skip_waiting_for_build_processing: true,
+      distribute_external: false,
+      notify_external_testers: false
+    )
+    UI.success("✅ Successfully uploaded to TestFlight!")
+  end
+
+  # ── Bump build number ──────────────────────────────────────────────
+
+  desc "Increment build number (synced with App Store Connect)"
+  lane :bump_build do
+    asc_build = app_store_build_number(
+      app_identifier: app_identifier,
+      live: false,
+      api_key: app_store_connect_api_key_from_env,
+    ).to_i
+    project_build = get_build_number(xcodeproj: ios_project).to_i
+    increment_build_number(build_number: [asc_build, project_build].max + 1, xcodeproj: ios_project)
+    version = get_version_number(xcodeproj: ios_project, target: app_scheme)
+    build = get_build_number(xcodeproj: ios_project)
+    UI.success("ASC: #{asc_build}, project: #{project_build} → New build: #{build} (version #{version})")
+  end
+
+  # ════════════════════════════════════════════════════════════════════
+  # Private lanes
+  # ════════════════════════════════════════════════════════════════════
+
+  # Regenerate ios/ for build.json's bundle identifier.
+  private_lane :prebuild_ios do
+    # The app depends on the generated audio contract package in ../contracts.
+    unless File.directory?(File.join(project_root, "node_modules"))
+      UI.message("📦 Installing JS dependencies...")
+      sh("cd .. && npm ci && npm run prepare:audio-contracts")
+    end
+
+    UI.message("🔧 Running expo prebuild for #{app_identifier}...")
+    sh("rm -rf #{project_root}/ios")
+    sh("cd .. && IOS_BUNDLE_ID=#{app_identifier} IOS_APP_GROUP=#{app_group} npx expo prebuild --platform ios --clean")
+    patch_rn_screens
+    write_xcode_env_local
+    UI.message("📦 Running pod install...")
+    sh("cd ../ios && bundle exec pod install")
+  end
+
+  desc "Build the iOS app"
+  private_lane :build_ios_app do |options|
+    team_id = apple_team_id
+    api_key = app_store_connect_api_key_from_env
+
+    prebuild_ios unless options[:skip_prebuild]
+
+    # Sync signing from the shared match repo: installs the team distribution
+    # cert and each target's profile. readonly: true keeps builds from
+    # mutating certs — run `mise run mobile:sign-setup` once to populate them.
+    UI.message("🔐 Syncing signing via match (shared cert repo)...")
+    match(type: "appstore", app_identifier: app_identifier, api_key: api_key, readonly: true)
+    profile_uuid = ENV["sigh_#{app_identifier}_appstore"]
+    profile_name = ENV["sigh_#{app_identifier}_appstore_profile-name"]
+    UI.success("Main app profile: #{profile_name} (#{profile_uuid})")
+
+    provisioning_profiles = { app_identifier => profile_uuid }
+
+    app_extensions.each do |ext_id, _ext_name|
+      match(type: "appstore", app_identifier: ext_id, api_key: api_key, readonly: true)
+      ext_uuid = ENV["sigh_#{ext_id}_appstore"]
+      UI.success("Extension profile (#{ext_id}): #{ENV["sigh_#{ext_id}_appstore_profile-name"]} (#{ext_uuid})")
+      provisioning_profiles[ext_id] = ext_uuid
+    end
+
+    # Pin the freshly prebuilt project to manual Apple Distribution signing.
+    # gym signs the archive from the project's own build settings, which
+    # prebuild sets to automatic "iPhone Developer" signing.
+    UI.message("🔏 Pinning archive to manual Apple Distribution signing...")
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: ios_project,
+      team_id: team_id,
+      code_sign_identity: "Apple Distribution",
+      profile_name: profile_name,
+      targets: [app_scheme],
+    )
+
+    app_extensions.each do |ext_id, ext_name|
+      update_code_signing_settings(
+        use_automatic_signing: false,
+        path: ios_project,
+        team_id: team_id,
+        code_sign_identity: "Apple Distribution",
+        profile_name: ENV["sigh_#{ext_id}_appstore_profile-name"],
+        targets: [ext_name],
+      )
+    end
+
+    gym(
+      workspace: ios_workspace,
+      scheme: app_scheme,
+      export_method: "app-store",
+      configuration: "Release",
+      clean: true,
+      output_directory: "./build",
+      output_name: "#{app_scheme}.ipa",
+      export_options: {
+        method: "app-store",
+        teamID: team_id,
+        compileBitcode: false,
+        provisioningProfiles: provisioning_profiles,
+      },
+      skip_package_ipa: options[:skip_package_ipa] || false,
+    )
+  end
+
+  # App Store Connect API key from .env.local
+  private_lane :app_store_connect_api_key_from_env do
+    if ENV["APP_STORE_CONNECT_API_KEY_KEY_ID"] &&
+       ENV["APP_STORE_CONNECT_API_KEY_ISSUER_ID"] &&
+       ENV["APP_STORE_CONNECT_API_KEY_KEY_FILEPATH"]
+      app_store_connect_api_key(
+        key_id:        ENV["APP_STORE_CONNECT_API_KEY_KEY_ID"].strip,
+        issuer_id:     ENV["APP_STORE_CONNECT_API_KEY_ISSUER_ID"].strip,
+        key_filepath:  File.expand_path(ENV["APP_STORE_CONNECT_API_KEY_KEY_FILEPATH"].strip),
+      )
+    else
+      nil  # Fall back to Apple ID / password auth
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════
+  # Error handling
+  # ════════════════════════════════════════════════════════════════════
+
+  error do |lane, exception|
+    UI.error("Error in lane '#{lane}':")
+    UI.error(exception.message)
+  end
+
+  after_all do |lane|
+    UI.success("Successfully completed '#{lane}' lane! 🎉")
+  end
+
+  # ── Helpers ─────────────────────────────────────────────────────────
+
+  # react-native-screens 4.x: snapshotViewAfterScreenUpdates throws on iOS 26
+  # during screen unmount → SIGSEGV. Wrap the call in @try/@catch.
+  private_lane :patch_rn_screens do
+    rns_path = File.join(project_root, "node_modules/react-native-screens/ios/RNSScreen.mm")
+    UI.user_error!("RNSScreen.mm not found at #{rns_path}") unless File.exist?(rns_path)
+
+    content = File.read(rns_path)
+    old_code = <<~OBJC.chomp
+          UIView *snapshot = [self.view snapshotViewAfterScreenUpdates:NO];
+          snapshot.frame = self.view.frame;
+          [self.view removeFromSuperview];
+          self.view = snapshot;
+          [superView addSubview:snapshot];
+    OBJC
+
+    new_code = <<~OBJC.chomp
+          @try {
+            UIView *snapshot = [self.view snapshotViewAfterScreenUpdates:NO];
+            if (snapshot != nil) {
+              snapshot.frame = self.view.frame;
+              [self.view removeFromSuperview];
+              self.view = snapshot;
+              [superView addSubview:snapshot];
+            }
+          } @catch (NSException *exception) {
+            // iOS 26+: snapshotViewAfterScreenUpdates can throw during screen transitions.
+          }
+    OBJC
+
+    if content.include?(old_code)
+      File.write(rns_path, content.sub(old_code, new_code))
+      UI.success("Patched RNSScreen.mm for iOS 26 compatibility")
+    elsif content.include?("@try {")
+      UI.message("RNSScreen.mm already patched — skipping")
+    else
+      UI.important("RNSScreen.mm code changed — patch may need updating")
+    end
+  end
+
+  # expo prebuild --clean deletes ios/.xcode.env.local. Without it Xcode's
+  # stripped PATH cannot find node, the JS bundle is silently skipped, and the
+  # IPA crashes on launch with "No script URL provided".
+  private_lane :write_xcode_env_local do
+    node_path = sh("command -v node 2>/dev/null || echo ''").strip
+    if node_path.empty?
+      ["/opt/homebrew/bin/node", "/usr/local/bin/node"].each do |p|
+        node_path = p and break if File.exist?(p)
+      end
+    end
+    UI.user_error!("Could not find node binary — install Node.js before building") if node_path.empty?
+
+    env_local_path = File.join(project_root, "ios", ".xcode.env.local")
+    File.write(env_local_path, "export NODE_BINARY=#{node_path}\n")
+    UI.success("Wrote NODE_BINARY=#{node_path} → ios/.xcode.env.local")
+  end
+end
