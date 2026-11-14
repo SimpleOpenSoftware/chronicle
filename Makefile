@@ -19,7 +19,7 @@ export $(shell sed 's/=.*//' config.env | grep -v '^\s*$$' | grep -v '^\s*\#')
 SCRIPTS_DIR := scripts
 K8S_SCRIPTS_DIR := $(SCRIPTS_DIR)/k8s
 
-.PHONY: help menu setup-k8s setup-infrastructure setup-rbac setup-storage-pvc config config-docker config-k8s config-all clean deploy deploy-docker deploy-k8s deploy-k8s-full deploy-infrastructure deploy-apps check-infrastructure check-apps build-backend up-backend down-backend k8s-status k8s-cleanup k8s-purge audio-manage test-robot test-robot-integration test-robot-unit test-robot-endpoints test-robot-specific test-robot-clean
+.PHONY: help menu setup-k8s setup-infrastructure setup-rbac setup-storage-pvc config config-docker config-k8s config-all clean deploy deploy-docker deploy-k8s deploy-k8s-full deploy-speaker deploy-apps check-infrastructure check-apps build-backend up-backend down-backend k8s-status k8s-cleanup k8s-purge audio-manage test-robot test-robot-integration test-robot-unit test-robot-endpoints test-robot-specific test-robot-clean
 
 # Default target
 .DEFAULT_GOAL := menu
@@ -50,6 +50,7 @@ menu: ## Show interactive menu (default)
 	@echo "  deploy-docker      🐳 Deploy with Docker Compose"
 	@echo "  deploy-k8s         ☸️  Deploy to Kubernetes with Skaffold"
 	@echo "  deploy-k8s-full    🏗️  Deploy infrastructure + applications"
+	@echo "  deploy-speaker     🗣️  Build + deploy speaker recognition (GPU, speech ns)"
 	@echo
 	@echo "🔧 Utilities:"
 	@echo "  k8s-purge          🗑️  Purge unused images (registry + container)"
@@ -92,6 +93,7 @@ help: ## Show detailed help for all targets
 	@echo "  deploy-docker      Deploy with Docker Compose"
 	@echo "  deploy-k8s         Deploy to Kubernetes with Skaffold"
 	@echo "  deploy-k8s-full    Deploy infrastructure + applications"
+	@echo "  deploy-speaker     Build + deploy speaker recognition to the speech namespace"
 	@echo
 	@echo "🔧 KUBERNETES UTILITIES:"
 	@echo "  k8s-status         Check Kubernetes cluster status and health"
@@ -160,7 +162,7 @@ setup-k8s: ## Initial Kubernetes setup (registry + infrastructure)
 		exit 1; \
 	fi; \
 	echo "🔧 Step 1: Configuring insecure registry access on $$node_ip..."; \
-	$(SCRIPTS_DIR)/configure-insecure-registry-remote.sh $$node_ip; \
+	$(K8S_SCRIPTS_DIR)/configure-insecure-registry-remote.sh $$node_ip; \
 	echo "📦 Step 2: Setting up storage for speaker recognition..."; \
 	$(K8S_SCRIPTS_DIR)/setup-storage.sh; \
 	echo "📝 Step 3: Generating configuration files..."; \
@@ -206,12 +208,12 @@ config: config-all ## Generate all configuration files
 
 config-docker: ## Generate Docker Compose configuration files
 	@echo "🐳 Generating Docker Compose configuration files..."
-	@CONFIG_FILE=config.env.dev python3 scripts/generate-docker-configs.py
+	@CONFIG_FILE=config.env.dev uv run --with-requirements setup-requirements.txt python scripts/generate-docker-configs.py
 	@echo "✅ Docker Compose configuration files generated"
 
 config-k8s: ## Generate Kubernetes configuration files (ConfigMap/Secret only - no .env files)
 	@echo "☸️  Generating Kubernetes configuration files..."
-	@python3 scripts/generate-k8s-configs.py
+	@uv run --with-requirements setup-requirements.txt python scripts/generate-k8s-configs.py
 	@echo "📦 Applying ConfigMap and Secret to Kubernetes..."
 	@kubectl apply -f k8s-manifests/configmap.yaml -n $(APPLICATION_NAMESPACE) 2>/dev/null || echo "⚠️  ConfigMap not applied (cluster not available?)"
 	@kubectl apply -f k8s-manifests/secrets.yaml -n $(APPLICATION_NAMESPACE) 2>/dev/null || echo "⚠️  Secret not applied (cluster not available?)"
@@ -265,18 +267,15 @@ deploy-k8s: config-k8s ## Deploy to Kubernetes using Skaffold
 	@set -a; source skaffold.env; set +a; skaffold run --profile=backend --default-repo=$(CONTAINER_REGISTRY)
 	@echo "✅ Kubernetes deployment completed"
 
-deploy-k8s-full: deploy-infrastructure deploy-apps ## Deploy infrastructure + applications to Kubernetes
+deploy-speaker: config-k8s ## Build (amd64, via BUILDX_BUILDER) and deploy speaker recognition
+	@echo "🗣️  Deploying speaker recognition to the speech namespace..."
+	@set -a; source skaffold.env; set +a; skaffold run --profile=speaker-recognition --default-repo=$(CONTAINER_REGISTRY)
+	@echo "✅ Speaker recognition deployed (backend URL: $(SPEAKER_SERVICE_URL))"
+
+deploy-k8s-full: setup-infrastructure deploy-k8s ## Deploy infrastructure + applications to Kubernetes
 	@echo "✅ Full Kubernetes deployment completed"
 
-deploy-infrastructure: ## Deploy infrastructure services to Kubernetes
-	@echo "🏗️  Deploying infrastructure services..."
-	@kubectl apply -f k8s-manifests/
-	@echo "✅ Infrastructure deployment completed"
-
-deploy-apps: config-k8s ## Deploy application services to Kubernetes
-	@echo "📱 Deploying application services..."
-	@set -a; source skaffold.env; set +a; skaffold run --profile=backend --default-repo=$(CONTAINER_REGISTRY)
-	@echo "✅ Application deployment completed"
+deploy-apps: deploy-k8s ## Alias for deploy-k8s
 
 # ========================================
 # UTILITY TARGETS
@@ -300,9 +299,7 @@ build-backend: ## Build backend Docker image
 	@echo "🔨 Building backend Docker image..."
 	@cd backend && docker build -t backend:latest .
 
-up-backend: config-docker ## Start backend services
-	@echo "🚀 Starting backend services..."
-	@cd backend && docker-compose up -d
+up-backend: deploy-docker ## Alias for deploy-docker
 
 down-backend: ## Stop backend services
 	@echo "🛑 Stopping backend services..."

@@ -60,6 +60,8 @@ env:
   # Other environment variables
   NODE_ENV: "production"
 
+# Pin the pod to one node (kubernetes.io/hostname). Empty: any node.
+node: ""
 nodeSelector: {}
 tolerations: []
 affinity: {}

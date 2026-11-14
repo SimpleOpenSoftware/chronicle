@@ -46,7 +46,11 @@ spec:
             periodSeconds: 60
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- with .Values.nodeSelector }}
+      {{- $nodeSelector := deepCopy (.Values.nodeSelector | default dict) }}
+      {{- with .Values.node }}
+      {{- $_ := set $nodeSelector "kubernetes.io/hostname" . }}
+      {{- end }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}

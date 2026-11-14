@@ -65,7 +65,19 @@ def get_skaffold_variables() -> Set[str]:
         "COMPUTE_MODE",
         "VITE_ALLOWED_HOSTS",
         "SPEAKER_NODE",
+        "APP_NODE",
+        "TAILSCALE_HOSTNAME",
+        "TAILSCALE_PROXY_GROUP",
     }
+
+
+# Skaffold variables that may be empty: an empty value turns the feature off
+# (APP_NODE: no node pin; TAILSCALE_HOSTNAME: no Tailscale ingress).
+OPTIONAL_SKAFFOLD_VARIABLES = {
+    "APP_NODE",
+    "TAILSCALE_HOSTNAME",
+    "TAILSCALE_PROXY_GROUP",
+}
 
 
 def format_variable(var_name: str, var_value: str, service_name: str = None) -> str:

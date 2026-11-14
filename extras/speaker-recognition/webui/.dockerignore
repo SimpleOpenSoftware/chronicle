@@ -4,6 +4,7 @@
 !index.html
 !vite.config.ts
 !tailwind.config.js
+!chronicle-espresso-preset.js
 !postcss.config.js
 !tsconfig.json
 !tsconfig.node.json
