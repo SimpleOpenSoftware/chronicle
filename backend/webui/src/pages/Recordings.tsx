@@ -13,6 +13,7 @@ import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
 import TranscriptEditor from '../components/transcript/TranscriptEditor'
 import { Button, Checkbox, IconButton } from '../components/ui'
 import { TITLE_NOT_GENERATED } from '../lib/constants'
+import { formatDateTime } from '../utils/datetime'
 
 interface Conversation {
   conversation_id: string
@@ -166,8 +167,9 @@ export default function Recordings() {
 
   const formatDate = (timestamp: number | string) => {
     if (!timestamp) return 'Date unknown'
-    return sourceDate(typeof timestamp === 'number' ? new Date(timestamp * 1000).toISOString() : timestamp)
-      .toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) + ' IST'
+    return formatDateTime(typeof timestamp === 'number' ? timestamp * 1000 : timestamp, {
+      day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+    })
   }
 
 

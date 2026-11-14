@@ -9,6 +9,7 @@ import Finetuning from './Finetuning'
 import Queue from './Queue'
 import WakeWordLab from './WakeWordLab'
 import { formatDate } from '../components/dataAudit/format'
+import { PRECISE_DATE_TIME, formatDateTime, setDisplayTimezone } from '../utils/datetime'
 
 const m = vi.hoisted(() => ({
   statusError: null as Error | null, dashboardError: null as Error | null,
@@ -57,8 +58,9 @@ beforeEach(() => {
   m.samples.mockResolvedValue({ data: { samples: [clip('one')] } }); m.audio.mockResolvedValue({ data: new Blob(['audio']) })
   URL.createObjectURL = vi.fn().mockReturnValue('blob:clip'); URL.revokeObjectURL = vi.fn()
 })
-afterEach(cleanup)
-it('normalizes naive UTC audit timestamps to explicit IST', () => {
+beforeEach(() => setDisplayTimezone('Asia/Kolkata'))
+afterEach(() => { cleanup(); setDisplayTimezone(null) })
+it('normalizes naive UTC audit timestamps to the display timezone', () => {
   expect(formatDate('2026-09-13T00:07:18')).toBe(formatDate('2026-09-13T00:07:18Z'))
   expect(formatDate('2026-09-13T00:07:18')).toContain('5:37:18'); expect(formatDate(null)).toBe('—')
 })
@@ -122,7 +124,7 @@ it('rejects stale bucket responses after switching twice', async () => {
 })
 it('makes dispatch controls explicit and distinguishes failed configuration from no words', async () => {
   const ui = show(<WakeWordLab />); expect(await screen.findByText('Detection settings')).toBeVisible()
-  expect(await screen.findByText('3/7/2024, 3:16:40 pm IST')).toBeVisible()
+  expect(await screen.findByText(formatDateTime(1720000000000, PRECISE_DATE_TIME))).toBeVisible()
   expect(screen.getByRole('checkbox', { name: 'Allow assistant dispatch', hidden: true }).closest('details')).not.toHaveAttribute('open'); expect(m.collect).not.toHaveBeenCalled()
   ui.unmount(); m.models.mockRejectedValue(new Error('offline')); show(<WakeWordLab />)
   expect(await screen.findByText('Wake-word configuration could not be loaded. Refresh to try again.')).toBeVisible()

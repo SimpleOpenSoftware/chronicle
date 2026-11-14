@@ -26,12 +26,13 @@ COPY src/ src/
 
 # Install dependencies and package
 # Use build arg to control CPU vs GPU mode
+# COMPUTE_MODE can be: cpu, cu126, cu128 (the extras in pyproject.toml).
+# cu126 keeps Pascal (sm_61, e.g. GTX 1070); cu128 torch builds drop it.
 ARG COMPUTE_MODE=cpu
-RUN if [ "$COMPUTE_MODE" = "gpu" ]; then \
-        uv sync --no-default-groups --group gpu; \
-    else \
-        uv sync --no-default-groups --group cpu; \
-    fi
+RUN case "$COMPUTE_MODE" in \
+        cpu|cu126|cu128) uv sync --no-default-groups --extra "$COMPUTE_MODE" ;; \
+        *) echo "Unsupported COMPUTE_MODE=$COMPUTE_MODE (use cpu, cu126 or cu128)" >&2; exit 1 ;; \
+    esac
 
 # Create directories
 RUN mkdir -p /app/audio_chunks /app/debug /app/data /models
@@ -55,5 +56,6 @@ RUN --mount=type=cache,target=/models \
 # Expose port
 EXPOSE 8085
 
-# Run the service
-CMD ["uv", "run", "--no-dev", "simple-speaker-service"]
+# Run the service. --no-sync keeps the torch build selected by COMPUTE_MODE;
+# without it, uv re-resolves at startup and swaps in the default torch wheel.
+CMD ["uv", "run", "--no-dev", "--no-sync", "simple-speaker-service"]

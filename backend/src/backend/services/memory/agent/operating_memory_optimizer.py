@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from backend.config_loader import load_config
+from backend.model_registry import check_output_limit
 from backend.services.inference_artifacts import (
     canonical_hash,
     load_inference_runs,
@@ -108,8 +109,11 @@ def _optimizer_runtime_config(config: Any) -> Any:
     """Give the meta-optimizer room to reason and still emit its tool call."""
 
     values = dict(vars(config))
-    values["max_tokens"] = max(
-        _OPTIMIZER_MIN_MAX_TOKENS, int(values.get("max_tokens") or 0)
+    values["max_tokens"] = check_output_limit(
+        values.get("max_output_tokens"),
+        max(_OPTIMIZER_MIN_MAX_TOKENS, int(values.get("max_tokens") or 0)),
+        setting="operating_memory optimizer minimum max_tokens",
+        model=str(values.get("model_entry") or values.get("model") or ""),
     )
     return type(config)(**values)
 

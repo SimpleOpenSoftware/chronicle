@@ -1,3 +1,4 @@
+{{- if not .Values.workers.sidecar.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +18,27 @@ spec:
         {{- include "backend.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: workers
     spec:
+      {{- if .Values.persistence.enabled }}
+      # Copy the repo config into the writable config dir. Settings already
+      # there (saved from the app) win; only keys new in the repo are added.
+      # See backend/src/backend/config_seed.py.
+      initContainers:
+        - name: config-seed
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - backend.config_seed
+            - /seed
+            - {{ printf "%s/config" .Values.persistence.mountPath | quote }}
+          volumeMounts:
+            - name: config-files
+              mountPath: /seed
+              readOnly: true
+            - name: data-volume
+              mountPath: {{ .Values.persistence.mountPath }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}-workers
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -33,29 +55,51 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- if .Values.persistence.enabled }}
+            # Writable config on the data volume, like the Docker bind mount.
+            # The config-seed init container fills it from the ConfigMap.
+            - name: CONFIG_DIR
+              value: {{ printf "%s/config" .Values.persistence.mountPath | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.workers.resources | default .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if not .Values.persistence.enabled }}
+            - name: config-files
+              mountPath: /app/config
+              readOnly: true
+            {{- end }}
             {{- if .Values.persistence.enabled }}
             - name: data-volume
               mountPath: {{ .Values.persistence.mountPath }}
             - name: data-volume
               mountPath: /app/audio_chunks
             {{- end }}
-            - name: mem0-ca-cert
-              mountPath: /etc/ssl/certs/mem0-ca.crt
-              subPath: ca.crt
-              readOnly: true
       volumes:
+        - name: config-files
+          configMap:
+            name: chronicle-config
+            {{- if not .Values.persistence.enabled }}
+            items:
+              - key: defaults.yml
+                path: defaults.yml
+              - key: config.yml
+                path: config.yml
+            {{- end }}
         {{- if .Values.persistence.enabled }}
         - name: data-volume
           persistentVolumeClaim:
             claimName: {{ include "backend.fullname" . }}-data
         {{- end }}
-        - name: mem0-ca-cert
-          configMap:
-            name: mem0-ca-cert
-      {{- with .Values.workers.nodeSelector | default .Values.nodeSelector }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $nodeSelector := deepCopy ((.Values.workers.nodeSelector | default .Values.nodeSelector) | default dict) }}
+      {{- with .Values.node }}
+      {{- $_ := set $nodeSelector "kubernetes.io/hostname" . }}
+      {{- end }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -67,3 +111,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

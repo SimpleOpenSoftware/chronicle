@@ -1332,6 +1332,37 @@ async def recognise_speakers_job(
             "processing_time_seconds": 0,
         }
 
+    # Probe before any gallery read: an unreachable service otherwise fails inside
+    # the enrollment-catalog call and surfaces as a misleading PrivacyHeld.
+    if not await speaker_client.health_check():
+        if create_mode:
+            raise SpeakerReprocessFailed(
+                f"speaker service at {speaker_client.service_url} is not reachable"
+            )
+        logger.warning(
+            f"🎤 Speaker service {speaker_client.service_url} not reachable; "
+            f"skipping speaker recognition for {conversation_id}"
+        )
+        record_event_sync(
+            severity="warning",
+            category="service",
+            source="speaker_recognition",
+            title="Speaker service unreachable; speaker recognition skipped",
+            detail=f"{speaker_client.service_url} did not answer its health check",
+            user_id=str(user_id) if user_id else None,
+            client_id=conversation.client_id,
+            conversation_id=conversation_id,
+            incident_key="speaker-service-unavailable",
+        )
+        return {
+            "success": True,
+            "conversation_id": conversation_id,
+            "version_id": version_id,
+            "speaker_recognition_enabled": True,
+            "skip_reason": "Speaker service unavailable",
+            "processing_time_seconds": time.time() - start_time,
+        }
+
     if transcript_version.segments and not any(
         _is_speech_segment(segment) for segment in transcript_version.segments
     ):

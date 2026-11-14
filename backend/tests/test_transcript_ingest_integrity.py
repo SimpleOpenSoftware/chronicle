@@ -586,6 +586,7 @@ async def test_registered_speaker_job_runs_batch_provider_identification(
     )
     fake_client = SimpleNamespace(
         enabled=True,
+        health_check=AsyncMock(return_value=True),
         identify_provider_segments=identify_provider_segments,
     )
     fake_conversation_model = SimpleNamespace(
@@ -719,7 +720,9 @@ async def test_registered_speaker_job_skips_event_only_transcript(monkeypatch):
         active_transcript=version,
         save=AsyncMock(),
     )
-    fake_client = SimpleNamespace(enabled=True)
+    fake_client = SimpleNamespace(
+        enabled=True, health_check=AsyncMock(return_value=True)
+    )
     fake_conversation_model = SimpleNamespace(
         conversation_id=object(),
         find_one=AsyncMock(return_value=conversation),
@@ -788,7 +791,11 @@ async def test_speaker_job_derives_edge_timing_normalization_before_processing(
     normalize = AsyncMock(return_value=normalized)
     monkeypatch.setattr(module, "Conversation", fake_conversation_model)
     monkeypatch.setattr(
-        module, "SpeakerRecognitionClient", lambda: SimpleNamespace(enabled=True)
+        module,
+        "SpeakerRecognitionClient",
+        lambda: SimpleNamespace(
+            enabled=True, health_check=AsyncMock(return_value=True)
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -924,6 +931,7 @@ async def test_registered_speaker_job_persists_word_clock_before_empty_pyannote_
 
     client = SimpleNamespace(
         enabled=True,
+        health_check=AsyncMock(return_value=True),
         diarize_identify_match=AsyncMock(
             return_value={"segments": [], "diarization_model": "community-1"}
         ),

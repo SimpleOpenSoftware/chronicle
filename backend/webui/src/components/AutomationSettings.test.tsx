@@ -3,17 +3,19 @@ import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import AutomationSettings from './AutomationSettings'
+import { formatDateTime, setDisplayTimezone } from '../utils/datetime'
 const state = vi.hoisted(() => ({ next: '2026-09-14T04:30:00+00:00' as string | null, update: vi.fn() }))
 vi.mock('../hooks/useFinetuning', () => ({
   useCronJobs: () => ({ data: [{ job_id: 'daily', description: '', enabled: true, schedule: '30 4 * * *', last_run: null, next_run: state.next }], isLoading: false, refetch: vi.fn() }),
   useToggleCronJob: () => ({ mutateAsync: vi.fn() }), useRunCronJob: () => ({ mutateAsync: vi.fn() }),
   useUpdateCronSchedule: () => ({ mutateAsync: state.update }),
 }))
-beforeEach(() => { state.next = '2026-09-14T04:30:00+00:00'; state.update.mockReset().mockResolvedValue({}) })
-afterEach(cleanup)
-it('shows the UTC next-run instant in IST while preserving the UTC expression when edited', async () => {
+beforeEach(() => { setDisplayTimezone('Asia/Kolkata'); state.next = '2026-09-14T04:30:00+00:00'; state.update.mockReset().mockResolvedValue({}) })
+afterEach(() => { cleanup(); setDisplayTimezone(null) })
+it('shows the UTC next-run instant in the display timezone while preserving the UTC expression when edited', async () => {
   render(<AutomationSettings isAdmin />)
-  expect(screen.getByText(/Next:/)).toHaveTextContent(/10:00 am IST/i)
+  expect(screen.getByText(/Next:/)).toHaveTextContent(formatDateTime('2026-09-14T04:30:00Z'))
+  expect(screen.getByText(/Next:/)).toHaveTextContent(/10:00/)
   fireEvent.click(screen.getByText('Schedule and last run'))
   expect(screen.getByText(/At 04:30 AM/)).toHaveTextContent('(UTC)')
   fireEvent.click(screen.getByRole('button', { name: 'Edit schedule' }))

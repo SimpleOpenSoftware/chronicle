@@ -16,9 +16,9 @@ spec:
       labels:
         app: {{ .Release.Name }}-webui
     spec:
-      {{- if .Values.nodeSelector.enabled }}
+      {{- with .Values.nodeSelector.hostname }}
       nodeSelector:
-        kubernetes.io/hostname: {{ .Values.nodeSelector.hostname }}
+        kubernetes.io/hostname: {{ . }}
       {{- end }}
       containers:
         - name: webui
