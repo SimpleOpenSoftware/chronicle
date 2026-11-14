@@ -10,6 +10,11 @@ from typing import Any
 from omegaconf import OmegaConf
 
 from backend.config_loader import load_config
+from backend.model_registry import (
+    OutputLimitExceeded,
+    get_models_registry,
+    output_token_limit_findings,
+)
 from backend.services.job_progress import report_job_progress
 
 from .codex_executor import CodexTimelineExecutor
@@ -483,6 +488,39 @@ def settings_dict() -> dict[str, Any]:
         else value
     )
     return converted if isinstance(converted, dict) else {}
+
+
+def check_output_limits() -> None:
+    """Refuse a timeline run that the configured model cannot complete.
+
+    Called before a day is queued so the person asking sees the model-choice
+    message at once, rather than a background failure after the run starts. The
+    executor repeats the check at run time; this is only the early warning.
+    """
+
+    settings = settings_dict()
+    if str(settings.get("executor") or "pi") != "pi":
+        return  # Codex runs on its own subscription model and limits.
+    registry = get_models_registry()
+    if registry is None:
+        return  # The run itself raises the precise registry error.
+    pi = settings.get("pi") or {}
+    operation = str(pi.get("operation") or "timeline_segmentation")
+    findings = [
+        finding
+        for finding in output_token_limit_findings(
+            registry, [("timeline.pi.max_tokens", operation, pi.get("max_tokens"))]
+        )
+        if finding["operation"] == operation
+    ]
+    if findings:
+        finding = findings[0]
+        raise OutputLimitExceeded(
+            setting=finding["setting"],
+            model=finding["model"],
+            requested=finding["requested"],
+            limit=finding["limit"],
+        )
 
 
 def build_executor():
