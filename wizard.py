@@ -1438,7 +1438,7 @@ def select_llm_provider(
     default_choice = llm_to_choice.get(existing_llm, "1")
 
     choices = {
-        "1": "OpenAI (GPT-4o-mini, requires API key)",
+        "1": "OpenAI (GPT-4.1-mini, requires API key)",
         "2": "Ollama (local models, runs on your machine)",
         "3": "llama.cpp (Chronicle-managed, local GGUF models, GPU recommended)",
         "4": "None (skip memory extraction)",

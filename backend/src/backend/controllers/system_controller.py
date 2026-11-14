@@ -15,7 +15,7 @@ import warnings
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -48,6 +48,7 @@ from backend.model_registry import (
     _find_config_path,
     get_models_registry,
     load_models_config,
+    output_token_limit_findings,
 )
 from backend.model_routes import effective_model_routes, effective_operation_routes
 from backend.models.user import User
@@ -174,6 +175,42 @@ def _is_self_hosted_model(model) -> bool:
         return True
     # Tailnet DNS names, or bare docker-compose service names (no dots)
     return host.endswith(".ts.net") or "." not in host
+
+
+def _output_limit_issues(registry: Any) -> list[dict[str, Any]]:
+    """Report each max_tokens setting its model cannot honour.
+
+    These are errors: the operation refuses to run (see ``OutputLimitExceeded``)
+    until a larger-output model is chosen or the setting is lowered.
+    """
+
+    timeline_pi = (load_config().get("timeline", {}) or {}).get("pi", {}) or {}
+    extra = [
+        (
+            "timeline.pi.max_tokens",
+            str(timeline_pi.get("operation") or "timeline_segmentation"),
+            timeline_pi.get("max_tokens"),
+        )
+    ]
+    return [
+        {
+            "component": "Model Limits",
+            "severity": "error",
+            "message": (
+                f"'{finding['operation']}' needs a model with at least "
+                f"{finding['requested']} output tokens, but it uses "
+                f"{finding['model']} ({finding['model_name']}), which accepts at most "
+                f"{finding['limit']}. It will not run until this is fixed."
+            ),
+            "resolution": (
+                f"Settings > AI Model Settings: route '{finding['operation']}' to a "
+                f"model that supports at least {finding['requested']} output "
+                f"tokens. Or lower {finding['setting']} to {finding['limit']} or "
+                f"less, if shorter results are acceptable."
+            ),
+        }
+        for finding in output_token_limit_findings(registry, extra)
+    ]
 
 
 async def get_config_diagnostics():
@@ -359,6 +396,13 @@ async def get_config_diagnostics():
                             "resolution": "Memory extraction can fail without API key",
                         }
                     )
+
+            # Listed under issues so the health poller records a System Event.
+            limit_issues = _output_limit_issues(registry)
+            if limit_issues:
+                diagnostics["issues"].extend(limit_issues)
+                if diagnostics["overall_status"] == "healthy":
+                    diagnostics["overall_status"] = "partial"
 
         else:
             diagnostics["overall_status"] = "unhealthy"
@@ -2679,7 +2723,9 @@ async def create_plugin(
                 if events
                 else '"conversation.complete"'
             )
-            boilerplate = inspect.cleandoc(f'''
+            boilerplate = (
+                inspect.cleandoc(
+                    f'''
                 """
                 {class_name} implementation.
 
@@ -2716,7 +2762,10 @@ async def create_plugin(
                     async def on_conversation_complete(self, context: PluginContext) -> Optional[PluginResult]:
                         logger.info(f"Processing conversation for user: {{context.user_id}}")
                         return PluginResult(success=True, message="OK")
-            ''') + "\n"
+            '''
+                )
+                + "\n"
+            )
             (plugin_dir / "plugin.py").write_text(boilerplate, encoding="utf-8")
         created_files.append("plugin.py")
 

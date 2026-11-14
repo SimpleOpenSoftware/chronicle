@@ -150,6 +150,17 @@ class ModelDef(BaseModel):
     embedding_dimensions: Optional[int] = Field(
         default=None, ge=1, description="Embedding vector dimensions"
     )
+    max_output_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Largest completion the provider accepts for this model. A request for "
+            "more is rejected outright (OpenAI returns HTTP 400), so every requested "
+            "max_tokens is fitted to this value. Unset means unknown: requests pass "
+            "through unchanged, which is the right default for local servers whose "
+            "only limit is their context window."
+        ),
+    )
     operations: Dict[str, Any] = Field(
         default_factory=dict, description="API operation definitions"
     )
@@ -285,6 +296,94 @@ class ModelDef(BaseModel):
                 self.embedding_dimensions = defaults[self.model_name]
 
         return self
+
+
+class OutputLimitExceeded(ValueError):
+    """A configured max_tokens is larger than the routed model can produce.
+
+    Raised before any request is sent. Silently shrinking the allowance would run the
+    operation with less room than it was tuned for (a long timeline day is cut off
+    before its last episodes), so the operator is told to choose a bigger model.
+    """
+
+    def __init__(self, *, setting: str, model: str, requested: int, limit: int):
+        self.setting = setting
+        self.model = model
+        self.requested = requested
+        self.limit = limit
+        super().__init__(
+            f"{setting} needs {requested} output tokens, but model '{model}' accepts "
+            f"at most {limit}. Choose a model that supports at least {requested} "
+            f"output tokens for this operation (Settings > AI Model Settings), or "
+            f"lower {setting}."
+        )
+
+
+def check_output_tokens(model_def: Any, requested: int, *, setting: str) -> int:
+    """Return ``requested`` if the model can produce it; raise otherwise."""
+
+    # Test fakes and extra-field model entries share this path with ModelDef, the
+    # same way callers already read ``context_window``.
+    return check_output_limit(
+        getattr(model_def, "max_output_tokens", None),
+        requested,
+        setting=setting,
+        model=str(model_def.name),
+    )
+
+
+def check_output_limit(
+    limit: Optional[int], requested: int, *, setting: str, model: str
+) -> int:
+    """Core of :func:`check_output_tokens` for callers holding only the limit.
+
+    An undeclared limit means unknown, so the request passes through unchanged.
+    """
+
+    if limit is not None and requested > limit:
+        raise OutputLimitExceeded(
+            setting=setting, model=model, requested=int(requested), limit=int(limit)
+        )
+    return requested
+
+
+def output_token_limit_findings(
+    registry: "AppModels",
+    extra_settings: Optional[List[tuple[str, str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """List every configured ``max_tokens`` larger than its model accepts.
+
+    Checks each ``llm_operations`` entry against the model it routes to, plus
+    ``extra_settings``: ``(setting_path, operation_name, requested)`` triples for
+    feature settings that override an operation's limit (``timeline.pi.max_tokens``).
+    """
+
+    candidates: List[tuple[str, str, Any]] = []
+    for name, op_config in registry.llm_operations.items():
+        if op_config.max_tokens is not None:
+            candidates.append(
+                (f"llm_operations.{name}.max_tokens", name, op_config.max_tokens)
+            )
+    candidates.extend(extra_settings or [])
+
+    findings: List[Dict[str, Any]] = []
+    for setting, operation, requested in candidates:
+        if requested in (None, "") or isinstance(requested, bool):
+            continue
+        model_def = registry.resolve_operation_model(operation)
+        limit = model_def.max_output_tokens
+        if limit is not None and int(requested) > limit:
+            findings.append(
+                {
+                    "setting": setting,
+                    "operation": operation,
+                    "model": model_def.name,
+                    "model_name": model_def.model_name,
+                    "requested": int(requested),
+                    "limit": limit,
+                }
+            )
+    return findings
 
 
 class LLMOperationConfig(BaseModel):
@@ -526,6 +625,44 @@ class AppModels(BaseModel):
         """
         return sorted(set(m.model_type for m in self.models.values()))
 
+    def resolve_operation_model(
+        self, name: str, *, model_override: Optional[str] = None
+    ) -> ModelDef:
+        """Return the model an operation routes to, without validating its settings.
+
+        Diagnostics and route explanations use this so a misconfigured operation can
+        still be reported; :meth:`get_llm_operation` adds the settings checks.
+
+        Raises:
+            RuntimeError: If no model can be resolved for the operation
+        """
+        op_config = self.llm_operations.get(name, LLMOperationConfig())
+        default_role = self.llm_operation_role(name)
+
+        if model_override:
+            model_def = self.get_by_name(model_override)
+            if not model_def:
+                raise RuntimeError(
+                    f"LLM operation '{name}' requested override model "
+                    f"'{model_override}' which is not defined in the models list"
+                )
+        elif op_config.model:
+            model_def = self.get_by_name(op_config.model)
+            if not model_def:
+                raise RuntimeError(
+                    f"LLM operation '{name}' references model '{op_config.model}' "
+                    f"which is not defined in the models list"
+                )
+        else:
+            model_def = self.get_default(default_role)
+            if not model_def and default_role != "llm":
+                model_def = self.get_default("llm")
+            if not model_def:
+                raise RuntimeError(
+                    f"No model specified for operation '{name}' and no default LLM defined"
+                )
+        return model_def
+
     def get_llm_operation(
         self,
         name: str,
@@ -551,33 +688,10 @@ class AppModels(BaseModel):
 
         Raises:
             RuntimeError: If no model can be resolved for the operation
+            OutputLimitExceeded: If max_tokens is larger than the model can produce
         """
         op_config = self.llm_operations.get(name, LLMOperationConfig())
-        default_role = self.llm_operation_role(name)
-
-        # Resolve model definition
-        if model_override:
-            model_def = self.get_by_name(model_override)
-            if not model_def:
-                raise RuntimeError(
-                    f"LLM operation '{name}' requested override model "
-                    f"'{model_override}' which is not defined in the models list"
-                )
-        elif op_config.model:
-            model_def = self.get_by_name(op_config.model)
-            if not model_def:
-                raise RuntimeError(
-                    f"LLM operation '{name}' references model '{op_config.model}' "
-                    f"which is not defined in the models list"
-                )
-        else:
-            model_def = self.get_default(default_role)
-            if not model_def and default_role != "llm":
-                model_def = self.get_default("llm")
-            if not model_def:
-                raise RuntimeError(
-                    f"No model specified for operation '{name}' and no default LLM defined"
-                )
+        model_def = self.resolve_operation_model(name, model_override=model_override)
 
         # Merge parameters: operation config > model_params > safe fallback
         model_params = model_def.model_params or {}
@@ -603,6 +717,14 @@ class AppModels(BaseModel):
         if op_config.response_format == "json":
             response_format = {"type": "json_object"}
 
+        if max_tokens is not None:
+            source = (
+                f"llm_operations.{name}.max_tokens"
+                if op_config.max_tokens is not None
+                else f"models.{model_def.name}.model_params.max_tokens"
+            )
+            max_tokens = check_output_tokens(model_def, int(max_tokens), setting=source)
+
         return ResolvedLLMOperation(
             model_def=model_def,
             temperature=float(temperature),
@@ -620,11 +742,11 @@ class AppModels(BaseModel):
         else:
             role = self.llm_operation_role(name)
             source = f"defaults.{role}"
-        resolved = self.get_llm_operation(name)
+        model_def = self.resolve_operation_model(name)
         return {
-            "model": resolved.model_def.name,
-            "model_name": resolved.model_name,
-            "provider": resolved.model_def.model_provider,
+            "model": model_def.name,
+            "model_name": model_def.model_name,
+            "provider": model_def.model_provider,
             "role": role,
             "source": source,
         }
