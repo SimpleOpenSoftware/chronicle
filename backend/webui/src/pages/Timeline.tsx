@@ -208,6 +208,16 @@ export default function Timeline() {
       setReconciliationRequestId(request.request_id)
     },
   })
+  // A start can be refused before anything is queued (e.g. the timeline model's
+  // output limit is too small); show the server's reason, not a silent no-op.
+  const startFailure = (reconcile.error || bypassImmich.error) as
+    | { response?: { status?: number; data?: { detail?: unknown } }; message?: string }
+    | null
+  const startDetail = startFailure?.response?.data?.detail
+  const reconcileStartError = startFailure
+    ? typeof startDetail === 'string' ? startDetail : startFailure.message || 'Request failed'
+    : null
+  const reconcileStartModelProblem = startFailure?.response?.status === 409
   const reconciliation = useQuery({
     queryKey: ['timeline-reconciliation', reconciliationRequestId],
     queryFn: async () => (await timelineApi.getReconciliation(reconciliationRequestId!)).data,
@@ -388,6 +398,13 @@ export default function Timeline() {
       {status?.state === 'failed' && !reconciliationStatus && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
           <AlertTriangle className="h-4 w-4" /><span className="min-w-0 flex-1">The previous analysis failed. {status.error}</span><Button size="sm" variant="danger" onClick={() => reconcile.mutate()}>Reconcile day</Button>
+        </div>
+      )}
+      {reconcileStartError && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+          <AlertTriangle className="h-4 w-4" />
+          <span className="min-w-0 flex-1">Could not start analysis. {reconcileStartError}</span>
+          {reconcileStartModelProblem && <Link to="/settings" className="font-medium underline">Change model</Link>}
         </div>
       )}
       {timeline.isError && (

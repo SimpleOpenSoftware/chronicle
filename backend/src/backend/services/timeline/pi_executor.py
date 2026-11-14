@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import backend.services.timeline.pi_tasks as pi_tasks
 import backend.services.timeline.prompt as prompt
+from backend.model_registry import check_output_limit
 from backend.services.inference_artifacts import (
     invalidate_reusable_result,
     load_reusable_result,
@@ -753,6 +754,16 @@ class PiTimelineExecutor:
                 raise ValueError(
                     "timeline.pi.max_tokens must be a positive integer"
                 ) from exc
+            if max_tokens > 0:
+                # The shipped 32K allowance needs a large-output model. Stop with a
+                # model-choice message rather than send a request the provider
+                # rejects, or quietly shrink the room a dense day needs.
+                max_tokens = check_output_limit(
+                    config.max_output_tokens,
+                    max_tokens,
+                    setting="timeline.pi.max_tokens",
+                    model=config.model_entry,
+                )
             if max_tokens <= 0 or max_tokens > config.context_window - 1024:
                 raise ValueError(
                     "timeline.pi.max_tokens must be positive and leave at least "
