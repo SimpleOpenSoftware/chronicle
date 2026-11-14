@@ -213,7 +213,7 @@ const { useAudioStreamer } = loadTypeScript(sourcePath, {
     'wss://chronicle.invalid/ws/audio',
     { kind: 'wearable', sourceId: 'neo-1' },
   );
-  assert.deepEqual(socketFrameDurations, [20, 60], 'wearable capture must declare 60 ms Opus');
+  assert.deepEqual(socketFrameDurations, [20, 20], 'wearable capture must declare 20 ms Opus');
   assert.equal(beginCaptureCalls.length, 2, 'wearable also uses one live capture');
   assert.equal(beginCaptureCalls[1].deliveryClass, DeliveryClass.LIVE);
   await wearableStreamer.stopStreaming();
