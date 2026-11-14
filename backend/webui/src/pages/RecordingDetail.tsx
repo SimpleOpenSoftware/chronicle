@@ -4,14 +4,14 @@ import { useParams, useNavigate, useLocation, useSearchParams } from 'react-rout
 import { useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft, Calendar, User, Trash2, RefreshCw, MoreVertical,
-  RotateCcw, Zap, Download, Scissors,
+  RotateCcw, Zap, FileText, Download, Scissors,
   Save, X, Pencil, Clock, Database, Layers, Star, BarChart3, Hash, AudioLines, ChevronRight,
   Check, Copy
 } from 'lucide-react'
 import { annotationsApi, speakerApi, systemApi, BACKEND_URL } from '../services/api'
 import {
   useConversationDetail,
-  useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSpeakers, useToggleStar
+  useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSummary, useReprocessSpeakers, useToggleStar
 } from '../hooks/useConversations'
 import ConversationVersionHeader from '../components/ConversationVersionHeader'
 import MemoryAuditCard from '../components/MemoryAuditCard'
@@ -129,6 +129,7 @@ export default function RecordingDetail({ dataset = false }: { dataset?: boolean
   // Reprocessing state
   const [reprocessingTranscript, setReprocessingTranscript] = useState(false)
   const [reprocessingMemory, setReprocessingMemory] = useState(false)
+  const [reprocessingSummary, setReprocessingSummary] = useState(false)
   const [reprocessingSpeakers, setReprocessingSpeakers] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [idCopyStatus, setIdCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle')
@@ -186,6 +187,7 @@ export default function RecordingDetail({ dataset = false }: { dataset?: boolean
   const deleteConversationMutation = useDeleteConversation()
   const reprocessTranscriptMutation = useReprocessTranscript()
   const reprocessMemoryMutation = useReprocessMemory()
+  const reprocessSummaryMutation = useReprocessSummary()
   const reprocessSpeakersMutation = useReprocessSpeakers()
 
   const formatDate = (timestamp: number | string) => {
@@ -308,6 +310,20 @@ export default function RecordingDetail({ dataset = false }: { dataset?: boolean
       setActionError(`Failed to reprocess memory: ${err.message || 'Unknown error'}`)
     } finally {
       setReprocessingMemory(false)
+    }
+  }
+
+  const handleReprocessSummary = async () => {
+    if (!id) return
+    setReprocessingSummary(true)
+    setOpenDropdown(false)
+    try {
+      await reprocessSummaryMutation.mutateAsync(id)
+      refetch()
+    } catch (err: any) {
+      setActionError(`Failed to reprocess summary: ${err.response?.data?.error || err.message || 'Unknown error'}`)
+    } finally {
+      setReprocessingSummary(false)
     }
   }
 
@@ -499,6 +515,15 @@ export default function RecordingDetail({ dataset = false }: { dataset?: boolean
                 <span>Reprocess Memory</span>
                 </button>
           )}
+              <button
+                onClick={handleReprocessSummary}
+                disabled={reprocessingSummary}
+                className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50"
+                title="Regenerate the title and summaries from the current transcript"
+              >
+                {reprocessingSummary ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                <span>Reprocess Summary</span>
+              </button>
               <div className="relative group/speakers">
                 <button
                   disabled={reprocessingSpeakers}

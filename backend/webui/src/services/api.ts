@@ -289,6 +289,7 @@ export const conversationsApi = {
   reprocessMemory: (conversationId: string, transcriptVersionId: string = 'active') => api.post(`/api/conversations/${conversationId}/reprocess-memory`, null, {
     params: { transcript_version_id: transcriptVersionId }
   }),
+  reprocessSummary: (conversationId: string) => api.post(`/api/conversations/${conversationId}/reprocess-summary`),
   reprocessSpeakers: (
     conversationId: string,
     transcriptVersionId: string = 'active',

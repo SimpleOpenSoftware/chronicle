@@ -3,9 +3,9 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 import SourceSearch from '../components/SourceSearch'
 import { useAuth } from '../contexts/AuthContext'
-import { MessageSquare, RefreshCw, Calendar, User, Play, Pause, MoreVertical, RotateCcw, Zap, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Save, X, AlertTriangle, Pencil, Star, Clock, Mic } from 'lucide-react'
+import { MessageSquare, RefreshCw, Calendar, User, Play, Pause, MoreVertical, RotateCcw, Zap, FileText, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Save, X, AlertTriangle, Pencil, Star, Clock, Mic } from 'lucide-react'
 import { conversationsApi, annotationsApi, speakerApi } from '../services/api'
-import { useConversations, useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSpeakers, useReprocessOrphan, useToggleStar } from '../hooks/useConversations'
+import { useConversations, useDeleteConversation, useReprocessTranscript, useReprocessMemory, useReprocessSummary, useReprocessSpeakers, useReprocessOrphan, useToggleStar } from '../hooks/useConversations'
 import ConversationVersionHeader from '../components/ConversationVersionHeader'
 import { PlayheadTimeLabel } from '../components/audio/PlayheadWaveform'
 import { useGaplessPlayer } from '../hooks/useGaplessPlayer'
@@ -119,6 +119,7 @@ export default function Recordings() {
   const [openDropdown, setOpenDropdown] = useState<string | null>(null)
   const [reprocessingTranscript, setReprocessingTranscript] = useState<Set<string>>(new Set())
   const [reprocessingMemory, setReprocessingMemory] = useState<Set<string>>(new Set())
+  const [reprocessingSummary, setReprocessingSummary] = useState<Set<string>>(new Set())
   const [reprocessingSpeakers, setReprocessingSpeakers] = useState<Set<string>>(new Set())
   const [reprocessingOrphan, setReprocessingOrphan] = useState<Set<string>>(new Set())
   const [deletingConversation, setDeletingConversation] = useState<Set<string>>(new Set())
@@ -218,6 +219,26 @@ export default function Recordings() {
       setReprocessingMemory(prev => {
         const newSet = new Set(prev)
         newSet.delete(conversation.conversation_id!)
+        return newSet
+      })
+    }
+  }
+
+  const reprocessSummaryMutation = useReprocessSummary()
+
+  const handleReprocessSummary = async (conversation: Conversation) => {
+    const conversationId = conversation.conversation_id
+    if (!conversationId) return
+    setReprocessingSummary(prev => new Set(prev).add(conversationId))
+    setOpenDropdown(null)
+    try {
+      await reprocessSummaryMutation.mutateAsync(conversationId)
+    } catch (err: any) {
+      setActionError(`Error starting summary reprocessing: ${err.response?.data?.error || err.message || 'Unknown error'}`)
+    } finally {
+      setReprocessingSummary(prev => {
+        const newSet = new Set(prev)
+        newSet.delete(conversationId)
         return newSet
       })
     }
@@ -841,6 +862,19 @@ export default function Recordings() {
                         {!conversation.conversation_id && (
                           <span className="text-xs text-red-500 ml-1">(ID missing)</span>
                         )}
+                      </button>
+                      <button
+                        onClick={() => handleReprocessSummary(conversation)}
+                        disabled={!conversation.conversation_id || reprocessingSummary.has(conversation.conversation_id)}
+                        className="min-h-11 w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Regenerate the title and summaries from the current transcript"
+                      >
+                        {conversation.conversation_id && reprocessingSummary.has(conversation.conversation_id) ? (
+                          <RefreshCw className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <FileText className="h-4 w-4" />
+                        )}
+                        <span>Reprocess Summary</span>
                       </button>
                       <button
                         onClick={() => handleReprocessSpeakers(conversation)}
