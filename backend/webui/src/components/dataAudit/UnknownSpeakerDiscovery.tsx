@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Loader2, Pause, Play, Search, X } from 'lucide-react'
+import { Check, ChevronDown, ChevronRight, Loader2, Pause, Play, Search, X } from 'lucide-react'
 import { dataAuditApi, UnknownSpeakerCluster } from '../../services/api'
 import { useGaplessPlayer } from '../../hooks/useGaplessPlayer'
 import { Alert, Button } from '../ui'
@@ -20,6 +20,8 @@ export default function UnknownSpeakerDiscovery() {
   const [error, setError] = useState<string | null>(null)
   const [accepted, setAccepted] = useState<Set<string>>(new Set())
   const [selectedClips, setSelectedClips] = useState<Set<string>>(new Set())
+  // Conversations start collapsed: a cluster can span many conversations with many clips.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const player = useGaplessPlayer()
 
   const refresh = async () => {
@@ -75,6 +77,7 @@ export default function UnknownSpeakerDiscovery() {
   useEffect(() => {
     if (!cluster) return
     setAccepted(new Set(cluster.members.map((member) => member.identity_key)))
+    setExpanded(new Set())
     setSelectedClips(new Set(cluster.members.flatMap((member) =>
       member.segments.filter((segment) => segment.duration >= 3).slice(0, 2)
         .map((segment) => `${member.identity_key}:${segment.segment_index}`)
@@ -103,18 +106,50 @@ export default function UnknownSpeakerDiscovery() {
       {!cluster && !discovering && <p className="mt-4 text-sm italic text-gray-400">No suggested voice matches to review.</p>}
       {cluster && (
         <div className="mt-5 rounded-lg border border-gray-200 p-4 dark:border-gray-700">
-          <p className="font-medium text-gray-900 dark:text-gray-100">
-            Possible same person · {cluster.conversation_count} conversations · {cluster.segment_count} clips
-          </p>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="font-medium text-gray-900 dark:text-gray-100">
+              Possible same person · {cluster.conversation_count} conversations · {cluster.segment_count} clips
+            </p>
+            <button
+              type="button"
+              data-testid="unknown-cluster-toggle-all"
+              className="text-xs text-gray-500 hover:text-gray-700 hover:underline dark:text-gray-400 dark:hover:text-gray-200"
+              onClick={() => setExpanded(
+                expanded.size === cluster.members.length
+                  ? new Set()
+                  : new Set(cluster.members.map((member) => member.identity_key))
+              )}
+            >
+              {expanded.size === cluster.members.length ? 'Collapse all' : 'Expand all'}
+            </button>
+          </div>
           <div className="mt-3 space-y-2">
-            {cluster.members.map((member) => (
-              <div key={member.identity_key} className="rounded bg-gray-50 px-3 py-2 text-sm dark:bg-gray-900/40">
-                <label className="flex items-center gap-2">
-                  <input type="checkbox" checked={accepted.has(member.identity_key)} onChange={() => toggle(accepted, member.identity_key, setAccepted)} />
-                  <span className="font-medium">{member.conversation_title || 'Untitled'}</span>
-                </label>
-                <span className="ml-2 text-gray-400">{member.local_label}</span>
-                <div className="mt-2 space-y-1 pl-6">
+            {cluster.members.map((member) => {
+              const open = expanded.has(member.identity_key)
+              const title = member.conversation_title || 'Untitled'
+              const chosen = accepted.has(member.identity_key)
+                ? member.segments.filter((segment) => selectedClips.has(`${member.identity_key}:${segment.segment_index}`)).length
+                : 0
+              return (
+              <div key={member.identity_key} data-testid={`unknown-cluster-member-${member.identity_key}`} className="rounded bg-gray-50 px-3 py-2 text-sm dark:bg-gray-900/40">
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" aria-label={`Include ${title}`} checked={accepted.has(member.identity_key)} onChange={() => toggle(accepted, member.identity_key, setAccepted)} />
+                  <button
+                    type="button"
+                    aria-expanded={open}
+                    data-testid={`unknown-cluster-member-toggle-${member.identity_key}`}
+                    onClick={() => toggle(expanded, member.identity_key, setExpanded)}
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                  >
+                    {open ? <ChevronDown className="h-4 w-4 flex-shrink-0 text-gray-400" /> : <ChevronRight className="h-4 w-4 flex-shrink-0 text-gray-400" />}
+                    <span className="truncate font-medium">{title}</span>
+                    <span className="flex-shrink-0 text-gray-400">{member.local_label}</span>
+                    <span className="ml-auto flex-shrink-0 text-xs text-gray-400">
+                      {member.segments.length} {member.segments.length === 1 ? 'clip' : 'clips'} · {chosen} selected
+                    </span>
+                  </button>
+                </div>
+                {open && <div className="mt-2 space-y-1 pl-6">
                   {member.segments.map((segment) => {
                     const key = `${member.identity_key}:${segment.segment_index}`
                     const playbackId = `unknown-discovery:${key}`
@@ -127,9 +162,10 @@ export default function UnknownSpeakerDiscovery() {
                       <span className="truncate">{segment.text || '(no transcript)'}</span>
                     </div>
                   })}
-                </div>
+                </div>}
               </div>
-            ))}
+              )
+            })}
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Existing or new speaker name" className="min-w-64 rounded border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-900" />
