@@ -78,7 +78,7 @@ const formatDuration = (seconds: number) => {
 const isUnknownSpeakerLabel = (name?: string): boolean => {
   if (!name) return true
   const n = name.trim().toLowerCase()
-  return n === '' || n === 'unknown' || n.startsWith('unknown speaker') || n === 'background' || n === 'noise'
+  return n === '' || n === 'unknown' || n.startsWith('unknown speaker') || /^speaker[ _]*\d+$/.test(n) || n === 'background' || n === 'noise'
 }
 
 /**
