@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { X } from 'lucide-react'
 import { chatApi } from '../services/api'
+import { formatDateTime } from '../utils/datetime'
 
 export interface ChatRun {
   run_id: string
@@ -26,9 +27,9 @@ interface RunStep {
   response_unavailable?: boolean
 }
 
-const stamp = (value: string) => new Date(value).toLocaleString('en-IN', {
-  timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
-}) + ' IST'
+const stamp = (value: string) => formatDateTime(value, {
+  day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+})
 
 function Payload({ label, value }: { label: string; value: unknown }) {
   if (value === undefined) return null

@@ -18,6 +18,7 @@ import ChatSaveReview from "../components/ChatSaveReview";
 import DialogueTasks from "../components/DialogueTasks";
 import { refKey } from "../components/SourceResults";
 import { sourceDate } from "../utils/sourceTime";
+import { formatDateTime } from '../utils/datetime'
 
 interface VaultNote {
   id: string;
@@ -43,15 +44,7 @@ interface Message {
   source_coverage?: string;
   memories_used?: string[];
 }
-const stamp = (value: string) =>
-  sourceDate(value).toLocaleString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }) + " IST";
+const stamp = (value: string) => formatDateTime(value);
 const button =
   "min-h-10 rounded px-3 py-2 text-sm hover:bg-[var(--tape-chip)] disabled:opacity-50";
 const failure = (e: any) =>

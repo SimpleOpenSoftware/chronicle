@@ -93,7 +93,7 @@ async def test_blocked_request_never_imports_or_queues_work(requests_db, monkeyp
         explicit_reconciliation,
         "check_immich_day_readiness",
         lambda *_args: _async_value(
-            readiness(ready=False, reason="immich_unconfigured")
+            readiness(ready=False, reason="immich_unreachable")
         ),
     )
     imported = queued = 0
@@ -119,9 +119,53 @@ async def test_blocked_request_never_imports_or_queues_work(requests_db, monkeyp
 
     assert created is True
     assert request.state == "blocked"
-    assert request.reason == "immich_unconfigured"
+    assert request.reason == "immich_unreachable"
     assert imported == 0
     assert queued == 0
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_immich_queues_any_user_without_import(
+    requests_db, monkeypatch
+):
+    monkeypatch.setattr(explicit_reconciliation, "immich_configured", lambda: False)
+    monkeypatch.setattr(
+        explicit_reconciliation,
+        "check_immich_day_readiness",
+        lambda *_args: _async_value(
+            readiness(ready=True, reason="immich_unconfigured")
+        ),
+    )
+    imported = 0
+
+    async def import_candidates(*_args):
+        nonlocal imported
+        imported += 1
+
+    async def not_called():
+        raise AssertionError("Immich ownership does not apply without Immich")
+
+    async def authorize(**_kwargs):
+        return SimpleNamespace(dirty_range_id="range-one")
+
+    monkeypatch.setattr(
+        explicit_reconciliation, "import_immich_day_candidates", import_candidates
+    )
+    monkeypatch.setattr(explicit_reconciliation, "resolve_immich_user_id", not_called)
+    monkeypatch.setattr(explicit_reconciliation, "authorize_explicit_range", authorize)
+    monkeypatch.setattr(explicit_reconciliation, "_queue_request", lambda *_args: "job")
+
+    request, created = await explicit_reconciliation.request_explicit_reconciliation(
+        user=SimpleNamespace(id="not-the-admin"),
+        local_date=date(2026, 8, 15),
+        timezone_name="Asia/Kolkata",
+    )
+
+    assert created is True
+    assert request.state == "queued"
+    assert request.reason == "immich_unconfigured"
+    assert request.job_id == "job"
+    assert imported == 0
 
 
 @pytest.mark.asyncio
@@ -312,7 +356,7 @@ async def test_concurrent_blocked_requests_reuse_one_readiness_snapshot(
     async def check(*_args):
         nonlocal checks
         checks += 1
-        return readiness(ready=False, reason="immich_unconfigured")
+        return readiness(ready=False, reason="immich_unreachable")
 
     monkeypatch.setattr(explicit_reconciliation, "distributed_lock", local_lock)
     monkeypatch.setattr(explicit_reconciliation, "check_immich_day_readiness", check)
@@ -335,6 +379,7 @@ async def test_concurrent_blocked_requests_reuse_one_readiness_snapshot(
 
 @pytest.mark.asyncio
 async def test_non_owner_cannot_query_or_import_immich(requests_db, monkeypatch):
+    monkeypatch.setattr(explicit_reconciliation, "immich_configured", lambda: True)
     monkeypatch.setattr(
         explicit_reconciliation,
         "resolve_immich_user_id",
@@ -696,3 +741,86 @@ def test_enqueue_keeps_running_retry_with_previous_ended_at(monkeypatch, status)
         queue_controller.enqueue_explicit_timeline_reconciliation("request")
         == "live-retry"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_stops_job_dismisses_range_and_allows_a_new_request(
+    requests_db, monkeypatch
+):
+    stopped = []
+    monkeypatch.setattr(explicit_reconciliation, "_queue_request", lambda _id: "job")
+    monkeypatch.setattr(explicit_reconciliation, "_stop_job", stopped.append)
+    user = SimpleNamespace(id="user")
+    day = date(2026, 8, 15)
+
+    first, _ = await explicit_reconciliation.request_explicit_reconciliation(
+        user=user, local_date=day, timezone_name="Asia/Kolkata", skip_immich=True
+    )
+    cancelled = await explicit_reconciliation.cancel_explicit_reconciliation(
+        user=user, request_id=first.request_id
+    )
+
+    assert cancelled.state == "cancelled"
+    assert stopped == ["job"]
+    dirty_range = await DirtyEvidenceRange.find_one(
+        DirtyEvidenceRange.dirty_range_id == first.dirty_range_id
+    )
+    assert dirty_range.state == "dismissed"
+    assert dirty_range.lease_owner is None
+    assert dirty_range.resolution_history[-1].action == "cancelled"
+    assert dirty_range.resolution_history[-1].prior_state == "authorized_pending"
+
+    # The cancelled request no longer pins the day: asking again starts fresh.
+    second, created = await explicit_reconciliation.request_explicit_reconciliation(
+        user=user, local_date=day, timezone_name="Asia/Kolkata", skip_immich=True
+    )
+    assert created is True
+    assert second.request_id != first.request_id
+
+    # The worker entrypoint refuses to run a cancelled request.
+    result = await timeline_jobs.explicit_reconciliation_job.__wrapped__(
+        first.request_id
+    )
+    assert result == {"request_id": first.request_id, "state": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_finished_request_cannot_be_cancelled(requests_db):
+    request = TimelineReconciliationRequest(
+        user_id="user",
+        local_date=date(2026, 8, 15),
+        timezone="Asia/Kolkata",
+        state="completed",
+        reason="user_bypassed_immich",
+    )
+    await request.insert()
+
+    with pytest.raises(explicit_reconciliation.ReconciliationNotCancellable):
+        await explicit_reconciliation.cancel_explicit_reconciliation(
+            user=SimpleNamespace(id="user"), request_id=request.request_id
+        )
+    with pytest.raises(LookupError):
+        await explicit_reconciliation.cancel_explicit_reconciliation(
+            user=SimpleNamespace(id="someone-else"), request_id=request.request_id
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("started", "stopped"), ("queued", "cancelled"), ("scheduled", "cancelled")],
+)
+def test_stop_job_kills_running_and_cancels_pending(monkeypatch, status, expected):
+    calls = []
+    job = SimpleNamespace(
+        id="timeline-explicit_x", cancel=lambda: calls.append("cancel")
+    )
+    monkeypatch.setattr(queue_controller.Job, "fetch", lambda *_a, **_k: job)
+    monkeypatch.setattr(queue_controller, "get_job_status_from_rq", lambda _j: status)
+    monkeypatch.setattr(
+        queue_controller,
+        "send_stop_job_command",
+        lambda _conn, job_id: calls.append(("stop", job_id)),
+    )
+
+    assert queue_controller.stop_explicit_timeline_reconciliation(job.id) == expected
+    assert calls == ([("stop", job.id)] if status == "started" else ["cancel"])

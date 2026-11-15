@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createBrowserSession, savedToken, signedOut, logoutPending } from './browserSession'
+import { createBrowserSession, savedToken, signedOut, logoutPending, takeHandoffToken } from './browserSession'
 
 const success = (config: InternalAxiosRequestConfig, data: unknown = {}) => ({ config, data, status: 200, statusText: 'OK', headers: {} })
 const reject = (config: InternalAxiosRequestConfig, status: number) => Promise.reject(new AxiosError('Request failed', '', config, null, { ...success(config), status }))
@@ -107,5 +107,35 @@ describe('browser session transport', () => {
     expect(calls).toEqual(['/auth/session/logout', '/auth/session/logout', '/auth/session/login'])
     expect(savedToken()).toBe('new-login')
     expect(signedOut()).toBe(false)
+  })
+})
+
+describe('sign-in handoff', () => {
+  it('exchanges a host token for a session and clears an earlier sign-out', async () => {
+    localStorage.setItem('root_sessionLogout', 'done')
+    const { session } = setup(async config => {
+      expect(config.url).toBe('/auth/session/exchange')
+      expect(config.withCredentials).toBe(true)
+      expect(config.headers['X-Chronicle-Session']).toBe('1')
+      expect(config.headers.Authorization).toBe('Bearer host-token')
+      return success(config, { access_token: 'chronicle-token' })
+    })
+    await expect(session.exchange('host-token')).resolves.toBe('chronicle-token')
+    expect(savedToken()).toBe('chronicle-token')
+    expect(signedOut()).toBe(false)
+  })
+
+  it('keeps the existing state when the host token is rejected', async () => {
+    localStorage.setItem('root_token', 'existing')
+    const { session } = setup(async config => reject(config, 401))
+    await expect(session.exchange('bad')).rejects.toBeTruthy()
+    expect(savedToken()).toBe('existing')
+  })
+
+  it('takes the token from the fragment and removes it from the address bar', () => {
+    window.history.replaceState(null, '', '/conversations?x=1#token=abc&tab=2')
+    expect(takeHandoffToken()).toBe('abc')
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe('/conversations?x=1#tab=2')
+    expect(takeHandoffToken()).toBeNull()
   })
 })

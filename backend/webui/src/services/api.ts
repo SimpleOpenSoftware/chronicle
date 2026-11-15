@@ -289,6 +289,7 @@ export const conversationsApi = {
   reprocessMemory: (conversationId: string, transcriptVersionId: string = 'active') => api.post(`/api/conversations/${conversationId}/reprocess-memory`, null, {
     params: { transcript_version_id: transcriptVersionId }
   }),
+  reprocessSummary: (conversationId: string) => api.post(`/api/conversations/${conversationId}/reprocess-summary`),
   reprocessSpeakers: (
     conversationId: string,
     transcriptVersionId: string = 'active',
@@ -775,7 +776,7 @@ export interface TimelineReconciliationRequest {
   request_id: string
   date: string
   timezone: string
-  state: 'blocked' | 'queued' | 'running' | 'completed' | 'failed'
+  state: 'blocked' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   reason: 'assets_on_day' | 'later_asset_watermark' | 'no_immich_evidence' | 'immich_unconfigured' | 'immich_unreachable' | 'user_bypassed_immich'
   target_asset_count: number
   latest_eligible_asset_date: string | null
@@ -852,6 +853,8 @@ export const timelineApi = {
     api.post<TimelineReconciliationRequest>(`/api/timeline/reconciliation/day/${date}`, { timezone, skip_immich: skipImmich }),
   getReconciliation: (requestId: string) =>
     api.get<TimelineReconciliationRequest>(`/api/timeline/reconciliation/${requestId}`),
+  cancelReconciliation: (requestId: string) =>
+    api.post<TimelineReconciliationRequest>(`/api/timeline/reconciliation/${requestId}/cancel`),
   dismissFailedRange: (dirtyRangeId: string, reason: string) =>
     api.post<TimelineDirtyRange>(`/api/timeline/reconciliation/ranges/${encodeURIComponent(dirtyRangeId)}/dismiss`, { reason }),
   getAnalysis: (runId: string) =>

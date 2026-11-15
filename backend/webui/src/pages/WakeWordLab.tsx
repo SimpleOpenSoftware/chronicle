@@ -6,6 +6,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { Alert, Button, Card, IconButton, StatCard, Tabs } from '../components/ui'
 
 import VoiceLatencyReport from '../components/VoiceLatencyReport'
+import { PRECISE_DATE_TIME, formatDateTime } from '../utils/datetime'
 
 type Bucket = 'pending' | 'positive' | 'negative'
 
@@ -678,7 +679,7 @@ function ClipRow({
   // Release the AudioContext when the row unmounts.
   useEffect(() => () => { ctxRef.current?.close() }, [])
 
-  const when = new Date(sample.created_at_ms).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' })
+  const when = formatDateTime(sample.created_at_ms, PRECISE_DATE_TIME)
 
   return (
     <li className="flex flex-wrap items-center gap-3 rounded-md border border-gray-200 dark:border-gray-700 px-3 py-2">

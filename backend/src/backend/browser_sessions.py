@@ -14,10 +14,12 @@ from urllib.parse import urlsplit
 from beanie import Document, PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi_users.authentication import JWTStrategy
 from fastapi_users.exceptions import UserNotExists
 from pymongo import IndexModel
 
 from .auth import SECRET_KEY, UserManager, get_jwt_strategy, get_user_manager
+from .models.api_key import TOKEN_SCHEME
 
 COOKIE_NAME = "chronicle_session"
 SESSION_SECONDS = 30 * 24 * 60 * 60
@@ -105,6 +107,35 @@ async def login(
     user = await manager.authenticate(credentials)
     if user is None or not user.is_active:
         raise HTTPException(400, "LOGIN_BAD_CREDENTIALS")
+    return await start_session(user, request, response, manager)
+
+
+@router.post("/exchange")
+async def exchange(
+    request: Request,
+    response: Response,
+    manager: UserManager = Depends(get_user_manager),
+):
+    """Trade a bearer JWT for a browser session (single sign-on handoff).
+
+    A host such as Ushadow mints a JWT for the user with the shared signing key
+    and opens the WebUI with it; the WebUI calls this once so renewal works like
+    a password sign-in. API keys are refused: they are long-lived machine
+    credentials, not an interactive sign-in.
+    """
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token or token.startswith(f"{TOKEN_SCHEME}_"):
+        raise HTTPException(401, "Bearer JWT required")
+    user = await JWTStrategy.read_token(get_jwt_strategy(), token, manager)
+    if user is None or not user.is_active:
+        raise HTTPException(401, "Invalid or expired token")
+    return await start_session(user, request, response, manager)
+
+
+async def start_session(
+    user, request: Request, response: Response, manager: UserManager
+):
+    """Create a refresh session and cookie for an authenticated user."""
     token = secrets.token_urlsafe(32)
     await revoke_cookie(request)
     await BrowserSession(

@@ -58,7 +58,7 @@ function socketSource(source: AudioStreamSource) {
       sourceId: source.sourceId,
       displayName: 'wearable',
       deviceKind: DeviceKind.OMI,
-      uplinkFrameDurationMs: 60 as const,
+      uplinkFrameDurationMs: 20 as const,
     };
   }
   return {
@@ -185,6 +185,8 @@ export const useAudioStreamer = (): UseAudioStreamer => {
         },
         onPlaybackPacket: packet => playbackRef.current?.append(packet),
         onClosed: () => {
+          // BLE frames keep arriving after a close; a cleared ref makes sendFrame drop them.
+          if (socketRef.current === socket) socketRef.current = null;
           playbackRef.current?.close();
           playbackRef.current = null;
           setConversationState(null);

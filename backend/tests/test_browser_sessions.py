@@ -47,6 +47,7 @@ async def browser(monkeypatch):
         authenticate=AsyncMock(return_value=user),
         get=AsyncMock(return_value=user),
         on_after_login=AsyncMock(),
+        parse_id=PydanticObjectId,
     )
 
     def make_app():
@@ -144,7 +145,7 @@ async def test_logout_revokes_stolen_cookie_and_is_idempotent(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["login", "refresh", "logout"])
+@pytest.mark.parametrize("endpoint", ["login", "refresh", "logout", "exchange"])
 async def test_csrf_requests_rejected(browser, endpoint):
     client, rows, _, _ = browser
     await sign_in(client)
@@ -184,4 +185,65 @@ async def test_bad_login_does_not_create_session(browser):
         "/auth/session/login", data={"username": "x", "password": "wrong"}
     )
     assert result.status_code == 400
+    assert not rows
+
+
+def host_token(user_id, *, key=None, expires_in=300, audience=("ushadow", "chronicle")):
+    """A JWT as a host app (Ushadow) mints it with the shared signing key."""
+    now = datetime.now(UTC)
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "iss": "ushadow",
+            "aud": list(audience),
+            "iat": now,
+            "exp": now + timedelta(seconds=expires_in),
+        },
+        key or sessions.SECRET_KEY,
+        algorithm="HS256",
+    )
+
+
+@pytest.mark.asyncio
+async def test_exchange_turns_host_token_into_renewable_session(browser):
+    client, rows, manager, _ = browser
+    user = manager.get.return_value
+    result = await client.post(
+        "/auth/session/exchange",
+        headers={"Authorization": f"Bearer {host_token(user.id)}"},
+    )
+    assert result.status_code == 200
+    assert result.headers["cache-control"] == "no-store"
+    assert sessions.digest(client.cookies.get(sessions.COOKIE_NAME)) in rows
+    payload = jwt.decode(
+        result.json()["access_token"],
+        sessions.SECRET_KEY,
+        algorithms=["HS256"],
+        audience="fastapi-users:auth",
+    )
+    assert payload["sub"] == str(user.id)
+    assert (await client.post("/auth/session/refresh")).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["missing", "api_key", "wrong_key", "expired", "wrong_audience", "disabled"],
+)
+async def test_exchange_rejects_unusable_tokens(browser, failure):
+    client, rows, manager, _ = browser
+    user = manager.get.return_value
+    token = {
+        "missing": "",
+        "api_key": "chrn_abc123abc123_secret",
+        "wrong_key": host_token(user.id, key="not-the-shared-key"),
+        "expired": host_token(user.id, expires_in=-60),
+        "wrong_audience": host_token(user.id, audience=("someone-else",)),
+        "disabled": host_token(user.id),
+    }[failure]
+    if failure == "disabled":
+        user.is_active = False
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    result = await client.post("/auth/session/exchange", headers=headers)
+    assert result.status_code == 401
     assert not rows

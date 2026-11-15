@@ -42,7 +42,7 @@ function readinessMessage(request?: TimelineReconciliationRequest) {
   if (reason === 'later_asset_watermark') return `Immich contains an eligible asset captured on ${watermark}, after this day.`
   if (reason === 'no_immich_evidence') return 'No eligible Immich evidence is available for this interval yet. Open Immich, back up photos up to the cutoff below, then check again.'
   if (reason === 'user_bypassed_immich') return 'Continuing without Immich evidence at your request.'
-  if (reason === 'immich_unconfigured') return 'Immich is not configured for Chronicle, so reconciliation cannot start.'
+  if (reason === 'immich_unconfigured') return 'Immich is not configured, so this analysis uses your other evidence.'
   return 'Chronicle could not reach Immich. Reconciliation did not start.'
 }
 
@@ -208,6 +208,23 @@ export default function Timeline() {
       setReconciliationRequestId(request.request_id)
     },
   })
+  const cancelReconciliation = useMutation({
+    mutationFn: async (requestId: string) => (await timelineApi.cancelReconciliation(requestId)).data,
+    onSuccess: request => {
+      queryClient.setQueryData(['timeline-reconciliation', request.request_id], request)
+      void queryClient.invalidateQueries({ queryKey: ['semantic-timeline', day, timezone] })
+    },
+  })
+  // A start can be refused before anything is queued (e.g. the timeline model's
+  // output limit is too small); show the server's reason, not a silent no-op.
+  const startFailure = (reconcile.error || bypassImmich.error) as
+    | { response?: { status?: number; data?: { detail?: unknown } }; message?: string }
+    | null
+  const startDetail = startFailure?.response?.data?.detail
+  const reconcileStartError = startFailure
+    ? typeof startDetail === 'string' ? startDetail : startFailure.message || 'Request failed'
+    : null
+  const reconcileStartModelProblem = startFailure?.response?.status === 409
   const reconciliation = useQuery({
     queryKey: ['timeline-reconciliation', reconciliationRequestId],
     queryFn: async () => (await timelineApi.getReconciliation(reconciliationRequestId!)).data,
@@ -353,7 +370,7 @@ export default function Timeline() {
             {(reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed') && <AlertTriangle className="h-4 w-4" />}
             <span className="font-semibold">Reconciliation {reconciliationStatus.state}{reconciliationStatus.state === 'completed' && ` through ${new Date(reconciliationStatus.evidence_cutoff).toLocaleString('en-IN', { timeZone: timezone })} (${timezone})`}</span>
           </div>
-          {reconciliationStatus.state !== 'completed' && <p className="mt-1.5">{readinessMessage(reconciliationStatus)}</p>}
+          {reconciliationStatus.state !== 'completed' && reconciliationStatus.state !== 'cancelled' && <p className="mt-1.5">{readinessMessage(reconciliationStatus)}</p>}
           <p className="mt-1 text-xs">{reconciliationStatus.state === 'completed' ? 'Later evidence is not included.' : `Evidence cutoff: ${new Date(reconciliationStatus.evidence_cutoff).toLocaleString('en-IN', { timeZone: timezone })} (${timezone}).`}</p>
           <details className="mt-2 text-xs">
             <summary className="cursor-pointer">Evidence details</summary>
@@ -377,7 +394,13 @@ export default function Timeline() {
           </details>
           {reconciliationStatus.state === 'blocked' && reconciliationStatus.notification_id && <p className="mt-1 text-xs opacity-75">Backup reminder: {reconciliationStatus.notification_status || 'queued'}</p>}
           {reconciliationStatus.last_error && <p className="mt-1 text-xs text-red-700 dark:text-red-300">{reconciliationStatus.last_error}</p>}
-          {(reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed') && (
+          {(reconciliationStatus.state === 'queued' || reconciliationStatus.state === 'running') && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="secondary" onClick={() => cancelReconciliation.mutate(reconciliationStatus.request_id)} disabled={cancelReconciliation.isPending}>{cancelReconciliation.isPending ? 'Cancelling…' : 'Cancel'}</Button>
+              {cancelReconciliation.isError && <span className="text-xs text-red-700 dark:text-red-300">{(cancelReconciliation.error as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Cancel failed'}</span>}
+            </div>
+          )}
+          {(reconciliationStatus.state === 'blocked' || reconciliationStatus.state === 'failed' || reconciliationStatus.state === 'cancelled') && (
             <div className="mt-2 flex flex-wrap gap-2">
               <Button size="sm" onClick={() => reconcile.mutate()} disabled={reconcile.isPending || bypassImmich.isPending}>{reconciliationStatus.state === 'blocked' ? 'Check again' : 'Retry reconciliation'}</Button>
               {reconciliationStatus.state === 'blocked' && reconciliationStatus.reason === 'no_immich_evidence' && <Button size="sm" variant="secondary" onClick={() => bypassImmich.mutate()} disabled={reconcile.isPending || bypassImmich.isPending}>Continue without Immich</Button>}
@@ -388,6 +411,13 @@ export default function Timeline() {
       {status?.state === 'failed' && !reconciliationStatus && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
           <AlertTriangle className="h-4 w-4" /><span className="min-w-0 flex-1">The previous analysis failed. {status.error}</span><Button size="sm" variant="danger" onClick={() => reconcile.mutate()}>Reconcile day</Button>
+        </div>
+      )}
+      {reconcileStartError && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+          <AlertTriangle className="h-4 w-4" />
+          <span className="min-w-0 flex-1">Could not start analysis. {reconcileStartError}</span>
+          {reconcileStartModelProblem && <Link to="/settings" className="font-medium underline">Change model</Link>}
         </div>
       )}
       {timeline.isError && (

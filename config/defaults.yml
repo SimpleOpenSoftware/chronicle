@@ -25,12 +25,15 @@ models:
   # LLM Models
   # ===========================
   - name: openai-llm
-    description: OpenAI GPT-4o-mini
+    description: OpenAI GPT-4.1-mini
     model_type: llm
     model_provider: openai
     api_family: openai
-    model_name: gpt-4o-mini
+    model_name: gpt-4.1-mini
     model_url: https://api.openai.com/v1
+    # Completion cap enforced by OpenAI. An operation that asks for more is refused
+    # with a prompt to choose a larger-output model.
+    max_output_tokens: 32768
     api_key: ${oc.env:OPENAI_API_KEY,''}
     model_params:
       temperature: 0.2
@@ -47,6 +50,7 @@ models:
     api_family: openai
     model_name: gpt-5-nano
     model_url: https://api.openai.com/v1
+    max_output_tokens: 128000
     api_key: ${oc.env:OPENAI_API_KEY,''}
     model_params:
       temperature: 0.2
@@ -902,7 +906,7 @@ backend:
     provider: openai  # or ollama
     api_key: ${oc.env:OPENAI_API_KEY,''}
     base_url: https://api.openai.com/v1
-    model: gpt-4o-mini
+    model: gpt-4.1-mini
     timeout: 60
 
   # Transcription provider configuration

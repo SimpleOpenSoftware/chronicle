@@ -1,0 +1,6 @@
+# Shared central cert store for all ushadow-io mobile apps.
+# Managed by `mise run mobile:sign-setup`. Every app points at the same repo
+# and reuses the one team distribution cert; only this app's profile is created.
+git_url("https://github.com/Ushadow-io/certificates.git")
+storage_mode("git")
+type("appstore")

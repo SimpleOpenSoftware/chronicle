@@ -71,6 +71,7 @@ async def test_registered_speaker_job_retains_background_reference_fence(
     client = SimpleNamespace(
         enabled=True,
         service_url="http://synthetic.invalid",
+        health_check=AsyncMock(return_value=True),
         enrollment_catalog=AsyncMock(return_value=catalog),
     )
 

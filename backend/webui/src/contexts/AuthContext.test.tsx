@@ -8,7 +8,7 @@ import { authApi, browserSession } from '../services/api'
 
 vi.mock('../services/api', () => ({
   authApi: { getMe: vi.fn(), login: vi.fn() },
-  browserSession: { refresh: vi.fn(), finishLogout: vi.fn(), logout: vi.fn() },
+  browserSession: { refresh: vi.fn(), finishLogout: vi.fn(), logout: vi.fn(), exchange: vi.fn() },
 }))
 const token = `header.${btoa(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86400 }))}.signature`
 const user = { id: 'user', email: 'user@example.com', is_superuser: false }
@@ -76,4 +76,19 @@ it('ignores an account response that arrives after another tab signs out', async
     resolve({ data: user })
   })
   expect(screen.queryByText('Signed in as user@example.com')).toBeNull()
+})
+
+it('signs in from a #token handoff and strips it from the address bar', async () => {
+  localStorage.clear()
+  window.history.replaceState(null, '', '/#token=host-token')
+  vi.mocked(browserSession.exchange).mockImplementation(async () => {
+    localStorage.setItem('root_token', token)
+    return token
+  })
+  vi.mocked(authApi.getMe).mockResolvedValue({ data: user } as any)
+  mount()
+  await screen.findByText('Signed in as user@example.com')
+  expect(browserSession.exchange).toHaveBeenCalledWith('host-token')
+  expect(window.location.hash).toBe('')
+  expect(browserSession.refresh).not.toHaveBeenCalled()
 })

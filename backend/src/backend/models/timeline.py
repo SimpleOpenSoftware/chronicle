@@ -534,10 +534,19 @@ class DirtyEvidenceRangeResolution(BaseModel):
     """Append-only human resolution of one terminal reconciliation range."""
 
     resolution_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    action: Literal["dismissed"] = "dismissed"
+    action: Literal["dismissed", "cancelled"] = "dismissed"
     actor_user_id: str = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=500)
-    prior_state: Literal["failed"] = "failed"
+    # A cancel can stop a range at any non-terminal stage, not only after failure.
+    prior_state: Literal[
+        "failed",
+        "pending",
+        "authorized_pending",
+        "leased",
+        "waiting",
+        "awaiting_context",
+        "context_pending",
+    ] = "failed"
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -768,7 +777,7 @@ class TimelineReconciliationRequest(Document):
     user_id: str
     local_date: date
     timezone: str
-    state: Literal["blocked", "queued", "running", "completed", "failed"]
+    state: Literal["blocked", "queued", "running", "completed", "failed", "cancelled"]
     reason: Literal[
         "assets_on_day",
         "later_asset_watermark",

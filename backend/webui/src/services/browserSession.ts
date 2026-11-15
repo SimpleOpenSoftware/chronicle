@@ -76,6 +76,19 @@ export function createBrowserSession(api: AxiosInstance, baseURL: string) {
     return response
   }
 
+  // Single sign-on handoff: trade a host-minted JWT for a normal renewable session.
+  // Opening a handoff link is an explicit sign-in, so it overrides an earlier sign-out.
+  const exchange = async (hostToken: string) => {
+    const started = ++generation
+    const response = await transport.post<{ access_token: string }>('/auth/session/exchange', null, {
+      headers: { Authorization: `Bearer ${hostToken}` },
+    })
+    if (started !== generation) throw new Error('Session changed')
+    localStorage.removeItem(logoutKey)
+    storeToken(response.data.access_token)
+    return response.data.access_token
+  }
+
   api.interceptors.response.use(response => response, async error => {
     const request = error.config
     if (error.response?.status !== 401 || !request || request._sessionRetried || signedOut()) throw error
@@ -89,5 +102,19 @@ export function createBrowserSession(api: AxiosInstance, baseURL: string) {
     return api.request(request)
   })
 
-  return { login, logout, refresh, finishLogout, expire }
+  return { login, logout, refresh, finishLogout, expire, exchange }
+}
+
+/**
+ * Take a handoff token from `#token=…` and remove it from the address bar, so it
+ * is not kept in history or copied with the URL. Returns null when there is none.
+ */
+export function takeHandoffToken(location: Location = window.location, history: History = window.history): string | null {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ''))
+  const token = params.get('token')
+  if (!token) return null
+  params.delete('token')
+  const rest = params.toString()
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${rest ? `#${rest}` : ''}`)
+  return token
 }

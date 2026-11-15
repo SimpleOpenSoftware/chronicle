@@ -339,7 +339,7 @@ available. Direct recovery is explicitly marked as outside that ledger.
 `--container NAME` to select a container within the group. Live following is not
 implemented. `inspect` returns selected state, image, ports, mounts, and health timing
 fields, excluding environment variables and health command credentials. Both support
-`--json` and `--node`. Human operation timestamps are IST; JSON timestamps are Unix
+`--json` and `--node`. Human operation timestamps use the host's local timezone; JSON timestamps are Unix
 seconds. JSON output contains no decorative text.
 
 Use these commands before raw container-engine diagnostics. If a specific question

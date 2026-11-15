@@ -204,6 +204,16 @@ async def reprocess_memory(
     )
 
 
+@router.post("/{conversation_id}/reprocess-summary")
+async def reprocess_summary(
+    conversation_id: str, current_user: User = Depends(current_active_user)
+):
+    """Regenerate the title and both summaries from the active transcript."""
+    return await conversation_controller.reprocess_summary(
+        conversation_id, current_user
+    )
+
+
 @router.post("/{conversation_id}/reprocess-speakers")
 async def reprocess_speakers(
     conversation_id: str,

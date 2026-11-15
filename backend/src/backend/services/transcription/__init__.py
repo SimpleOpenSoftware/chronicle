@@ -944,16 +944,29 @@ class RegistryStreamingTranscriptionProvider(StreamingTranscriptionProvider):
             return None
 
     async def end_stream(self, stream_id: str) -> dict:
-        if stream_id not in self._streams:
+        # Unregister first so no exit path below can leak the stream entry.
+        stream = self._streams.pop(stream_id, None)
+        if stream is None:
             return {"text": "", "words": [], "segments": []}
-        ws = self._streams[stream_id]["ws"]
+        ws = stream["ws"]
         ops = self.model.operations or {}
-        pending = self._streams[stream_id].get("pending_audio")
-        if pending:
-            await ws.send(bytes(pending))
-            pending.clear()
+        pending = stream.get("pending_audio")
         end_msg = (ops.get("end", {}) or {}).get("message", {"type": "stop"})
-        await ws.send(json.dumps(end_msg))
+        try:
+            if pending:
+                await ws.send(bytes(pending))
+                pending.clear()
+            await ws.send(json.dumps(end_msg))
+        except websockets.exceptions.ConnectionClosed as e:
+            # The provider already closed the socket, e.g. Deepgram's idle
+            # timeout (NET-0001) after ~10 s without audio. Finals that arrived
+            # before the close were already published; nothing is left to flush.
+            logger.warning(
+                f"Provider closed stream {stream_id} before it ended "
+                f"(code={e.rcvd.code if e.rcvd else None}, "
+                f"reason={e.rcvd.reason if e.rcvd else ''})"
+            )
+            return {"text": "", "words": [], "segments": []}
 
         expect = ops.get("expect", {}) or {}
         final_type = expect.get("final_type")
@@ -977,8 +990,6 @@ class RegistryStreamingTranscriptionProvider(StreamingTranscriptionProvider):
             await ws.close()
         except Exception:
             pass
-
-        self._streams.pop(stream_id, None)
 
         if not isinstance(final, dict):
             return {"text": "", "words": [], "segments": []}
