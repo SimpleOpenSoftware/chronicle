@@ -322,3 +322,66 @@ async def test_failed_embedding_tasks_drain_siblings_before_return(
     assert completed == [True]
     assert await evidence.db.speaker_corpus_matches.count_documents({}) == 0
     assert await evidence.db.unknown_speaker_clusters.count_documents({}) == 0
+
+
+@pytest.mark.asyncio
+async def test_refused_clip_is_skipped_and_the_decision_still_confirms(
+    evidence, discovery, guided_setup, monkeypatch
+):
+    from backend.services.speaker_enrollment import EnrollmentUnavailable
+
+    await allow(evidence)
+    await run_worker("unknown")
+    row = await evidence.db.unknown_speaker_clusters.find_one({})
+    keys = [member["identity_key"] for member in row["members"]]
+    assert len(keys) == 2
+    client = guided_setup.client
+    client.get_speaker_by_name = AsyncMock(return_value={"id": "synthetic-gallery"})
+    # The provider refuses the first clip (e.g. byte-identical audio) and
+    # accepts the second.
+    client.append_to_speaker = AsyncMock(
+        side_effect=[EnrollmentUnavailable(), {"status": "enrolled"}]
+    )
+    monkeypatch.setattr(
+        guided.data_audit_controller, "apply_triage", AsyncMock(return_value={})
+    )
+
+    class Field:
+        # Stands in for the Beanie field: `field == value` builds the query.
+        def __eq__(self, value):
+            return {"conversation_id": value}
+
+    async def find_one(query):
+        doc = await evidence.db.conversations.find_one(query)
+        return NS(user_id=doc["user_id"], model_dump=lambda: doc)
+
+    collection = evidence.db.conversations
+    monkeypatch.setattr(
+        guided,
+        "Conversation",
+        NS(
+            get_pymongo_collection=lambda: collection,
+            find_one=find_one,
+            conversation_id=Field(),
+        ),
+    )
+    monkeypatch.setattr(
+        guided, "Annotation", lambda **kw: NS(insert=AsyncMock(return_value=None))
+    )
+
+    result = await guided.decide_unknown_cluster(
+        discovery.user,
+        row["cluster_id"],
+        row["run_fingerprint"],
+        "confirm",
+        "Synthetic speaker",
+        keys,
+        [{"identity_key": key, "segment_index": 0} for key in keys],
+    )
+
+    assert result["status"] == "confirmed"
+    assert result["appended"] == 1
+    assert result["skipped"] == 1
+    assert client.append_to_speaker.await_count == 2
+    stored = await evidence.db.unknown_speaker_clusters.find_one({"_id": row["_id"]})
+    assert stored["status"] == "confirmed"

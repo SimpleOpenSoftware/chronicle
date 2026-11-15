@@ -35,7 +35,7 @@ from backend.controllers.queue_controller import JOB_RESULT_TTL, default_queue
 from backend.models.annotation import Annotation, AnnotationType
 from backend.models.conversation import Conversation
 from backend.services import privacy
-from backend.services.speaker_enrollment import capture_evidence
+from backend.services.speaker_enrollment import EnrollmentUnavailable, capture_evidence
 from backend.speaker_recognition_client import SpeakerRecognitionClient
 from backend.users import User
 from backend.utils.audio_chunk_utils import reconstruct_audio_segment
@@ -255,7 +255,7 @@ async def decide_unknown_cluster(
     existing_speaker = await client.get_speaker_by_name(
         speaker_name, user_id=str(user.user_id)
     )
-    enrolled = appended = 0
+    enrolled = appended = skipped = 0
     for clip in enrollment_clips:
         member = accepted.get(clip.get("identity_key"))
         if not member:
@@ -278,32 +278,39 @@ async def decide_unknown_cluster(
             member["conversation_id"], ref["start"], ref["end"]
         )
         await visibility.assert_current()
-        if existing_speaker:
-            result = await client.append_to_speaker(
-                existing_speaker["id"],
-                wav,
-                user_id=str(user.user_id),
-                speaker_name=speaker_name,
-                conversation_ids=[member["conversation_id"]],
-                visibility=visibility,
-                evidence_records=evidence_records,
-            )
-            if not result.get("error"):
-                appended += 1
-        else:
-            result = await client.enroll_new_speaker(
-                speaker_name,
-                wav,
-                user_id=str(user.user_id),
-                conversation_ids=[member["conversation_id"]],
-                visibility=visibility,
-                evidence_records=evidence_records,
-            )
-            if not result.get("error"):
-                enrolled += 1
-                existing_speaker = await client.get_speaker_by_name(
-                    speaker_name, user_id=str(user.user_id)
+        # The provider can refuse one clip (e.g. its audio is byte-identical to a
+        # clip already enrolled). That operation is quarantined; skip the clip
+        # so the clips already enrolled are not reported as a failed decision.
+        try:
+            if existing_speaker:
+                result = await client.append_to_speaker(
+                    existing_speaker["id"],
+                    wav,
+                    user_id=str(user.user_id),
+                    speaker_name=speaker_name,
+                    conversation_ids=[member["conversation_id"]],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
                 )
+                if not result.get("error"):
+                    appended += 1
+            else:
+                result = await client.enroll_new_speaker(
+                    speaker_name,
+                    wav,
+                    user_id=str(user.user_id),
+                    conversation_ids=[member["conversation_id"]],
+                    visibility=visibility,
+                    evidence_records=evidence_records,
+                )
+                if not result.get("error"):
+                    enrolled += 1
+                    existing_speaker = await client.get_speaker_by_name(
+                        speaker_name, user_id=str(user.user_id)
+                    )
+        except EnrollmentUnavailable:
+            skipped += 1
+            logger.warning("Skipped an enrollment clip the speaker service refused")
         await visibility.assert_current()
 
     async with visibility.publication():
@@ -325,6 +332,7 @@ async def decide_unknown_cluster(
         "annotations_created": annotations,
         "enrolled_new": enrolled,
         "appended": appended,
+        "skipped": skipped,
         "corrections_applied": getattr(apply_result, "body", apply_result),
     }
 
