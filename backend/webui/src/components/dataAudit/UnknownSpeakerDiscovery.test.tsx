@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import UnknownSpeakerDiscovery from './UnknownSpeakerDiscovery'
 
@@ -53,8 +53,23 @@ describe('unknown speaker discovery', () => {
     expect(await screen.findByText(/Possible same person/)).toHaveTextContent('2 conversations')
     expect(screen.getByText('Unknown Speaker 1')).toBeInTheDocument()
     expect(screen.getByText('Unknown Speaker 7')).toBeInTheDocument()
+    // Conversations start collapsed; the summary still shows what will be enrolled.
+    expect(screen.queryAllByTitle('Use this clip for enrollment')).toHaveLength(0)
+    expect(screen.getAllByText('1 clip · 1 selected')).toHaveLength(2)
+
+    const lunch = screen.getByRole('button', { name: /Lunch/ })
+    expect(lunch).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(lunch)
+    expect(lunch).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getAllByTitle('Use this clip for enrollment')).toHaveLength(1)
+    fireEvent.click(lunch)
+    expect(screen.queryAllByTitle('Use this clip for enrollment')).toHaveLength(0)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     expect(screen.getAllByTitle('Use this clip for enrollment')).toHaveLength(2)
     expect(screen.getAllByRole('button', { name: /Play clip from/ })).toHaveLength(2)
     expect(screen.getByRole('button', { name: 'Relabel + enroll' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse all' }))
+    expect(screen.queryAllByTitle('Use this clip for enrollment')).toHaveLength(0)
   })
 })
