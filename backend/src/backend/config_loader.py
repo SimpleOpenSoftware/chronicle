@@ -11,9 +11,26 @@ import warnings
 from pathlib import Path
 from typing import Optional
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigSaveError(RuntimeError):
+    """A runtime settings change could not be written to config.yml."""
+
+
+def _save_failure(what: str, config_path: Path, error: Exception) -> ConfigSaveError:
+    if isinstance(error, OSError) and error.errno == 30:  # EROFS
+        reason = (
+            f"{config_path} is read-only. In Kubernetes it is usually mounted from a "
+            "ConfigMap; edit that ConfigMap (or give the config directory writable "
+            "storage) instead of using the Settings page."
+        )
+    else:
+        reason = f"{type(error).__name__}: {error}"
+    return ConfigSaveError(f"Could not save {what}: {reason}")
+
 
 # Global config cache
 _config_cache: Optional[DictConfig] = None
@@ -250,8 +267,9 @@ def save_config_section(section_path: str, values: dict) -> bool:
             return True
 
         except Exception as e:
-            logger.error(f"Error saving config section '{section_path}': {e}")
-            return False
+            error = _save_failure(f"config section '{section_path}'", config_path, e)
+            logger.error(str(error))
+            raise error from e
 
 
 def _load_raw_config() -> DictConfig:
@@ -277,7 +295,15 @@ def get_raw_models() -> list:
     note it excludes default-only models that live solely in defaults.yml.
     """
     raw = _load_raw_config()
-    models = raw.get("models", []) or []
+    models = raw.get("models")
+    # A config.yml without a ``models`` key yields None, not a ListConfig, and
+    # OmegaConf.to_container() rejects plain Python values.
+    if models is None:
+        return []
+    if not isinstance(models, ListConfig):
+        raise ValueError(
+            f"config.yml 'models' must be a list, got {type(models).__name__}"
+        )
     return OmegaConf.to_container(models, resolve=False)
 
 
@@ -306,5 +332,6 @@ def save_models_list(models: list) -> bool:
             return True
 
         except Exception as e:
-            logger.error(f"Error saving models list: {e}")
-            return False
+            error = _save_failure("the models list", config_path, e)
+            logger.error(str(error))
+            raise error from e
