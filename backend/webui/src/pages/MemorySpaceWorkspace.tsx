@@ -9,6 +9,7 @@ import { TITLE_NOT_GENERATED } from '../lib/constants'
 import { sourceDate } from '../utils/sourceTime'
 import { Button, Input, Textarea, computeWordDiff, WordDiff } from '../components/ui'
 import { memorySpacesApi, type MemorySpace, type SpaceMergeProposal, type SpaceNoteReviewFrame } from '../services/api'
+import { PRECISE_DATE_TIME, formatDateTime } from '../utils/datetime'
 
 const TABS = [
   { id: 'record', label: 'Record', icon: Mic },
@@ -547,7 +548,7 @@ export default function MemorySpaceWorkspace() {
                 {recordings.isSuccess && !recordingRows.length && <p className="py-5 text-sm text-stone-500">No recordings yet.</p>}
                 {recordingRows.map(recording => (
                   <div key={recording.conversation_id} className="space-y-4 py-4">
-                    <div className="flex items-center justify-between gap-3"><span><span className="block text-sm font-medium">{recording.title && recording.title !== TITLE_NOT_GENERATED ? recording.title : 'Untitled recording'}</span><span className="text-xs text-stone-500">{recording.created_at ? sourceDate(recording.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeZoneName: 'short' }) : ''}</span></span><span className="text-xs text-stone-500">{recording.processing_status ? `Processing: ${recording.processing_status.replace(/_/g, ' ')}` : 'Processing status unavailable'}</span></div>
+                    <div className="flex items-center justify-between gap-3"><span><span className="block text-sm font-medium">{recording.title && recording.title !== TITLE_NOT_GENERATED ? recording.title : 'Untitled recording'}</span><span className="text-xs text-stone-500">{recording.created_at ? formatDateTime(sourceDate(recording.created_at), PRECISE_DATE_TIME) : ''}</span></span><span className="text-xs text-stone-500">{recording.processing_status ? `Processing: ${recording.processing_status.replace(/_/g, ' ')}` : 'Processing status unavailable'}</span></div>
                     <SpaceRecordingAudio conversationId={recording.conversation_id} title={recording.title || 'recording'} />
                     {recording.memory_review_state && recording.memory_review_state !== 'automatic' && <NoteExtractionReview spaceId={spaceId} conversationId={recording.conversation_id} archived={archived} />}
                   </div>

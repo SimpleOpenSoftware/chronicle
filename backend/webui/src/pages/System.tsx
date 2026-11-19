@@ -9,6 +9,7 @@ import { systemApi } from '../services/api'
 import ExternalServices from '../components/ExternalServices'
 import RemoteControl from '../components/RemoteControl'
 import { Alert, Button, IconButton, Modal } from '../components/ui'
+import { PRECISE_TIME, formatTime } from '../utils/datetime'
 
 function getBackendHttpUrl(): string {
   const { protocol, hostname, port } = window.location
@@ -299,7 +300,7 @@ export default function System() {
           )}
           {lastUpdated && (
             <span className="text-sm text-gray-600 dark:text-gray-400">
-              Last updated: {lastUpdated.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+              Last updated: {formatTime(lastUpdated, PRECISE_TIME)}
             </span>
           )}
           <Button

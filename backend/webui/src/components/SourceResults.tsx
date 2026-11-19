@@ -1,8 +1,8 @@
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, ChatSourceRef } from "../services/api";
-import { sourceDate } from "../utils/sourceTime";
 import type { ReactNode } from "react";
+import { formatDateTime, getDisplayTimezone } from '../utils/datetime'
 
 export function Highlight({ text, terms }: { text: string; terms: string[] }) {
   const matched = new Set(terms.map((t) => t.toLocaleLowerCase()));
@@ -57,14 +57,14 @@ export const hitRef = (hit: SourceHit): ChatSourceRef => ({
   kind: hit.kind,
   key: hit.key,
   local_date: hit.owner_date,
-  timezone: hit.timezone || "Asia/Kolkata",
+  timezone: hit.timezone || getDisplayTimezone(),
 });
 export const refKey = (ref: ChatSourceRef) =>
   [
     ref.kind,
     ref.key,
     ref.local_date || "",
-    ref.timezone || "Asia/Kolkata",
+    ref.timezone || getDisplayTimezone(),
   ].join(":");
 
 export function useSourceResults(
@@ -143,14 +143,7 @@ export function SourceResult({
               : "Recording"}{" "}
           ·{" "}
           {item.started_at
-            ? sourceDate(item.started_at).toLocaleString("en-IN", {
-                timeZone: "Asia/Kolkata",
-                day: "numeric",
-                month: "short",
-                year: "numeric",
-                hour: "numeric",
-                minute: "2-digit",
-              }) + " IST"
+            ? formatDateTime(item.started_at)
             : "Date unknown"}
         </p>
         <h3 className="mt-1 break-words font-medium">

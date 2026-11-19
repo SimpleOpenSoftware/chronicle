@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../services/api'
 import { Alert, Button, Card } from './ui'
+import { formatDateTime } from '../utils/datetime'
 
 type Metric = { value_ms: number; quality: string; attempts?: number }
 type TimingEvent = {
@@ -39,7 +40,7 @@ export function VoiceTimingCard({ report }: { report: VoiceReport }) {
   const range = Math.max(1, eventEnd - eventStart)
   return <article className="text-gray-900 dark:text-gray-100 border-t border-gray-200 dark:border-gray-700 py-4">
     <div className="flex flex-wrap justify-between gap-2 text-sm">
-      <span className="font-medium">{report.client_id} · {new Date(report.started_at_ms).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</span>
+      <span className="font-medium">{report.client_id} · {formatDateTime(report.started_at_ms)}</span>
       <span>{report.status} · {duration(total)} total</span>
     </div>
     <dl className="grid grid-cols-1 sm:grid-cols-3 gap-3 my-3">
