@@ -26,9 +26,11 @@ BACKGROUND_SPEECH_LABEL = "Background Speech"
 UNKNOWN_SPEAKER_PREFIX = "Unknown Speaker"
 
 # Matches the placeholder unknown labels: "Unknown", "Unknown 1",
-# "Unknown Speaker", "Unknown Speaker 2", "unknown_speaker_3" (case-insensitive).
+# "Unknown Speaker", "Unknown Speaker 2", "unknown_speaker_3" (case-insensitive),
+# and the raw diarization labels a transcript keeps when speaker recognition did
+# not run: Deepgram's "Speaker 0" and pyannote's "SPEAKER_00".
 _UNKNOWN_SPEAKER_RE = re.compile(
-    r"^\s*unknown(?:[ _]speaker)?(?:[ _]*\d+)?\s*$", re.IGNORECASE
+    r"^\s*(?:unknown(?:[ _]speaker)?(?:[ _]*\d+)?|speaker[ _]*\d+)\s*$", re.IGNORECASE
 )
 
 
