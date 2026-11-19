@@ -1,9 +1,8 @@
 name: Sync screenpipe fork
 
-# Keeps AnkushMalaker/screenpipe's `chronicle` branch rebased directly onto
-# upstream screenpipe/screenpipe main. The branch carries Chronicle's complete
-# patch stack; the former `custom/linux-timeline-stability` base branch was
-# folded into it and deleted in August 2026.
+# Keeps AnkushMalaker/screenpipe's `chronicle-recorder` branch rebased directly
+# onto upstream screenpipe/screenpipe main. The historical `chronicle` branch
+# is left intact.
 #
 # This lives in chronicle rather than in the fork itself for two reasons:
 # `schedule` only fires from a repo's default branch, so hosting it in the fork
@@ -38,14 +37,14 @@ env:
 
 jobs:
   rebase:
-    name: Rebase chronicle onto upstream/main
+    name: Rebase chronicle-recorder onto upstream/main
     runs-on: ubuntu-latest
     steps:
       - name: Check out the fork's Chronicle branch
         uses: actions/checkout@v4
         with:
           repository: ${{ env.FORK }}
-          ref: chronicle
+          ref: chronicle-recorder
           # Full history: a rebase needs the merge base with its target, which a
           # shallow clone does not have.
           fetch-depth: 0
@@ -92,7 +91,7 @@ jobs:
           (github.event_name == 'schedule' ||
            (inputs.push && inputs.push != 'false'))
         env:
-          BRANCH: chronicle
+          BRANCH: chronicle-recorder
         run: |
           # --force-with-lease, never plain --force: the rebase rewrote history,
           # but this still refuses if the branch moved since checkout (e.g. a
@@ -104,7 +103,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BEHIND: ${{ steps.diverge.outputs.behind }}
-          BRANCH: chronicle
+          BRANCH: chronicle-recorder
           ONTO: upstream/main
         run: |
           title="screenpipe fork: $BRANCH needs manual conflict resolution"
@@ -117,9 +116,14 @@ jobs:
             "The fork was left untouched. Resolve it locally:" \
             "" \
             '```' \
-            "cd untracked/screenpipe && SYNC_BRANCH=$BRANCH ./sync-fork.sh" \
+            "git clone --branch $BRANCH https://github.com/$FORK.git screenpipe-sync" \
+            "cd screenpipe-sync" \
+            'expected=$(git rev-parse HEAD)' \
+            "git fetch --no-tags $UPSTREAM main" \
+            'git rebase FETCH_HEAD' \
             "# fix conflicts, then: git add <files> && git rebase --continue" \
-            "SYNC_BRANCH=$BRANCH ./sync-fork.sh --push" \
+            "# Run the affected tests and review the diff before publishing." \
+            "git push --force-with-lease=refs/heads/$BRANCH:\$expected origin HEAD:refs/heads/$BRANCH" \
             '```' \
             "" \
             "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")

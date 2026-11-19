@@ -277,9 +277,9 @@ The current node is the default. Remote operations require an explicit registere
 node ID; selection never silently moves to another owner:
 
 ```bash
-./services status --node rainbow
-./services restart tts --node rainbow
-./services logs tts --node rainbow --tail 100
+./services status --node NODE_ID
+./services restart tts --node NODE_ID
+./services logs tts --node NODE_ID --tail 100
 ```
 
 `--all` start/restart selects enabled services allowed on that node by the placement
@@ -305,7 +305,7 @@ failure without rolling back or resubmitting. Exit codes are 0 for success/accep
 ./services start llm-services --timeout 600
 ./services start llm-services --no-wait
 ./services operation OPERATION_ID
-./services operation OPERATION_ID --node rainbow --json
+./services operation OPERATION_ID --node NODE_ID --json
 ```
 
 `--no-wait` returns after acceptance; the manager continues readiness checks. Ctrl-C

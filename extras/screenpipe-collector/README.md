@@ -13,7 +13,7 @@ pixels and OCR are retrieved only for bounded jobs requested by Chronicle. See t
 
    ```bash
    uv run --project extras/screenpipe-collector chronicle-screenpipe pair \
-     --backend https://kraken.example \
+     --backend https://chronicle.example \
      --code PAIRING_CODE
    ```
 

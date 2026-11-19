@@ -144,12 +144,12 @@ test and a deployed trace both exist.
   `a421c9-audiov2dep-3971e53a6a254ceab71bb28de68a1bfd` and one canonical 1.1-second
   `audio_chunks` document with captured time 21:03:55 IST. The deleted `/ws` endpoint
   rejects a WebSocket upgrade with HTTP 403.
-- **21:00 IST operational finding:** Kraken's root filesystem is 100% utilized with
+- **21:00 IST operational finding:** the validation host's root filesystem is 100% utilized with
   about 370 MB free. ScreenPipe's finite-ingest path is actively logging `ENOSPC`
   while writing large temporary WAVs. This did not prevent the small V2 durability
   probe, but it is a separate production retention/capacity incident and makes larger
   capture/build operations unsafe until space is reclaimed or temp storage moves to
-  `/mnt/wsl/data`.
+  a separate data volume.
 - **21:12 IST:** isolated the cutover from the heavily dirty `dev` checkout on
   `feature/audio-v2-cutover`, committed it as `4a73a5ff`, and pushed only runtime
   audio code, generated contracts, clients, tests, and canonical docs. Local wake-word
@@ -296,7 +296,7 @@ test and a deployed trace both exist.
   unclosed Mongo client warning from Timeline dispatch tests.
 - **11:26 IST:** cut Chronicle off OpenRouter after its exhausted allowance continued
   surfacing historical/live errors. `defaults.llm`, `defaults.fast_llm`, and
-  `defaults.fallback_llm` now all resolve to Kraken's local `qwen3.8-llm`; the two
+  `defaults.fallback_llm` now all resolve to the validation host's local `qwen3.8-llm`; the two
   explicit overrides (`memory_write` and `timeline_consolidation`) were moved to the
   same model. Backend and worker runtime inspection confirms every registered LLM
   operation resolves to provider `llamacpp` at `http://llama-cpp-llm:8080/v1`.

@@ -134,9 +134,9 @@ def _span(index: int, started_at: datetime, *, direction: str = "input"):
     return SimpleNamespace(
         id=f"span-{index}",
         user_id="user-1",
-        source_id="rainbow",
+        source_id="capture-node",
         locator=EvidenceLocator(
-            capture_source_id="rainbow",
+            capture_source_id="capture-node",
             modality="audio",
             track_id=f"{direction}:device-{index}",
         ),

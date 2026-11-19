@@ -163,7 +163,7 @@ The wizard will ask questions - here's what to answer:
 **"Enable HTTPS"**: **Say Yes** (needed for phone connection)
 **"Server IP for SSL certificate"**:
 - Run `tailscale ip` in another terminal
-- Copy the IP that starts with `100.` (like `100.64.1.5`)
+- Copy the IP that starts with `100.`
 - Paste that IP here
 
 *The wizard creates all the configuration files automatically*
@@ -180,7 +180,7 @@ The wizard will ask questions - here's what to answer:
 
 Before connecting your phone, make sure everything works:
 
-1. Visit: **https://[your-tailscale-ip]** (like `https://100.64.1.5`)
+1. Visit: **https://[your-tailscale-ip]**
 
    *Your browser will warn about "unsafe certificate" - click "Advanced" → "Proceed anyway"*
 
@@ -216,7 +216,7 @@ Before connecting your phone, make sure everything works:
 3. Go to Settings → Backend Configuration
 4. Enter Backend URL: `https://[your-tailscale-ip]`
 
-   *Use the same IP as your web dashboard - like `https://100.64.1.5`*
+   *Use the same IP as your web dashboard*
 
 5. Tap "Test Connection" - should show **green checkmark**
 6. If connection fails, double-check:

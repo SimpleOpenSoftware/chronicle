@@ -163,7 +163,7 @@ def test_collect_audio_checkpoints_sources_excluded_from_forwarding(tmp_path: Pa
     collector = object.__new__(Collector)
     collector.config = Config(
         backend_url="http://chronicle",
-        source_id="rainbow",
+        source_id="capture-node",
         token="token",
         screenpipe_dir=tmp_path,
         forward_audio="output",
@@ -705,7 +705,7 @@ def test_collect_observations_keeps_interleaved_displays_independent(
     collector = object.__new__(Collector)
     collector.config = Config(
         backend_url="http://backend",
-        source_id="screenpipe-rainbow",
+        source_id="screenpipe-capture-node",
         token="token",
         screenpipe_dir=tmp_path,
     )

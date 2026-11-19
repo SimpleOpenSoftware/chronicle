@@ -2,7 +2,7 @@
 
 Run with an explicitly non-sensitive 16 kHz mono WAV fixture:
   uv run --with playwright python scripts/live_audio_v2_e2e.py \
-    --audio /tmp/smallest-official-16k.wav
+    --base https://chronicle.example.com --audio /tmp/smallest-official-16k.wav
 """
 
 import argparse
@@ -51,7 +51,9 @@ def _conversation_id(conversation: dict) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, required=True)
-    parser.add_argument("--base", default="https://kraken.parrot-census.ts.net")
+    parser.add_argument(
+        "--base", required=True, help="Chronicle deployment URL to test."
+    )
     parser.add_argument("--seconds", type=int, default=12)
     parser.add_argument(
         "--expect-wakeword",

@@ -123,7 +123,7 @@ describe('MemorySpaceWorkspace scope', () => {
     vi.spyOn(memorySpacesApi, 'get').mockResolvedValue({
       data: {
         space_id: SPACE_ID,
-        name: 'Rainbow ramble',
+        name: 'Capture node ramble',
         state: 'active',
         seed_notes: [],
         sync_state: 'healthy',
@@ -149,11 +149,11 @@ describe('MemorySpaceWorkspace scope', () => {
         review_error: null,
         selected_frame_keys: [],
         context_description: null,
-        sources: [{ source_id: 'screenpipe-rainbow', name: 'Rainbow', platform: 'linux', status: 'online', last_seen_at: '2026-08-30T05:19:00Z', health: {} }],
+        sources: [{ source_id: 'screenpipe-capture-node', name: 'Capture node', platform: 'linux', status: 'online', last_seen_at: '2026-08-30T05:19:00Z', health: {} }],
         jobs: [],
         frames: [
-          { key: 'screenpipe-rainbow:41', source_id: 'screenpipe-rainbow', frame_id: 41, captured_at: '2026-08-30T05:16:00Z', content_type: 'image/jpeg' },
-          { key: 'screenpipe-rainbow:42', source_id: 'screenpipe-rainbow', frame_id: 42, captured_at: '2026-08-30T05:17:00Z', content_type: 'image/jpeg' },
+          { key: 'screenpipe-capture-node:41', source_id: 'screenpipe-capture-node', frame_id: 41, captured_at: '2026-08-30T05:16:00Z', content_type: 'image/jpeg' },
+          { key: 'screenpipe-capture-node:42', source_id: 'screenpipe-capture-node', frame_id: 42, captured_at: '2026-08-30T05:17:00Z', content_type: 'image/jpeg' },
         ],
       },
     } as never)
@@ -173,7 +173,7 @@ describe('MemorySpaceWorkspace scope', () => {
     await waitFor(() => expect(extract).toHaveBeenCalledWith(
       SPACE_ID,
       conversationId,
-      ['screenpipe-rainbow:42'],
+      ['screenpipe-capture-node:42'],
     ))
     // Let the mutation's post-success refetches settle before afterEach restores
     // the API spies; otherwise an in-flight query can fall through to localhost.

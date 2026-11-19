@@ -142,7 +142,7 @@ def test_llm_health_uses_each_endpoints_configured_bind_host(monkeypatch, tmp_pa
     (llm_dir / ".env").write_text(
         "LLM_PORT=8083\n"
         "EMBED_PORT=8082\n"
-        "LLM_BIND_HOST=100.83.66.30\n"
+        "LLM_BIND_HOST=100.64.0.10\n"
         "EMBED_BIND_HOST=127.0.0.1\n"
     )
     requested = []
@@ -155,7 +155,7 @@ def test_llm_health_uses_each_endpoints_configured_bind_host(monkeypatch, tmp_pa
 
     assert services.check_service_health("llm-services") == ("healthy", "")
     assert requested == [
-        ("http://100.83.66.30:8083/health", 2),
+        ("http://100.64.0.10:8083/health", 2),
         ("http://127.0.0.1:8082/health", 2),
     ]
 

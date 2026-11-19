@@ -7,7 +7,7 @@ Date: 2026-08-06
 Pi is the recommended first-class local-Qwen backend for Chronicle memory writes and
 searches. In the A30 write evaluation it completed every primary write, had the strongest
 semantic coverage, used fewer tokens and tool calls, and materially improved tail latency
-over Chronicle's direct tool loop. In the corrected, matched-budget Kraken retrieval run,
+over Chronicle's direct tool loop. In the corrected, matched-budget retrieval run on the validation host,
 Pi was fully correct on five of six questions versus four of six for Direct and recovered
 all expected answerable fact atoms. Direct remains useful as an explicit write-recovery
 backend and as the faster retrieval diagnostic path.
@@ -20,7 +20,7 @@ synthesis after reaching the search-round cap.
 ## What was evaluated
 
 - One NVIDIA A30 with 24 GB VRAM for the audited write suite and context profiling.
-- Kraken's NVIDIA RTX 4090 for the corrected retrieval comparison and local smoke test.
+- The validation host's NVIDIA RTX 4090 for the corrected retrieval comparison and local smoke test.
 - `unsloth/Qwen3.6-27B-GGUF:Q4_K_M`, approximately 16.8 GB.
 - llama.cpp b10290 at commit `c8e03ce`.
 - A text-only 64K context profile with flash attention, Q8 K/V cache, one parallel
@@ -29,7 +29,7 @@ synthesis after reaching the search-round cap.
 - Eight audited write cases, each run into an isolated vault.
 - Six retrieval questions over immutable copies of a fixed vault, including two cases
   authored as negative controls and one additional question the vault could not answer.
-- The final retrieval comparison used the same Kraken model endpoint, temperature 0.2,
+- The final retrieval comparison used the same validation-host model endpoint, temperature 0.2,
   2,048-token output limit, six search rounds, and source vault for both executors. The
   Codex write column below is a historical semantic comparator, not a contemporaneous
   performance run.
@@ -87,7 +87,7 @@ for every transcript class.
 
 ## Retrieval results
 
-### Corrected matched-budget run on Kraken
+### Corrected matched-budget run on the validation host
 
 | Executor | Completed | Fully correct | Answerable fact coverage | Correct abstentions | Unsupported additions | Wall time |
 |---|---:|---:|---:|---:|---:|---:|
@@ -112,7 +112,7 @@ The first A30 pass was not decision-grade: a pause/resume had removed system-ins
 `ripgrep`, Pi's terminal failure sentinel counted as an answer, and both loops could lose
 evidence gathered on their last allowed tool turn. The implementation now rejects failure
 sentinels as answers, hard-caps tool calls, and permits one bounded tools-disabled
-synthesis only from audited evidence. The Kraken rerun above had working `rg` and records
+synthesis only from audited evidence. The validation-host rerun above had working `rg` and records
 the effective Pi temperature in its provenance.
 
 ## Private network topology
@@ -127,12 +127,12 @@ Tailnet client
   -> http://llama-cpp-llm:8080/v1 on Chronicle's private container network
 ```
 
-Kraken now uses that container-DNS endpoint for backend and worker requests. The optional
+The validation host now uses that container-DNS endpoint for backend and worker requests. The optional
 host diagnostic ports for the LLM and embedding server bind only to `127.0.0.1`; no
 Jarvis endpoint exists, and all Jarvis machines are paused. Tailscale is connected, with
 neither Serve nor Funnel configured at evaluation time.
 
-Chronicle's Caddy/backend ports currently listen on all Kraken host interfaces. That is
+Chronicle's Caddy/backend ports currently listen on all validation-host interfaces. That is
 not a Tailscale Funnel or automatic public-internet publication, but it permits LAN access
 and relies on the host/router boundary. A strict Tailnet-only cutover should bind Chronicle
 ingress to loopback and place Tailscale Serve in front after client URLs and certificates
@@ -184,7 +184,7 @@ are checked. That live ingress change was intentionally not made during the mode
   healthy.
 - A synthetic local Pi write reached primary canonical completion in 16.4 seconds with
   five tool calls, no fallback, no errors, and no vault invariant violations.
-- Kraken's `/readiness` endpoint returns `ready`; its model and memory probes connect.
+- The validation host's `/readiness` endpoint returns `ready`; its model and memory probes connect.
   The broader legacy `/health` endpoint currently reports `critical` because its Redis
   probe attempts a signal operation from a non-main thread. That separate probe defect
   does not indicate a failed model or memory connection.
@@ -197,12 +197,12 @@ are checked. That live ingress change was intentionally not made during the mode
 3. Canary Pi retrieval on one non-critical vault and retain Direct as a fast diagnostic
    selector while watching cap warnings and unsupported-answer rate.
 4. Run Chronicle's setup wizard before rebuilding/restarting Chronicle with Pi selected.
-   Existing obsolete memory keys are intentionally rejected, so Kraken will not silently
+   Existing obsolete memory keys are intentionally rejected, so the validation host will not silently
    switch to Direct or another model.
 5. Roll out writes to one non-critical vault first and monitor latency, truncation, tool-error,
    recovery, and invariant metrics before broad ingestion.
 
-Kraken's live llama.cpp profile and private model routing were changed and restarted, with
+The validation host's live llama.cpp profile and private model routing were changed and restarted, with
 rollback copies of the prior configuration retained. The Chronicle Pi application code is
 merged into `dev`, but the live backend/workers were not rebuilt or restarted as part of
 that merge. They continue running the prior process image until the wizard and deliberate
@@ -212,7 +212,7 @@ image rebuild/rollout are performed.
 
 The observed final A30 write suite cost ₹38.88. Earlier A30 context and exploratory work
 is estimated at about ₹60, for approximately ₹99 total. The corrected retrieval rerun
-used Kraken and added no Jarvis compute cost. Cost is approximate because the earlier
+used the validation host and added no Jarvis compute cost. Cost is approximate because the earlier
 exploratory session was not captured as one final billing record.
 
 Limitations include eight write cases, six retrieval questions, one run per case, no

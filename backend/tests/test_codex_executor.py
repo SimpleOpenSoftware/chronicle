@@ -228,7 +228,7 @@ async def test_codex_writer_attaches_selected_images_to_initial_prompt(
     await CodexMemoryAgent(root).run(
         "I am showing the notebook now.",
         "conv1",
-        images=[("rainbow.jpg", b"selected-frame")],
+        images=[("selected-frame.jpg", b"selected-frame")],
     )
 
     assert captured["image"] == b"selected-frame"

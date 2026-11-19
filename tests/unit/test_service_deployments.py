@@ -3,14 +3,16 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-
 from service_deployments import DeploymentStore, PlacementError, Plan
 
 
-def plan(mode="single", owners=("rainbow",)):
+def plan(mode="single", owners=("capture-node",)):
     return Plan.model_validate(
         {
-            "nodes": {"kraken": "http://kraken:8775", "rainbow": "http://rainbow:8775"},
+            "nodes": {
+                "backend-node": "http://backend-node:8775",
+                "capture-node": "http://capture-node:8775",
+            },
             "deployments": {
                 "llm-services": {
                     "mode": mode,
@@ -43,13 +45,13 @@ def test_single_owner_denies_foreign_node_and_duplicate_process(tmp_path):
     store = DeploymentStore(tmp_path / "plan.db")
     store.configure(plan(), stopped)
     with pytest.raises(PlacementError, match="excluded"):
-        store.acquire("llm-services", "kraken", stopped)
+        store.acquire("llm-services", "backend-node", stopped)
 
     def unexpected(node, *args):
-        return {**stopped(), "running": node == "kraken"}
+        return {**stopped(), "running": node == "backend-node"}
 
     with pytest.raises(PlacementError, match="Unexpected"):
-        store.acquire("llm-services", "rainbow", unexpected)
+        store.acquire("llm-services", "capture-node", unexpected)
 
 
 def test_concurrent_activations_and_plan_edit_cannot_race(tmp_path):
@@ -58,7 +60,7 @@ def test_concurrent_activations_and_plan_edit_cannot_race(tmp_path):
 
     def start(_):
         try:
-            return store.acquire("llm-services", "rainbow", stopped)
+            return store.acquire("llm-services", "capture-node", stopped)
         except PlacementError:
             return None
 
@@ -76,10 +78,12 @@ def test_concurrent_activations_and_plan_edit_cannot_race(tmp_path):
 def test_move_requires_positive_stop_proof_and_revision(tmp_path):
     store = DeploymentStore(tmp_path / "plan.db")
     original = store.configure(plan(), stopped)
-    new = plan(owners=("kraken",)).model_copy(update={"revision": original.revision})
+    new = plan(owners=("backend-node",)).model_copy(
+        update={"revision": original.revision}
+    )
     with pytest.raises(PlacementError, match="must be stopped"):
         store.configure(
-            new, lambda node, *_: {**stopped(), "running": node == "rainbow"}
+            new, lambda node, *_: {**stopped(), "running": node == "capture-node"}
         )
 
     def offline(*_):
@@ -95,9 +99,9 @@ def test_move_requires_positive_stop_proof_and_revision(tmp_path):
 
 def test_ha_allows_only_declared_replicas(tmp_path):
     store = DeploymentStore(tmp_path / "plan.db")
-    store.configure(plan("ha", ("kraken", "rainbow")), stopped)
+    store.configure(plan("ha", ("backend-node", "capture-node")), stopped)
     token = store.acquire(
-        "llm-services", "rainbow", lambda *_: {**stopped(), "running": True}
+        "llm-services", "capture-node", lambda *_: {**stopped(), "running": True}
     )
     assert token
     store.release(token)
@@ -106,7 +110,7 @@ def test_ha_allows_only_declared_replicas(tmp_path):
 
 
 def test_speaker_ha_rejects_unversioned_mutable_catalogs():
-    data = plan("ha", ("kraken", "rainbow")).model_dump()
+    data = plan("ha", ("backend-node", "capture-node")).model_dump()
     deployment = data["deployments"].pop("llm-services")
     data["deployments"]["speaker-recognition"] = deployment
     deployment["state"] = "speaker_catalog"
@@ -123,7 +127,7 @@ def test_compose_entry_point_does_not_execute_when_authority_is_down(
 
     (tmp_path / "config").mkdir()
     (tmp_path / "config/config.yml").write_text(
-        "service_placement:\n  node_id: rainbow\n  coordinator_url: http://authority:8775\n"
+        "service_placement:\n  node_id: capture-node\n  coordinator_url: http://authority:8775\n"
     )
     monkeypatch.setattr(services, "__file__", str(tmp_path / "services.py"))
 
@@ -146,7 +150,7 @@ def test_cli_recreate_denied_before_stopping(monkeypatch, tmp_path):
 
     (tmp_path / "config").mkdir()
     (tmp_path / "config/config.yml").write_text(
-        "service_placement:\n  node_id: kraken\n  coordinator_url: http://authority:8775\n"
+        "service_placement:\n  node_id: backend-node\n  coordinator_url: http://authority:8775\n"
     )
     monkeypatch.setattr(services, "__file__", str(tmp_path / "services.py"))
     monkeypatch.setattr(services, "check_service_enabled", lambda *_: True)
@@ -178,14 +182,14 @@ def test_first_placement_cannot_race_unconfigured_activation(tmp_path):
     store = DeploymentStore(tmp_path / "plan.db")
     empty = Plan(nodes=plan().nodes)
     saved = store.configure(empty, stopped)
-    token = store.acquire("llm-services", "kraken", stopped)
+    token = store.acquire("llm-services", "backend-node", stopped)
     proposed = plan().model_copy(update={"revision": saved.revision})
     with pytest.raises(PlacementError, match="in progress"):
         store.configure(proposed, stopped)
     store.release(token)
     with pytest.raises(PlacementError, match="must be stopped"):
         store.configure(
-            proposed, lambda node, *_: {**stopped(), "running": node == "kraken"}
+            proposed, lambda node, *_: {**stopped(), "running": node == "backend-node"}
         )
 
 
@@ -193,14 +197,17 @@ def test_stale_reconciliation_cannot_stop_new_owner(tmp_path):
     store = DeploymentStore(tmp_path / "plan.db")
     old = store.configure(plan(), stopped)
     store.configure(
-        plan(owners=("kraken",)).model_copy(update={"revision": old.revision}), stopped
+        plan(owners=("backend-node",)).model_copy(update={"revision": old.revision}),
+        stopped,
     )
     with pytest.raises(PlacementError, match="no longer authorized"):
-        store.acquire("llm-services", "kraken", stopped, stop_revision=old.revision)
+        store.acquire(
+            "llm-services", "backend-node", stopped, stop_revision=old.revision
+        )
 
 
 def test_health_only_ha_identity_is_rejected():
-    p = plan("ha", ("kraken", "rainbow")).model_dump()
+    p = plan("ha", ("backend-node", "capture-node")).model_dump()
     for i in p["deployments"]["llm-services"]["instances"]:
         i["endpoints"]["chat"]["identity"] = {"status": "ok"}
     with pytest.raises(ValidationError, match="model identity"):
@@ -216,7 +223,7 @@ def test_boot_waits_for_agent_readiness_before_compose(monkeypatch, tmp_path):
     monkeypatch.setattr(
         services,
         "load_config_yml",
-        lambda: {"service_placement": {"node_id": "rainbow"}},
+        lambda: {"service_placement": {"node_id": "capture-node"}},
     )
     monkeypatch.setattr(services, "_start_service_manager", lambda: None)
     monkeypatch.setattr(services, "ensure_docker_network", lambda: True)

@@ -20,18 +20,18 @@ vi.mock("../services/api", () => ({
 }));
 const plan = {
   revision: 3,
-  nodes: { rainbow: "http://rainbow:8775", kraken: "http://kraken:8775" },
+  nodes: { "capture-node": "http://capture-node:8775", "backend-node": "http://backend-node:8775" },
   deployments: {
     "speaker-recognition": {
       mode: "single",
       state: "speaker_catalog",
       instances: [
         {
-          node: "rainbow",
+          node: "capture-node",
           endpoints: {
             speaker: {
-              url: "http://rainbow:8085",
-              health_url: "http://rainbow:8085/readiness",
+              url: "http://capture-node:8085",
+              health_url: "http://capture-node:8085/readiness",
               readiness: { status: "ok" },
             },
           },
@@ -52,9 +52,9 @@ beforeEach(() => {
                 service: "speaker-recognition",
                 endpoint: "speaker",
                 mode: "single",
-                selected_node: "rainbow",
+                selected_node: "capture-node",
                 instances: [
-                  { node: "rainbow", healthy: true, reason: "Ready" },
+                  { node: "capture-node", healthy: true, reason: "Ready" },
                 ],
               },
             ],
@@ -79,21 +79,21 @@ function show() {
 it("shows configured owner and selected request destination", async () => {
   show();
   expect(await screen.findByText("Single owner")).toBeTruthy();
-  expect(await screen.findByText("speaker: serving from rainbow")).toBeTruthy();
+  expect(await screen.findByText("speaker: serving from capture-node")).toBeTruthy();
 });
 it("saves the expected revision and leaves container actions separate", async () => {
   show();
   fireEvent.click(await screen.findByText("Configure placement"));
   fireEvent.change(
     screen.getByLabelText("speaker-recognition instance 1 node"),
-    { target: { value: "kraken" } },
+    { target: { value: "backend-node" } },
   );
   fireEvent.click(screen.getByText("Save placement"));
   await waitFor(() => expect(put).toHaveBeenCalled());
   const payload = put.mock.calls[0][1];
   expect(payload.revision).toBe(3);
   expect(payload.deployments["speaker-recognition"].instances[0].node).toBe(
-    "kraken",
+    "backend-node",
   );
   expect(put.mock.calls[0][0]).toBe("/api/admin/service-deployments");
 });

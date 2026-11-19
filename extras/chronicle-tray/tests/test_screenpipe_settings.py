@@ -75,12 +75,12 @@ def test_save_capture_settings_supports_microphone_only():
 
 def test_audio_forwarding_setting_is_independent_from_capture_unit(tmp_path):
     path = tmp_path / "config.json"
-    path.write_text('{"source_id": "rainbow", "forward_audio": "both"}')
+    path.write_text('{"source_id": "capture-node", "forward_audio": "both"}')
 
     _save_forward_audio_setting("output", path)
 
     assert _forward_audio_setting(path) == "output"
-    assert json.loads(path.read_text())["source_id"] == "rainbow"
+    assert json.loads(path.read_text())["source_id"] == "capture-node"
 
 
 def test_audio_source_modes_round_trip():

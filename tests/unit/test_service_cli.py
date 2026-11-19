@@ -7,15 +7,14 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-from fastapi.testclient import TestClient
-
 import deployment_guard
+import pytest
 import service_cli as cli
 import service_operations as operations
 import services
 import status
 from edge import service_manager as manager
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
@@ -136,7 +135,7 @@ def test_loading_becomes_ready(runtime, monkeypatch):
         ["restart"],
         ["start", "oops"],
         ["start", "tts", "--all"],
-        ["start", "tts", "--direct", "--node", "rainbow"],
+        ["start", "tts", "--direct", "--node", "capture-node"],
         ["start", "tts", "--direct", "--no-wait"],
         ["start", "tts", "--timeout", "0"],
         ["start", "tts", "--build", "--use-prebuilt", "v1"],
@@ -238,12 +237,14 @@ def test_remote_uses_registered_node_and_auth(monkeypatch, tmp_path):
         return SimpleNamespace(
             ok=True,
             json=lambda: {
-                "plan": {"nodes": {"rainbow": "http://rainbow.example.ts.net:8775"}}
+                "plan": {
+                    "nodes": {"capture-node": "http://capture-node.example.ts.net:8775"}
+                }
             },
         )
 
     monkeypatch.setattr(cli.requests, "request", request)
-    assert cli.target_url("rainbow") == "http://rainbow.example.ts.net:8775"
+    assert cli.target_url("capture-node") == "http://capture-node.example.ts.net:8775"
     assert calls[0][2]["headers"] == {"Authorization": "Bearer secret-token"}
     with pytest.raises(ValueError, match="Unknown registered node"):
         cli.target_url("missing")
