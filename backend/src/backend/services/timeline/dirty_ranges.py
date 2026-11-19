@@ -1253,6 +1253,65 @@ async def dismiss_failed_range(
     )
 
 
+CANCELLABLE_RANGE_STATES = (
+    "pending",
+    "authorized_pending",
+    "leased",
+    "waiting",
+    "awaiting_context",
+    "context_pending",
+)
+
+
+async def cancel_range(
+    dirty_range_id: str, *, user_id: str, reason: str
+) -> Optional[DirtyEvidenceRange]:
+    """Take one owner-scoped, unfinished range out of scheduling.
+
+    Clearing the lease fences a still-running attempt: its next lease-checked write
+    raises ``DirtyRangeLeaseLost`` instead of publishing. ``dismissed`` keeps the
+    recovery cron from re-dispatching it. Returns None when the range had already
+    reached a terminal state, so there was nothing to cancel.
+    """
+
+    existing = await DirtyEvidenceRange.find_one(
+        DirtyEvidenceRange.dirty_range_id == dirty_range_id,
+        DirtyEvidenceRange.user_id == user_id,
+    )
+    if existing is None:
+        raise LookupError("reconciliation range not found")
+    if existing.state not in CANCELLABLE_RANGE_STATES:
+        return None
+    resolution = DirtyEvidenceRangeResolution(
+        action="cancelled",
+        actor_user_id=user_id,
+        reason=reason,
+        prior_state=existing.state,
+    )
+    document = await DirtyEvidenceRange.get_pymongo_collection().find_one_and_update(
+        {
+            "dirty_range_id": dirty_range_id,
+            "user_id": user_id,
+            "state": existing.state,
+        },
+        {
+            "$set": {
+                "state": "dismissed",
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "updated_at": resolution.created_at,
+            },
+            "$push": {"resolution_history": resolution.model_dump(mode="python")},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if document is None:
+        raise DirtyRangeLeaseLost(
+            f"dirty range {dirty_range_id} changed state while being cancelled; retry"
+        )
+    return DirtyEvidenceRange.model_validate(document)
+
+
 async def release_range_for_retry(
     dirty_range: DirtyEvidenceRange, error: str
 ) -> DirtyEvidenceRange:

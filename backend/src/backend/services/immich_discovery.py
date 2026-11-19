@@ -49,6 +49,10 @@ def _settings() -> tuple[str, str] | None:
     return (url, key) if url and key else None
 
 
+def immich_configured() -> bool:
+    return _settings() is not None
+
+
 async def resolve_immich_user_id() -> str | None:
     """Chronicle user that owns imported Immich references.
 
@@ -146,7 +150,8 @@ async def check_immich_day_readiness(
     checked_at = utcnow()
     settings = _settings()
     if settings is None:
-        return ImmichDayReadiness(False, "immich_unconfigured", 0, None, checked_at, [])
+        # Immich is optional. A deployment without it has no backup to wait for.
+        return ImmichDayReadiness(True, "immich_unconfigured", 0, None, checked_at, [])
     try:
         zone = ZoneInfo(timezone_name)
     except Exception as error:

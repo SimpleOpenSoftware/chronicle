@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from fastapi.responses import JSONResponse
 from rq import Queue, Retry, Worker
+from rq.command import send_stop_job_command
 from rq.exceptions import NoSuchJobError
 from rq.job import Dependency, Job, JobStatus
 from rq.registry import DeferredJobRegistry, ScheduledJobRegistry
@@ -925,6 +926,27 @@ def enqueue_explicit_timeline_reconciliation(request_id: str) -> Optional[str]:
         meta={"reconciliation_request_id": request_id},
     )
     return job.id
+
+
+def stop_explicit_timeline_reconciliation(job_id: str) -> str:
+    """Stop one explicit reconciliation job wherever it is in its lifecycle.
+
+    A running job's work-horse is killed; a queued, scheduled, or retry-deferred job
+    is cancelled so RQ never starts it. Returns what was done, for the caller's log.
+    """
+
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except NoSuchJobError:
+        return "missing"
+    status = get_job_status_from_rq(job)
+    if status == "started":
+        send_stop_job_command(redis_conn, job_id)
+        return "stopped"
+    if status in {"queued", "deferred", "scheduled"}:
+        job.cancel()
+        return "cancelled"
+    return status
 
 
 def start_streaming_jobs(

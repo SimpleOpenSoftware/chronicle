@@ -87,7 +87,7 @@ async def explicit_reconciliation_job(request_id: str, *, redis_client=None) -> 
     request = await TimelineReconciliationRequest.find_one({"request_id": request_id})
     if request is None:
         return {"request_id": request_id, "state": "missing"}
-    if request.state in {"completed", "failed", "blocked"}:
+    if request.state in {"completed", "failed", "blocked", "cancelled"}:
         return {"request_id": request_id, "state": request.state}
     return await _run_explicit_reconciliation(request)
 
