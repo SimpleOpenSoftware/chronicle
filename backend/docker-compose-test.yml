@@ -240,7 +240,9 @@ services:
       start_period: 1s
 
   minio-test:
-    image: docker.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
+    image: cgr.dev/chainguard/minio
+    # The image's default user cannot write to the bind-mounted data directory.
+    user: root
     entrypoint: sh
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:
