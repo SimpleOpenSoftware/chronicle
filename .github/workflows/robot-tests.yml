@@ -29,12 +29,14 @@ on:
     paths:
       - 'tests/**'
       - 'backend/src/**'
+      - 'backend/docker-compose-test.yml'
       - '.github/workflows/robot-tests.yml'
   push:
     branches: [dev, main]
     paths:
       - 'tests/**'
       - 'backend/src/**'
+      - 'backend/docker-compose-test.yml'
       - '.github/workflows/robot-tests.yml'
   workflow_dispatch:
     inputs:
