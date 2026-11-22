@@ -19,7 +19,7 @@ from backend.routers.modules.device_input_routes import JobRequest, create_job, 
 async def test_explicit_source_request_precedes_background_backlog_and_claims_atomically(
     mongo_service,
 ):
-    client = AsyncIOMotorClient(os.environ["MONGODB_URI"])
+    client = AsyncIOMotorClient(os.getenv("MONGODB_URI", "mongodb://localhost:27018"))
     database = "test_device_job_priority_" + uuid4().hex
     try:
         await init_beanie(

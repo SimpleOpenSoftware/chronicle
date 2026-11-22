@@ -109,6 +109,7 @@ jobs:
           uv run --no-project
           --with ./extras/chronicle-client
           --with pytest
+          --with pytest-asyncio
           pytest extras/chronicle-client/tests -q
 
   backend-unit:
@@ -152,7 +153,20 @@ jobs:
         # imported transitively during test collection.
         # ffmpeg: the audio-persistence tests shell out to the binary to convert
         # and reconstruct WAV/Opus chunks.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0 ffmpeg
+        # ripgrep: the vault grep tool runs the binary.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0 ffmpeg ripgrep
+
+      - name: Set up Node
+        uses: actions/setup-node@v4.0.2
+        with:
+          node-version: "22.19.0"
+
+      - name: Install Pi
+        # The Pi executor and vault tool tests drive the real Pi CLI. Keep the
+        # versions in step with NODE_VERSION and PI_VERSION in backend/Dockerfile.
+        run: >-
+          npm install --global --omit=dev --ignore-scripts --no-audit --no-fund
+          @earendil-works/pi-coding-agent@0.85.1
 
       - name: Install test dependencies
         run: uv sync --locked --group test
@@ -204,11 +218,11 @@ jobs:
           version: "latest"
 
       - name: Install test dependencies
-        run: uv sync --locked --group test
+        run: uv sync --locked --group test --group faster-whisper
 
       - name: Run unit tests with coverage
         run: >-
-          uv run --group test pytest
+          uv run --group test --group faster-whisper pytest
           --ignore=tests/test_parakeet_service.py
           --cov=common
           --cov=providers
