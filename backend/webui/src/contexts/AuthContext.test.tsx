@@ -4,11 +4,12 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
 import { AuthProvider, useAuth } from './AuthContext'
 import ProtectedRoute from '../components/auth/ProtectedRoute'
-import { authApi, browserSession } from '../services/api'
+import { authApi, browserSession, timelineApi } from '../services/api'
 
 vi.mock('../services/api', () => ({
   authApi: { getMe: vi.fn(), login: vi.fn() },
   browserSession: { refresh: vi.fn(), finishLogout: vi.fn(), logout: vi.fn() },
+  timelineApi: { setTimezone: vi.fn(async (timezone: string) => ({ data: { timezone } })) },
 }))
 const token = `header.${btoa(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86400 }))}.signature`
 const user = { id: 'user', email: 'user@example.com', is_superuser: false }
@@ -76,4 +77,20 @@ it('ignores an account response that arrives after another tab signs out', async
     resolve({ data: user })
   })
   expect(screen.queryByText('Signed in as user@example.com')).toBeNull()
+})
+
+it('saves the browser timezone for an account that has none', async () => {
+  vi.mocked(authApi.getMe).mockResolvedValue({ data: { ...user, timezone: null } } as any)
+  mount()
+  await screen.findByText('Signed in as user@example.com')
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  await waitFor(() => expect(timelineApi.setTimezone).toHaveBeenCalledWith(zone))
+  expect(timelineApi.setTimezone).toHaveBeenCalledTimes(1)
+})
+
+it('keeps a timezone the account already saved', async () => {
+  vi.mocked(authApi.getMe).mockResolvedValue({ data: { ...user, timezone: 'Asia/Kolkata' } } as any)
+  mount()
+  await screen.findByText('Signed in as user@example.com')
+  expect(timelineApi.setTimezone).not.toHaveBeenCalled()
 })
