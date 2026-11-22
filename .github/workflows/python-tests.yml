@@ -205,11 +205,11 @@ jobs:
           version: "latest"
 
       - name: Install test dependencies
-        run: uv sync --locked --group test
+        run: uv sync --locked --group test --group faster-whisper
 
       - name: Run unit tests with coverage
         run: >-
-          uv run --group test pytest
+          uv run --group test --group faster-whisper pytest
           --ignore=tests/test_parakeet_service.py
           --cov=common
           --cov=providers
