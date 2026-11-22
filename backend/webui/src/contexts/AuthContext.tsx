@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
-import { authApi, browserSession, type CurrentUser } from '../services/api'
+import { authApi, browserSession, timelineApi, type CurrentUser } from '../services/api'
 import { getStorageKey } from '../utils/storage'
 import { SESSION_CHANGED, savedToken, signedOut, logoutPending } from '../services/browserSession'
 
@@ -27,6 +27,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Check if user is admin
   const isAdmin = user?.is_superuser || false
+
+  // An account with no zone adopts this browser's zone. Background workers build
+  // days in the saved zone (UTC when unset), so without this the pages ask for
+  // browser-zone days that no worker ever builds.
+  const userId = user?.id
+  const needsTimezone = !!user && !user.timezone
+  useEffect(() => {
+    if (!needsTimezone) return
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    if (!zone) return
+    let cancelled = false
+    timelineApi.setTimezone(zone)
+      .then(response => {
+        if (!cancelled) setUser(current => current && current.id === userId ? { ...current, timezone: response.data.timezone } : current)
+      })
+      .catch(() => { /* Best effort: the page still offers the explicit switch. */ })
+    return () => { cancelled = true }
+  }, [needsTimezone, userId])
 
   useEffect(() => {
     const sync = () => {
