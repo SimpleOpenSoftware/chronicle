@@ -1137,15 +1137,15 @@ class ChronicleSetup:
     def setup_fallback_llm(self):
         """Configure a fallback LLM that calls retry against when the primary
         LLM is unreachable (connection failure, timeout, 5xx).
-        Default: OpenAI gpt-5-nano."""
+        Default: OpenAI gpt-5.4-mini."""
         self.print_section("Fallback LLM (recommended)")
         self.console.print(
             "[blue][INFO][/blue] If your main LLM is unreachable (e.g. a local "
             "model is down), LLM calls are retried once against a fallback model."
         )
         self.console.print(
-            "The default fallback is OpenAI gpt-5-nano (cheap, always available). "
-            "It uses your OPENAI_API_KEY."
+            "The default fallback is OpenAI gpt-5.4-mini. It uses your "
+            "OPENAI_API_KEY and requires access to that model."
         )
         self.console.print()
 
@@ -1161,16 +1161,34 @@ class ChronicleSetup:
             ),
             {},
         )
+        if (
+            existing_fb == "fallback-llm"
+            and existing_model.get("model_name")
+            in ("gpt-5-nano", "gpt-5-nano-2025-08-07")
+            and (existing_model.get("model_url") or "https://api.openai.com/v1").rstrip(
+                "/"
+            )
+            == "https://api.openai.com/v1"
+        ):
+            self.console.print(
+                f"[yellow][WARNING][/yellow] OpenAI retires {existing_model['model_name']} "
+                "on December 11, 2026. Choose option 1 to replace the saved "
+                "fallback with the recommended model."
+            )
         is_custom = bool(existing_fb) and (
             existing_fb != "fallback-llm"
             or (
                 existing_model
-                and existing_model.get("model_name") not in ("", "gpt-5-nano")
+                and (
+                    existing_model.get("model_name") not in ("", "gpt-5.4-mini")
+                    or (existing_model.get("model_url") or "").rstrip("/")
+                    not in ("", "https://api.openai.com/v1")
+                )
             )
         )
 
         choices = {
-            "1": "OpenAI gpt-5-nano (recommended)",
+            "1": "OpenAI gpt-5.4-mini (recommended)",
             "2": "Custom OpenAI-compatible endpoint",
             "3": "No fallback",
         }
@@ -1188,7 +1206,7 @@ class ChronicleSetup:
             return
 
         if choice == "1":
-            # Stock gpt-5-nano entry ships in defaults.yml; re-sync a stale
+            # Stock gpt-5.4-mini entry ships in defaults.yml; re-sync a stale
             # customized copy in config.yml so it doesn't shadow the default.
             if existing_model:
                 self.config_manager.sync_models_from_defaults(["fallback-llm"])
@@ -1208,7 +1226,7 @@ class ChronicleSetup:
                 )
             self.config_manager.update_config_defaults({"fallback_llm": "fallback-llm"})
             self.console.print(
-                "[green][SUCCESS][/green] Fallback LLM: OpenAI gpt-5-nano "
+                "[green][SUCCESS][/green] Fallback LLM: OpenAI gpt-5.4-mini "
                 "(defaults.fallback_llm: fallback-llm)"
             )
             return
@@ -1236,8 +1254,8 @@ class ChronicleSetup:
             self.config["FALLBACK_LLM_API_KEY"] = api_key
 
         model_name = self.prompt_value(
-            "Fallback LLM model name (e.g., gpt-5-nano, llama-3.1-8b-instant)",
-            existing_model.get("model_name", "gpt-5-nano"),
+            "Fallback LLM model name (e.g., gpt-5.4-mini, llama-3.1-8b-instant)",
+            existing_model.get("model_name", "gpt-5.4-mini"),
         )
         if not model_name:
             self.console.print(
