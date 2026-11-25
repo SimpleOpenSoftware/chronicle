@@ -155,6 +155,23 @@ The wizard will ask questions - here's what to answer:
 
 #### Optional (Both Paths):
 
+**"Fallback LLM when the main LLM is down?"**: The recommended fallback is
+`gpt-5.4-mini`, using `OPENAI_API_KEY`. Your OpenAI project must have access to it.
+It supports Chronicle's Chat Completions tools with reasoning enabled. OpenAI's
+listed replacement, `gpt-6-luna`, and the `gpt-5.6` family require the Responses API
+for reasoning with tools. See the [GPT-6 Luna model page](https://developers.openai.com/api/docs/models/gpt-6-luna)
+and [GPT-5.6 migration guide](https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p6-sol#chat-completions-and-function-tools).
+The fallback costs more per token than GPT-5 nano or GPT-5.6 Luna; check
+[GPT-5.4 mini pricing](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
+before enabling it, or choose a custom endpoint or no fallback.
+
+If you previously saved `gpt-5-nano` or `gpt-5-nano-2025-08-07` in
+`config/config.yml`, that override takes precedence over shipped defaults.
+OpenAI [retires both on December 11, 2026](https://developers.openai.com/api/docs/deprecations).
+Rerun `./wizard.sh` and choose fallback option **1** to replace the saved
+`fallback-llm` entry, or update your custom fallback explicitly. Existing custom
+and disabled fallback choices remain selected when you rerun setup.
+
 **"Enable Speaker Recognition"**: Say Yes if you got Hugging Face token
 **"Hugging Face token"**: Paste your token (if you got one)
 

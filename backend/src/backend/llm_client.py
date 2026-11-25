@@ -439,6 +439,8 @@ async def async_chat_with_tools(
             api_params["temperature"] = temperature
         if model_override is not None:
             api_params["model"] = model_override
+        if not model_supports_temperature(api_params.get("model")):
+            api_params.pop("temperature", None)
         api_params["messages"] = op.prepare_messages(messages)
         if tools:
             api_params["tools"] = tools
@@ -581,6 +583,8 @@ async def async_chat_with_tools_stream(
             api_params["temperature"] = temperature
         if model_override is not None:
             api_params["model"] = model_override
+        if not model_supports_temperature(api_params.get("model")):
+            api_params.pop("temperature", None)
         api_params["messages"] = op.prepare_messages(messages)
         if tools:
             api_params["tools"] = tools
